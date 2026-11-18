@@ -666,6 +666,11 @@ Resources:
               - !Sub arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/default
           - Effect: Allow
             Action:
+              - states:StartExecution
+            Resource:
+              - !Ref ApprovalWorkflow
+          - Effect: Allow
+            Action:
               - sqs:SendMessage
             Resource:
               - !GetAtt EventsDlq.Arn
@@ -709,6 +714,7 @@ Resources:
           TABLE_NAME: !Ref RequestsTable
           METRICS_NAMESPACE: RequestHub
           EVENT_BUS_NAME: default
+          STATE_MACHINE_ARN: !Ref ApprovalWorkflow
 
   StreamPublisherMapping:
     Type: AWS::Lambda::EventSourceMapping
@@ -1107,6 +1113,7 @@ Resources:
 
   EventsToWorkflowRolePolicy:
     Type: AWS::IAM::ManagedPolicy
+    Condition: UsePipes
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Properties:
@@ -1122,6 +1129,7 @@ Resources:
 
   EventsToWorkflowRole:
     Type: AWS::IAM::Role
+    Condition: UsePipes
     Properties:
       Path: /service-role/
       AssumeRolePolicyDocument:
@@ -1135,6 +1143,7 @@ Resources:
 
   SubmittedRule:
     Type: AWS::Events::Rule
+    Condition: UsePipes
     Properties:
       Name: !Sub
         - '${AWS::StackName}-start-approval-${Suffix}'

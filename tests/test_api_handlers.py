@@ -150,6 +150,19 @@ class StreamPublisherTests(unittest.TestCase):
         entry = publisher.to_entry(self.record("MODIFY", "APPROVED", "PENDING_APPROVAL"))
         self.assertEqual(json.loads(entry["Detail"])["previousStatus"], "PENDING_APPROVAL")
 
+    def test_new_requests_start_the_workflow_once(self):
+        import os
+        os.environ["EVENT_BUS_NAME"] = "default"
+        os.environ["STATE_MACHINE_ARN"] = "arn:aws:states:us-east-1:1:stateMachine:wf"
+        sfn = mock.Mock()
+        sfn.start_execution.side_effect = [None, ClientError({"Error": {"Code": "ExecutionAlreadyExists", "Message": "x"}}, "StartExecution")]
+        entry = publisher.to_entry(self.record("INSERT", "SUBMITTED"))
+        with mock.patch.object(publisher, "sfn", return_value=sfn):
+            self.assertTrue(publisher.start_workflow(entry))
+            self.assertTrue(publisher.start_workflow(entry))  # redelivery is harmless
+            self.assertFalse(publisher.start_workflow(publisher.to_entry(self.record("MODIFY", "APPROVED", "PENDING_APPROVAL"))))
+        self.assertEqual(sfn.start_execution.call_args.kwargs["name"], "r1")
+
     def test_noise_is_ignored(self):
         self.assertIsNone(publisher.to_entry(self.record("MODIFY", "APPROVED", "APPROVED")))
         self.assertIsNone(publisher.to_entry(self.record("INSERT", "SUBMITTED", sk="ATT#1")))
