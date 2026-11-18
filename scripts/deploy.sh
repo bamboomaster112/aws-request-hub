@@ -93,6 +93,9 @@ step "Refreshing the API deployment"
 API_ID=$(aws cloudformation describe-stacks --stack-name "$STACK" --query "Stacks[0].Outputs[?OutputKey=='ApiId'].OutputValue | [0]" --output text)
 aws apigateway create-deployment --rest-api-id "$API_ID" --stage-name v1 --description "deploy.sh $(date -u +%FT%TZ)" --query id --output text
 
+step "Verifying EventBridge rules"
+"$ROOT/scripts/verify-rules.sh" || true
+
 step "Publishing the web app"
 "$ROOT/scripts/publish-web.sh"
 

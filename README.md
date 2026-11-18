@@ -8,7 +8,7 @@ It is built to run inside the **KodeKloud AWS Playground** (3-hour sessions, us-
 
 ```mermaid
 flowchart LR
-  user([Browser]) -->|HTTPS| waf[AWS WAF<br/>rate limit, SQLi, XSS]
+  user([Browser]) -->|HTTPS| waf[AWS WAF, optional<br/>rate limit, SQLi, XSS]
   waf --> apigw[API Gateway REST<br/>Cognito authorizer, X-Ray]
   cognito[Cognito user pool<br/>TOTP MFA, Plus tier] -. JWT .- user
   apigw -->|GET /, /assets| web[(S3 web bucket)]
@@ -17,8 +17,8 @@ flowchart LR
   apigw --> d[Lambda decision-handler]
   apigw --> p[Lambda attachment-presigner]
   p -. presigned POST .-> att[(S3 attachments)]
-  ddb -->|Streams| pipes[EventBridge Pipes<br/>CDC, filter + transform]
-  pipes --> bus{{EventBridge bus<br/>+ archive}}
+  ddb -->|Streams| pipes[CDC: EventBridge Pipes<br/>or Lambda publisher]
+  pipes --> bus{{EventBridge<br/>default bus}}
   bus -->|Request Submitted| sfn[Step Functions<br/>approval workflow]
   sfn --> pe[Lambda policy-engine]
   pe --> ssm[(SSM Parameter Store<br/>policy rules)]
@@ -29,42 +29,48 @@ flowchart LR
   w --> sm[(Secrets Manager)]
   bus -->|status changes| sns[SNS topics<br/>approvals, updates, ops]
   bus -->|all events| fh[Kinesis Data Firehose] --> audit[(S3 audit lake<br/>gzip, date partitions)]
-  cw[CloudWatch dashboard, alarms,<br/>Logs Insights, EMF metrics] -.-> sns
+  cw[CloudWatch dashboard, alarms,<br/>EMF metrics, X-Ray] -.-> sns
 ```
 
 ### The flow, in one paragraph
 
-A signed-in user submits a request. API Gateway validates the JSON against a schema and writes it **straight into DynamoDB** (no Lambda). DynamoDB Streams feeds **EventBridge Pipes**, which filters and reshapes the change into a clean `Request Submitted` domain event on a custom bus. That starts a **Step Functions** workflow: a small policy engine reads the rules from Parameter Store and decides the risk tier. Low risk is auto-approved. Otherwise the workflow uses the **AWS SDK integration with `.waitForTaskToken`** to store a task token on the request and pause. Approvers get an SNS email; when one decides in the web app, a Lambda checks they are allowed (right group, not their own request) and calls `SendTaskSuccess`. If nobody decides before the SLA, the workflow escalates to admins, then expires the request. Every status change is itself a DynamoDB write, so Pipes turns it into a `Request Status Changed` event that EventBridge routes to SNS (notifications), SQS (fulfilment) and Firehose (audit lake).
+A signed-in user submits a request. API Gateway validates the JSON against a schema and writes it **straight into DynamoDB** (no Lambda). DynamoDB Streams feeds **EventBridge Pipes** (or, where Pipes is blocked, a small batched Lambda), which turns the change into a clean `Request Submitted` domain event on EventBridge. That starts a **Step Functions** workflow: a small policy engine reads the rules from Parameter Store and decides the risk tier. Low risk is auto-approved. Otherwise the workflow uses the **AWS SDK integration with `.waitForTaskToken`** to store a task token on the request and pause. Approvers get an SNS email; when one decides in the web app, a Lambda checks they are allowed (right group, not their own request) and calls `SendTaskSuccess`. If nobody decides before the SLA, the workflow escalates to admins, then expires the request. Every status change is itself a DynamoDB write, so Pipes turns it into a `Request Status Changed` event that EventBridge routes to SNS (notifications), SQS (fulfilment) and Firehose (audit lake).
 
-## AWS services used (24)
+## AWS services used
 
 | Area | Services |
 | --- | --- |
-| Edge and identity | AWS WAF, Amazon API Gateway (REST), Amazon Cognito |
-| Compute and orchestration | AWS Lambda (5 small functions), AWS Step Functions |
-| Events and messaging | Amazon EventBridge (bus, rules, archive), EventBridge Pipes, Amazon SQS, Amazon SNS |
-| Data | Amazon DynamoDB (Streams, PITR, GSIs), Amazon S3 (web, attachments, audit lake), Amazon Kinesis Data Firehose |
+| Edge and identity | Amazon API Gateway (REST), Amazon Cognito (Plus tier, TOTP MFA), AWS WAF (when the account allows it) |
+| Compute and orchestration | AWS Lambda (5 or 6 small functions), AWS Step Functions (Standard, SDK integration with task tokens) |
+| Events and messaging | Amazon EventBridge (rules on the default bus), EventBridge Pipes (when allowed), Amazon SQS (queue + 2 DLQs), Amazon SNS (3 topics, email) |
+| Data | Amazon DynamoDB (single table, Streams, PITR, 2 GSIs), Amazon S3 (web, attachments, audit lake), Amazon Data Firehose |
 | Security and config | AWS KMS (customer managed key), AWS Secrets Manager, AWS Systems Manager Parameter Store, AWS IAM |
-| Observability | Amazon CloudWatch (dashboard, alarms, Logs Insights, EMF metrics), AWS X-Ray |
-| Delivery | AWS CloudFormation and AWS SAM, AWS CodePipeline (V2), AWS CodeBuild, AWS CloudShell |
+| Observability | Amazon CloudWatch (dashboard, 6 alarms, embedded-metric-format KPIs, logs), AWS X-Ray |
+| Delivery | AWS CloudFormation (packaged by the AWS SAM CLI), AWS CodePipeline (V2), AWS CodeBuild, AWS CloudShell |
 | Governance (optional stack) | AWS CloudTrail, AWS Config managed rules |
 
 ## Designed around the playground limits
 
-| Playground limit | How the design handles it |
+Everything below was found by deploying into a live KodeKloud AWS Playground session (November 2026), probing with the AWS CLI and reading the playground's own IAM policies. Several restrictions are not on the playground's published list.
+
+| Playground restriction | How the project handles it |
 | --- | --- |
-| A Lambda function invoked more than 300 times in an hour is deleted | Lambda only where code adds value. Create, routing, notifications, fulfilment queueing and auditing are functionless. The smoke test watches DynamoDB directly instead of polling the API. A CloudWatch alarm fires at 200 invocations per function per hour. |
-| Lambda max 256 MB and 10 s timeout | All functions use 256 MB and 8 s. Long waits live in Step Functions, not in Lambda. |
-| No CloudFront | The single-page app is served over HTTPS by API Gateway from a private S3 bucket. Same origin as the API, so no CORS, and WAF protects the UI too. |
-| App Runner closed to new customers (April 2026) | Not used. ECS Express Mode is the AWS successor if you want a container front end later. |
-| Cognito pools need MFA, 12+ character passwords, advanced security | Plus tier, TOTP MFA required, strong password policy, user existence errors suppressed. |
-| Step Functions must have logging | `ALL` level logging with execution data to an encrypted log group, plus X-Ray tracing. |
-| Firehose buffer max 5 MB, interval min 60 s | 1 MB / 60 s buffering, no dynamic partitioning (it needs 64 MB buffers). Date partitions come from timestamp prefixes. |
-| CodeBuild small compute, 10-minute builds, 3 pipelines, 5 runs per hour | Small compute, 10-minute timeout, one pipeline. `release.sh` refuses to start a 5th run in an hour. |
-| Sessions last 3 hours, then the account is wiped | Everything is code. A fresh session goes from empty to working in one command. |
-| IAM: inline role policies are denied, and roles can only be passed to services from the `/service-role/` path | Every role is explicit, lives under `/service-role/` and uses customer managed policies. No SAM-generated roles. |
-| Tagging is denied for several services, and KMS rotation, log retention and some deletes are denied | No resource or stack tags (plain CloudFormation instead of SAM resources, which auto-tag). Keys, log groups and parameters are retained on delete and get per-stack unique names, so a redeploy never collides with leftovers. |
-| AWS WAF and EventBridge Pipes are blocked by an organisation-level service control policy (found Nov 2026, even though the playground page lists WAF) | `deploy.sh` probes both before deploying. Without WAF, API Gateway throttling and schema validation remain at the edge. Without Pipes, a small batched Lambda publishes the same CDC events, so everything downstream is identical. In a normal account both are on by default. |
+| A Lambda function invoked more than 300 times in an hour is deleted; max 256 MB and 10 s | Lambda only where code adds value: create, routing, notifications, queueing and auditing are functionless. 256 MB and 8 s everywhere. An alarm fires at 200 invocations per function per hour. The smoke test waits on DynamoDB, not the API. |
+| `iam:PutRolePolicy` is denied; `iam:PassRole` works only for roles under `/service-role/` | Every role is explicit, lives under `/service-role/` and uses customer managed policies. No SAM-generated roles. |
+| Tagging is denied for several services (for example `events:TagResource`) | No stack or resource tags, and plain CloudFormation resources instead of SAM resources (SAM tags functions and state machines automatically). |
+| Custom event buses and archives are denied | Rules live on the default event bus; there is no event archive. |
+| AWS WAF and EventBridge Pipes are blocked by a service control policy (the published list includes WAF) | `deploy.sh` probes both and falls back automatically: no web ACL (API Gateway throttling and schema validation remain), and a batched Lambda publisher instead of Pipes. |
+| KMS rotation and key deletion, log retention, and deletes of log groups, parameters, secrets, alarms and managed policies are denied | Those resources are retained on delete and get per-deployment unique names, so a redeploy never collides with leftovers. |
+| `secretsmanager:GetRandomPassword` is denied | `deploy.sh` generates the downstream API key with `openssl` and passes it as a NoEcho parameter. |
+| The console user cannot read Secrets Manager values | Test-user credentials for the scripts live in a mode-600 file in the CloudShell home directory (use Secrets Manager in a real account). |
+| Logs Insights saved queries are denied | None are created. |
+| No CloudFront; App Runner closed to new customers (April 2026) | The single-page app is served over HTTPS by API Gateway from a private S3 bucket, on the same origin as the API. |
+| Firehose buffer max 5 MB, interval min 60 s | 1 MB / 60 s, gzip, timestamp-based date prefixes. |
+| CodeBuild small compute and 10-minute builds, 3 pipelines, 5 runs per hour | Small compute, 10-minute timeout, one pipeline; `release.sh` refuses a 5th run in an hour. |
+| In one deploy, CloudFormation reported an EventBridge rule as created after a "retry without tags", but the rule did not exist | `deploy.sh` ends with `verify-rules.sh`, which checks every rule and rebuilds the workflow start rule if needed. |
+| Sessions last 3 hours, then the account is wiped | Everything is code: `preflight.sh`, `permissions-check.py`, then one `deploy.sh`. |
+
+`python3 scripts/permissions-check.py` runs IAM's policy simulator over every action the stacks need (with the time-window context the playground's policies require), which finds most of the above in seconds.
 
 ## Deploy (AWS CloudShell, us-east-1)
 
@@ -72,6 +78,7 @@ A signed-in user submits a request. API Gateway validates the JSON against a sch
 git clone https://github.com/bamboomaster112/aws-request-hub.git
 cd aws-request-hub
 ./scripts/preflight.sh                 # read-only permission probe, about 20 seconds
+python3 scripts/permissions-check.py   # IAM policy simulator over every action the stacks need
 ./scripts/deploy.sh                    # core stack + web app + CI/CD stack
 python3 scripts/seed-users.py          # requester, approver and admin test users with MFA enrolled
 python3 scripts/smoke-test.py          # end-to-end checks
@@ -102,11 +109,15 @@ To use the web app yourself, create a real user and follow the emailed temporary
 4. **High risk.** Raise a CHANGE request. It routes to admins only.
 5. **SLA escalation.** Leave an ACCESS request alone for 3 minutes. It escalates to admins, and an email goes out.
 6. **Failure handling.** Raise a GENERAL request for 50 with `[fail]` in the title. Fulfilment fails three times, the message lands in the DLQ, and the DLQ alarm fires.
-7. **Security at the edge.** Put `' UNION SELECT` in a title or `<script>` in a description. WAF answers 403.
-8. **Audit lake.** A minute later, browse `s3://request-hub-audit-.../events/year=/month=/day=/`.
-9. **Operations.** Open the `request-hub-operations` CloudWatch dashboard, including the Lambda budget widget against the 300 per hour line.
+7. **Security at the edge.** Call the API without a token (401) or with an invalid body (400). Where WAF is allowed, `' UNION SELECT` in a title or `<script>` in a description gets a 403.
+8. **Audit lake.** A minute later, browse `s3://request-hub-audit-.../events/year=/month=/day=/` (gzip files of raw EventBridge events).
+9. **Operations.** Open the `request-hub-operations-...` CloudWatch dashboard, including the Lambda budget widget against the 300 per hour line.
 
 `python3 scripts/smoke-test.py --escalation --dlq --audit` runs all of these automatically.
+
+## Verified in the playground
+
+Smoke test in a live KodeKloud AWS Playground session (18 Nov 2026), `python3 scripts/smoke-test.py`: **26 of 26 checks passed in 81 seconds**, covering Cognito MFA sign-in, the authorizer, schema validation, functionless create, change data capture to EventBridge, policy-based auto-approval, task-token approval, segregation of duties, single-use tokens, rejection with a reason, high-risk routing to admins, SQS fulfilment, presigned S3 uploads and downloads, and the Firehose audit lake.
 
 ## CI/CD
 
