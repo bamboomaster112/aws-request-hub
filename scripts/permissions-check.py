@@ -42,12 +42,24 @@ ACTIONS = {
 
 
 def main():
-    arn = boto3.client("sts").get_caller_identity()["Arn"]
-    iam = boto3.client("iam")
+    import datetime
+    session = boto3.session.Session()
+    arn = session.client("sts").get_caller_identity()["Arn"]
+    iam = session.client("iam")
+    region = session.region_name or "us-east-1"
+    # The playground's policies are time-boxed (aws:CurrentTime) and some check region and principal,
+    # so the simulator needs those context keys or it reports everything as an implicit deny.
+    context = [
+        {"ContextKeyName": "aws:CurrentTime", "ContextKeyType": "date",
+         "ContextKeyValues": [datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")]},
+        {"ContextKeyName": "aws:RequestedRegion", "ContextKeyType": "string", "ContextKeyValues": [region]},
+        {"ContextKeyName": "aws:PrincipalArn", "ContextKeyType": "string", "ContextKeyValues": [arn]},
+    ]
     names = [f"{svc}:{a}" for svc, acts in ACTIONS.items() for a in acts]
     denied = []
     for start in range(0, len(names), 40):
-        resp = iam.simulate_principal_policy(PolicySourceArn=arn, ActionNames=names[start:start + 40])
+        resp = iam.simulate_principal_policy(PolicySourceArn=arn, ActionNames=names[start:start + 40],
+                                             ContextEntries=context)
         for r in resp["EvaluationResults"]:
             if r["EvalDecision"] != "allowed":
                 denied.append((r["EvalActionName"], r["EvalDecision"]))
