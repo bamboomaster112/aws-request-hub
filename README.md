@@ -62,6 +62,7 @@ A signed-in user submits a request. API Gateway validates the JSON against a sch
 | Firehose buffer max 5 MB, interval min 60 s | 1 MB / 60 s buffering, no dynamic partitioning (it needs 64 MB buffers). Date partitions come from timestamp prefixes. |
 | CodeBuild small compute, 10-minute builds, 3 pipelines, 5 runs per hour | Small compute, 10-minute timeout, one pipeline. `release.sh` refuses to start a 5th run in an hour. |
 | Sessions last 3 hours, then the account is wiped | Everything is code. A fresh session goes from empty to working in one command. |
+| AWS WAF and EventBridge Pipes are blocked by an organisation-level service control policy (found Nov 2026, even though the playground page lists WAF) | `deploy.sh` probes both before deploying. Without WAF, API Gateway throttling and schema validation remain at the edge. Without Pipes, a small batched Lambda publishes the same CDC events, so everything downstream is identical. In a normal account both are on by default. |
 
 ## Deploy (AWS CloudShell, us-east-1)
 
@@ -79,7 +80,8 @@ Options for `deploy.sh`:
 | Variable | Default | Effect |
 | --- | --- | --- |
 | `NOTIFICATION_EMAIL` | empty | Subscribes an email address to the approvals, updates and ops topics |
-| `USE_PIPES` | `true` | `false` swaps EventBridge Pipes for a small Lambda CDC publisher |
+| `USE_PIPES` | `true` | `false` swaps EventBridge Pipes for a small Lambda CDC publisher (switched automatically when Pipes is blocked) |
+| `ENABLE_WAF` | `auto` | `true` / `false` forces the WAF web ACL on or off; `auto` turns it off when WAF is blocked |
 | `SLA_SECONDS` | `180` | Approval and escalation timers (short for demos) |
 | `WITH_PIPELINE` | `true` | Deploys the CodePipeline/CodeBuild stack |
 | `WITH_GOVERNANCE` | `false` | Deploys CloudTrail and AWS Config rules |

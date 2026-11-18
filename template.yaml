@@ -33,9 +33,15 @@ Parameters:
     AllowedValues: ['true', 'false']
     Default: 'true'
     Description: Sets the account-level API Gateway CloudWatch role and enables API access logs.
+  EnableWaf:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'true'
+    Description: Attach the AWS WAF web ACL to the API stage. The KodeKloud playground currently blocks WAF with a service control policy.
 
 Conditions:
   HasEmail: !Not [!Equals [!Ref NotificationEmail, '']]
+  UseWaf: !Equals [!Ref EnableWaf, 'true']
   UsePipes: !Equals [!Ref UseEventBridgePipes, 'true']
   UseLambdaPublisher: !Equals [!Ref UseEventBridgePipes, 'false']
   ApiLogging: !Equals [!Ref EnableApiGatewayAccountLogging, 'true']
@@ -1519,6 +1525,7 @@ Resources:
 
   WebAcl:
     Type: AWS::WAFv2::WebACL
+    Condition: UseWaf
     Properties:
       Name: !Sub ${AWS::StackName}-web-acl
       Description: Rate limiting plus SQL injection and XSS protection for the Request Hub API and web app
@@ -1592,6 +1599,7 @@ Resources:
 
   WebAclAssociation:
     Type: AWS::WAFv2::WebACLAssociation
+    Condition: UseWaf
     Properties:
       WebACLArn: !GetAtt WebAcl.Arn
       ResourceArn: !Join
@@ -1879,7 +1887,9 @@ Outputs:
   PolicyParameterName:
     Value: !Ref PolicyRulesParameter
   WebAclName:
-    Value: !Sub ${AWS::StackName}-web-acl
+    Value: !If [UseWaf, !Sub '${AWS::StackName}-web-acl', disabled]
+  WafEnabled:
+    Value: !Ref EnableWaf
   DashboardUrl:
     Value: !Sub https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AWS::StackName}-operations
   CdcMode:

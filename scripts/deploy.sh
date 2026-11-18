@@ -27,9 +27,25 @@ step "Identity and region"
 aws sts get-caller-identity --query '[Account, Arn]' --output text
 echo "Region: $REGION   Stack: $STACK"
 
+# Some services that the playground page lists are blocked by an organisation-level
+# service control policy. Detect that up front and switch to the built-in fallbacks.
+denied() { local err; err=$("$@" 2>&1 >/dev/null); [[ "$err" == *AccessDenied* ]]; }
+ENABLE_WAF="${ENABLE_WAF:-auto}"
+if [[ "$ENABLE_WAF" == "auto" ]]; then
+  if denied aws wafv2 list-web-acls --scope REGIONAL --limit 1; then
+    ENABLE_WAF=false; echo "AWS WAF is blocked in this account: deploying without the web ACL (API Gateway throttling still applies)."
+  else
+    ENABLE_WAF=true
+  fi
+fi
+if [[ "$USE_PIPES" == "true" ]] && denied aws pipes list-pipes --limit 1; then
+  USE_PIPES=false; echo "EventBridge Pipes is blocked in this account: using the Lambda CDC publisher instead."
+fi
+
 PARAMS=(
   "NotificationEmail=$NOTIFICATION_EMAIL"
   "UseEventBridgePipes=$USE_PIPES"
+  "EnableWaf=$ENABLE_WAF"
   "EnableApiGatewayAccountLogging=$API_LOGGING"
   "ApprovalSlaSeconds=$SLA_SECONDS"
   "EscalationSlaSeconds=$SLA_SECONDS"
