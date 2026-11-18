@@ -117,7 +117,11 @@ To use the web app yourself, create a real user and follow the emailed temporary
 
 ## Verified in the playground
 
-Smoke test in a live KodeKloud AWS Playground session (18 Nov 2026), `python3 scripts/smoke-test.py`: **26 of 26 checks passed in 81 seconds**, covering Cognito MFA sign-in, the authorizer, schema validation, functionless create, change data capture to EventBridge, policy-based auto-approval, task-token approval, segregation of duties, single-use tokens, rejection with a reason, high-risk routing to admins, SQS fulfilment, presigned S3 uploads and downloads, and the Firehose audit lake.
+Live KodeKloud AWS Playground session, 18 Nov 2026 (us-east-1, WAF and Pipes blocked, so the Lambda CDC publisher was used):
+
+* `python3 scripts/smoke-test.py --escalation --dlq --audit`: **31 of 31 checks passed in 256 seconds.** Covered: Cognito sign-in with TOTP MFA, the authorizer (401), schema validation (400), the web app over HTTPS, functionless create, change data capture starting the workflow, policy auto-approval and SQS fulfilment, task-token approval, segregation of duties (403), single-use tokens (409), rejection with a reason, high-risk routing to admins, presigned S3 upload and download (SSE-KMS), attachment authorisation, **SLA escalation to admins**, **three failed fulfilment attempts landing in the DLQ** without a false FULFILLED, and the **Firehose audit lake**.
+* CI/CD: a release through S3, EventBridge, CodePipeline V2 and CodeBuild ran Source, Test (unit tests, cfn-lint, Bandit, JavaScript check) and Deploy successfully.
+* Full deploy from an empty account: about 8 minutes (core, web app and CI/CD stacks).
 
 ## CI/CD
 
