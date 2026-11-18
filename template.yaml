@@ -542,6 +542,8 @@ Resources:
   PipeRolePolicy:
     Type: AWS::IAM::ManagedPolicy
     Condition: UsePipes
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       Description: Least-privilege permissions for PipeRole
       PolicyDocument:
@@ -645,6 +647,8 @@ Resources:
   StreamPublisherRolePolicy:
     Type: AWS::IAM::ManagedPolicy
     Condition: UseLambdaPublisher
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       Description: Least-privilege permissions for StreamPublisherRole
       PolicyDocument:
@@ -722,6 +726,8 @@ Resources:
   # ---------------------------------------------------------------------------
   PolicyEngineRolePolicy:
     Type: AWS::IAM::ManagedPolicy
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       Description: Least-privilege permissions for PolicyEngineRole
       PolicyDocument:
@@ -750,6 +756,8 @@ Resources:
 
   QueryApiRolePolicy:
     Type: AWS::IAM::ManagedPolicy
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       Description: Least-privilege permissions for QueryApiRole
       PolicyDocument:
@@ -785,6 +793,8 @@ Resources:
 
   DecisionHandlerRolePolicy:
     Type: AWS::IAM::ManagedPolicy
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       Description: Least-privilege permissions for DecisionHandlerRole
       PolicyDocument:
@@ -819,6 +829,8 @@ Resources:
 
   AttachmentPresignerRolePolicy:
     Type: AWS::IAM::ManagedPolicy
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       Description: Least-privilege permissions for AttachmentPresignerRole
       PolicyDocument:
@@ -853,6 +865,8 @@ Resources:
 
   FulfilmentWorkerRolePolicy:
     Type: AWS::IAM::ManagedPolicy
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       Description: Least-privilege permissions for FulfilmentWorkerRole
       PolicyDocument:
@@ -1008,6 +1022,8 @@ Resources:
 
   WorkflowRolePolicy:
     Type: AWS::IAM::ManagedPolicy
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       Description: Least-privilege permissions for WorkflowRole
       PolicyDocument:
@@ -1074,6 +1090,8 @@ Resources:
 
   EventsToWorkflowRolePolicy:
     Type: AWS::IAM::ManagedPolicy
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       Description: Least-privilege permissions for EventsToWorkflowRole
       PolicyDocument:
@@ -1230,6 +1248,8 @@ Resources:
 
   EventsToFirehoseRolePolicy:
     Type: AWS::IAM::ManagedPolicy
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       Description: Least-privilege permissions for EventsToFirehoseRole
       PolicyDocument:
@@ -1277,6 +1297,8 @@ Resources:
   # ---------------------------------------------------------------------------
   AuditFirehoseRolePolicy:
     Type: AWS::IAM::ManagedPolicy
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       Description: Least-privilege permissions for AuditFirehoseRole
       PolicyDocument:
@@ -1329,6 +1351,8 @@ Resources:
   # ---------------------------------------------------------------------------
   ApiGatewayServiceRolePolicy:
     Type: AWS::IAM::ManagedPolicy
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       Description: Least-privilege permissions for ApiGatewayServiceRole
       PolicyDocument:
@@ -1877,8 +1901,9 @@ Resources:
   # ---------------------------------------------------------------------------
   Api5xxAlarm:
     Type: AWS::CloudWatch::Alarm
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
-      AlarmName: !Sub ${AWS::StackName}-api-5xx
       AlarmDescription: The API returned server errors
       Namespace: AWS/ApiGateway
       MetricName: 5XXError
@@ -1895,8 +1920,9 @@ Resources:
 
   WorkflowFailedAlarm:
     Type: AWS::CloudWatch::Alarm
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
-      AlarmName: !Sub ${AWS::StackName}-workflow-failed
       AlarmDescription: An approval workflow execution failed
       Namespace: AWS/States
       MetricName: ExecutionsFailed
@@ -1912,8 +1938,9 @@ Resources:
 
   FulfilmentDlqAlarm:
     Type: AWS::CloudWatch::Alarm
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
-      AlarmName: !Sub ${AWS::StackName}-fulfilment-dlq
       AlarmDescription: Fulfilment messages failed three times and landed in the dead-letter queue
       Namespace: AWS/SQS
       MetricName: ApproximateNumberOfMessagesVisible
@@ -1929,8 +1956,9 @@ Resources:
 
   EventsDlqAlarm:
     Type: AWS::CloudWatch::Alarm
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
-      AlarmName: !Sub ${AWS::StackName}-events-dlq
       AlarmDescription: EventBridge or Pipes could not deliver an event
       Namespace: AWS/SQS
       MetricName: ApproximateNumberOfMessagesVisible
@@ -1946,8 +1974,9 @@ Resources:
 
   LambdaErrorsAlarm:
     Type: AWS::CloudWatch::Alarm
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
-      AlarmName: !Sub ${AWS::StackName}-lambda-errors
       AlarmDescription: One or more Request Hub functions raised errors
       ComparisonOperator: GreaterThanOrEqualToThreshold
       Threshold: 1
@@ -1992,8 +2021,9 @@ Resources:
 
   LambdaInvocationBudgetAlarm:
     Type: AWS::CloudWatch::Alarm
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
-      AlarmName: !Sub ${AWS::StackName}-lambda-invocation-budget
       AlarmDescription: >-
         A function passed 200 invocations in an hour. The KodeKloud playground deletes any
         function invoked more than 300 times in an hour, so slow down testing.
@@ -2040,8 +2070,12 @@ Resources:
 
   Dashboard:
     Type: AWS::CloudWatch::Dashboard
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
-      DashboardName: !Sub ${AWS::StackName}-operations
+      DashboardName: !Sub
+        - '${AWS::StackName}-operations-${Suffix}'
+        - Suffix: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]
       DashboardBody: !Sub |
         {
           "widgets": [
@@ -2115,6 +2149,6 @@ Outputs:
   WafEnabled:
     Value: !Ref EnableWaf
   DashboardUrl:
-    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AWS::StackName}-operations
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${Dashboard}
   CdcMode:
     Value: !If [UsePipes, eventbridge-pipes, lambda-publisher]
