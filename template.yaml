@@ -459,21 +459,18 @@ Resources:
   ApprovalsTopic:
     Type: AWS::SNS::Topic
     Properties:
-      TopicName: !Sub ${AWS::StackName}-approvals
       DisplayName: Request Hub approvals
       KmsMasterKeyId: !Ref AppKey
 
   UpdatesTopic:
     Type: AWS::SNS::Topic
     Properties:
-      TopicName: !Sub ${AWS::StackName}-updates
       DisplayName: Request Hub updates
       KmsMasterKeyId: !Ref AppKey
 
   OpsTopic:
     Type: AWS::SNS::Topic
     Properties:
-      TopicName: !Sub ${AWS::StackName}-ops-alerts
       DisplayName: Request Hub ops alerts
       KmsMasterKeyId: !Ref AppKey
 
@@ -1289,8 +1286,6 @@ Resources:
           Arn: !GetAtt AuditDeliveryStream.Arn
           RoleArn: !GetAtt EventsToFirehoseRole.Arn
           DeadLetterConfig: {Arn: !GetAtt EventsDlq.Arn}
-          InputTransformer:
-            InputTemplate: "<aws.events.event.json>\n"
 
   # ---------------------------------------------------------------------------
   # Audit lake: Firehose -> S3 (Hive-style date partitions, gzip, KMS at rest)
