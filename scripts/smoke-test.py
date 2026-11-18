@@ -97,7 +97,7 @@ def main():
     low = body["requestId"] if status == 201 else None
     if low:
         it = hub.wait(low, ["FULFILLED", "FAILED"], timeout=60)
-        check("Pipes -> EventBridge -> Step Functions auto-approved it (LOW risk)", it.get("riskTier") == "LOW", it.get("riskTier"))
+        check("Change data capture started the workflow, which auto-approved it (LOW risk)", it.get("riskTier") == "LOW", it.get("riskTier"))
         check("EventBridge -> SQS -> worker fulfilled it with a PO reference",
               it.get("status") == "FULFILLED" and str(it.get("fulfilmentRef", "")).startswith("PO-"), it.get("status"))
 
