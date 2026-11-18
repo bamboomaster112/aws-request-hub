@@ -20,11 +20,9 @@ except ImportError:  # pragma: no cover
 
 STACK = os.environ.get("STACK", "request-hub")
 REGION = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "us-east-1"
-SECRET_NAME = f"{STACK}/test-users"
 
 session = boto3.session.Session(region_name=REGION)
 cognito = session.client("cognito-idp")
-secrets = session.client("secretsmanager")
 cfn = session.client("cloudformation")
 
 
@@ -50,24 +48,24 @@ def wait_for_fresh_window(step=30):
 
 
 # ---------------- test user store ----------------
+# The playground denies secretsmanager:GetSecretValue to the console user, so test-user
+# credentials live in a private file in the CloudShell home directory (mode 600).
+# In a real account, keep them in Secrets Manager instead.
+USERS_FILE = os.path.expanduser(f"~/.{STACK}-test-users.json")
+
+
 def load_users():
     try:
-        return json.loads(secrets.get_secret_value(SecretId=SECRET_NAME)["SecretString"])
-    except ClientError as exc:
-        if exc.response["Error"]["Code"] == "ResourceNotFoundException":
-            sys.exit(f"No test users yet. Run: python3 scripts/seed-users.py  (secret {SECRET_NAME} not found)")
-        raise
+        with open(USERS_FILE) as fh:
+            return json.load(fh)
+    except FileNotFoundError:
+        sys.exit(f"No test users yet. Run: python3 scripts/seed-users.py  ({USERS_FILE} not found)")
 
 
 def save_users(users):
-    payload = json.dumps(users)
-    try:
-        secrets.put_secret_value(SecretId=SECRET_NAME, SecretString=payload)
-    except ClientError as exc:
-        if exc.response["Error"]["Code"] != "ResourceNotFoundException":
-            raise
-        secrets.create_secret(Name=SECRET_NAME, SecretString=payload,
-                              Description="Request Hub test users for the CloudShell scripts (playground only)")
+    fd = os.open(USERS_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        json.dump(users, fh)
 
 
 # ---------------- Cognito sign-in ----------------

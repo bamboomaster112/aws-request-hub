@@ -43,7 +43,6 @@ delete_stack "${STACK}-cicd"
 empty_bucket "$(out "$STACK" WebBucketName)"
 empty_bucket "$(out "$STACK" AttachmentsBucketName)"
 empty_bucket "$(out "$STACK" AuditBucketName)"
-aws secretsmanager delete-secret --secret-id "${STACK}/test-users" --force-delete-without-recovery >/dev/null 2>&1 \
-  && echo "Deleted secret ${STACK}/test-users"
+rm -f ~/."${STACK}"-test-users.json
 delete_stack "$STACK"
 echo "Teardown complete. (The KMS key is scheduled for deletion after its 7-day waiting period.)"

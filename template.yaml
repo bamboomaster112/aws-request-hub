@@ -309,6 +309,8 @@ Resources:
 
   DownstreamApiSecret:
     Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       Name: !Sub
         - '${AWS::StackName}/${Suffix}/downstream-api'
@@ -417,22 +419,6 @@ Resources:
   # ---------------------------------------------------------------------------
   # Events: custom bus, archive, queues and topics
   # ---------------------------------------------------------------------------
-  EventBus:
-    Type: AWS::Events::EventBus
-    Properties:
-      Name: !Sub ${AWS::StackName}-bus
-
-  EventArchive:
-    Type: AWS::Events::Archive
-    Properties:
-      ArchiveName: !Sub ${AWS::StackName}-events
-      Description: Replayable history of Request Hub domain events
-      SourceArn: !GetAtt EventBus.Arn
-      RetentionDays: 1
-      EventPattern:
-        source:
-          - prefix: request-hub
-
   EventsDlq:
     Type: AWS::SQS::Queue
     Properties:
@@ -467,7 +453,7 @@ Resources:
             Resource: [!GetAtt EventsDlq.Arn, !GetAtt FulfilmentQueue.Arn]
             Condition:
               ArnLike:
-                aws:SourceArn: !Sub arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/${AWS::StackName}-bus/*
+                aws:SourceArn: !Sub arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/${AWS::StackName}-*
 
   ApprovalsTopic:
     Type: AWS::SNS::Topic
@@ -554,7 +540,7 @@ Resources:
             Action:
               - events:PutEvents
             Resource:
-              - !GetAtt EventBus.Arn
+              - !Sub arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/default
           - Effect: Allow
             Action:
               - sqs:SendMessage
@@ -593,7 +579,7 @@ Resources:
         FilterCriteria:
           Filters:
             - Pattern: '{"eventName": ["INSERT"], "dynamodb": {"NewImage": {"SK": {"S": ["META"]}}}}'
-      Target: !GetAtt EventBus.Arn
+      Target: !Sub arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/default
       TargetParameters:
         EventBridgeEventBusParameters:
           Source: request-hub.requests
@@ -624,7 +610,7 @@ Resources:
         FilterCriteria:
           Filters:
             - Pattern: '{"eventName": ["MODIFY"], "dynamodb": {"NewImage": {"SK": {"S": ["META"]}}}}'
-      Target: !GetAtt EventBus.Arn
+      Target: !Sub arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/default
       TargetParameters:
         EventBridgeEventBusParameters:
           Source: request-hub.requests
@@ -649,7 +635,7 @@ Resources:
             Action:
               - events:PutEvents
             Resource:
-              - !GetAtt EventBus.Arn
+              - !Sub arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/default
           - Effect: Allow
             Action:
               - sqs:SendMessage
@@ -692,7 +678,7 @@ Resources:
         Variables:
           TABLE_NAME: !Ref RequestsTable
           METRICS_NAMESPACE: RequestHub
-          EVENT_BUS_NAME: !Ref EventBus
+          EVENT_BUS_NAME: default
 
   StreamPublisherMapping:
     Type: AWS::Lambda::EventSourceMapping
@@ -1098,7 +1084,7 @@ Resources:
     Properties:
       Name: !Sub ${AWS::StackName}-start-approval
       Description: Start the approval workflow for every new request
-      EventBusName: !Ref EventBus
+      EventBusName: default
       EventPattern:
         source: [request-hub.requests]
         detail-type: [Request Submitted]
@@ -1117,7 +1103,7 @@ Resources:
     Properties:
       Name: !Sub ${AWS::StackName}-approval-needed
       Description: Notify approvers when a request is waiting for a decision
-      EventBusName: !Ref EventBus
+      EventBusName: default
       EventPattern:
         source: [request-hub.requests]
         detail-type: [Request Status Changed]
@@ -1144,7 +1130,7 @@ Resources:
     Properties:
       Name: !Sub ${AWS::StackName}-escalated
       Description: Tell admins when an approval SLA has been missed
-      EventBusName: !Ref EventBus
+      EventBusName: default
       EventPattern:
         source: [request-hub.requests]
         detail-type: [Request Status Changed]
@@ -1167,7 +1153,7 @@ Resources:
     Properties:
       Name: !Sub ${AWS::StackName}-outcome
       Description: Tell the requester about decisions and fulfilment
-      EventBusName: !Ref EventBus
+      EventBusName: default
       EventPattern:
         source: [request-hub.requests]
         detail-type: [Request Status Changed]
@@ -1191,7 +1177,7 @@ Resources:
     Properties:
       Name: !Sub ${AWS::StackName}-workflow-failure
       Description: Page the ops topic when a request workflow fails
-      EventBusName: !Ref EventBus
+      EventBusName: default
       EventPattern:
         source: [request-hub.requests]
         detail-type: [Request Status Changed]
@@ -1211,7 +1197,7 @@ Resources:
     Properties:
       Name: !Sub ${AWS::StackName}-fulfilment
       Description: Queue approved requests for fulfilment
-      EventBusName: !Ref EventBus
+      EventBusName: default
       EventPattern:
         source: [request-hub.requests]
         detail-type: [Request Status Changed]
@@ -1255,7 +1241,7 @@ Resources:
     Properties:
       Name: !Sub ${AWS::StackName}-audit
       Description: Copy every domain event to the S3 audit lake
-      EventBusName: !Ref EventBus
+      EventBusName: default
       EventPattern:
         source:
           - prefix: request-hub
@@ -2073,27 +2059,6 @@ Resources:
           ]
         }
 
-  WorkflowFailuresQuery:
-    Type: AWS::Logs::QueryDefinition
-    Properties:
-      Name: !Sub ${AWS::StackName}/workflow-failures
-      LogGroupNames: [!Ref WorkflowLogs]
-      QueryString: |
-        fields @timestamp, type, execution_arn, details.error, details.cause
-        | filter type like /Failed|TimedOut|Aborted/
-        | sort @timestamp desc
-        | limit 50
-
-  SlowApiCallsQuery:
-    Type: AWS::Logs::QueryDefinition
-    Properties:
-      Name: !Sub ${AWS::StackName}/slow-api-calls
-      LogGroupNames: [!Ref ApiAccessLogs]
-      QueryString: |
-        fields @timestamp, method, resource, status, latencyMs, integrationLatencyMs, waf
-        | sort latencyMs desc
-        | limit 25
-
 Outputs:
   AppUrl:
     Description: Open this URL to use the Request Hub web app
@@ -2117,7 +2082,7 @@ Outputs:
   AuditBucketName:
     Value: !Ref AuditBucket
   EventBusName:
-    Value: !Ref EventBus
+    Value: default
   StateMachineArn:
     Value: !Ref ApprovalWorkflow
   FulfilmentDlqUrl:

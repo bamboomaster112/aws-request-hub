@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Creates three test users (requester, approver, admin), sets strong random
-passwords, enrols each one in TOTP MFA, and stores the credentials in
-Secrets Manager as <stack>/test-users for the smoke test.
+passwords, enrols each one in TOTP MFA, and stores the credentials in a
+private file in the CloudShell home directory for the smoke test.
 
-Nobody types a password: they are generated here and only ever live in
-Secrets Manager. Safe to re-run: the test users are recreated from scratch,
+Nobody types a password: they are generated here and never printed. Safe to re-run: the test users are recreated from scratch,
 because an existing TOTP enrolment cannot be reset through the admin API.
 """
 import secrets as pysecrets
@@ -85,7 +84,7 @@ def main():
                        "totpSecret": enrol_mfa(out, email, password)}
         print(f"  {role}: MFA enrolled")
     hubkit.save_users(users)
-    print(f"Stored credentials in Secrets Manager: {hubkit.SECRET_NAME}")
+    print(f"Stored credentials (mode 600) in {hubkit.USERS_FILE}")
     print("For the web app, create your own user (Cognito emails a temporary password and you enrol MFA")
     print("with your authenticator app):  ./scripts/create-user.sh you@yourdomain.com approvers")
 
