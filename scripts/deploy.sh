@@ -42,8 +42,12 @@ if [[ "$USE_PIPES" == "true" ]] && denied aws pipes list-pipes --limit 1; then
   USE_PIPES=false; echo "EventBridge Pipes is blocked in this account: using the Lambda CDC publisher instead."
 fi
 
+# The playground denies secretsmanager:GetRandomPassword, so generate the downstream API key here.
+DOWNSTREAM_API_KEY="${DOWNSTREAM_API_KEY:-$(openssl rand -hex 24)}"
+
 PARAMS=(
   "NotificationEmail=$NOTIFICATION_EMAIL"
+  "DownstreamApiKey=$DOWNSTREAM_API_KEY"
   "UseEventBridgePipes=$USE_PIPES"
   "EnableWaf=$ENABLE_WAF"
   "EnableApiGatewayAccountLogging=$API_LOGGING"

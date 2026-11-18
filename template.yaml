@@ -32,6 +32,11 @@ Parameters:
     AllowedValues: ['true', 'false']
     Default: 'true'
     Description: Sets the account-level API Gateway CloudWatch role and enables API access logs.
+  DownstreamApiKey:
+    Type: String
+    NoEcho: true
+    MinLength: 20
+    Description: Credential for the simulated downstream system. deploy.sh generates one (the playground denies secretsmanager:GetRandomPassword).
   EnableWaf:
     Type: String
     AllowedValues: ['true', 'false']
@@ -317,11 +322,7 @@ Resources:
         - Suffix: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]
       Description: Credential for the (simulated) downstream fulfilment system, for example an ERP or ITSM tool
       KmsKeyId: !Ref AppKey
-      GenerateSecretString:
-        SecretStringTemplate: '{"endpoint": "https://erp.example.internal/api"}'
-        GenerateStringKey: apiKey
-        PasswordLength: 40
-        ExcludePunctuation: true
+      SecretString: !Sub '{"endpoint": "https://erp.example.internal/api", "apiKey": "${DownstreamApiKey}"}'
 
   # ---------------------------------------------------------------------------
   # Identity: Cognito user pool with mandatory TOTP MFA (playground policy)
@@ -482,12 +483,30 @@ Resources:
       Topics: [!Ref ApprovalsTopic, !Ref UpdatesTopic, !Ref OpsTopic]
       PolicyDocument:
         Statement:
-          - Sid: AllowEventBridgeAndCloudWatchAlarms
+          - Sid: AllowEventBridgeAndAlarmsApprovals
             Effect: Allow
             Principal:
               Service: [events.amazonaws.com, cloudwatch.amazonaws.com]
             Action: sns:Publish
-            Resource: [!Ref ApprovalsTopic, !Ref UpdatesTopic, !Ref OpsTopic]
+            Resource: !Ref ApprovalsTopic
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+          - Sid: AllowEventBridgeAndAlarmsUpdates
+            Effect: Allow
+            Principal:
+              Service: [events.amazonaws.com, cloudwatch.amazonaws.com]
+            Action: sns:Publish
+            Resource: !Ref UpdatesTopic
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+          - Sid: AllowEventBridgeAndAlarmsOps
+            Effect: Allow
+            Principal:
+              Service: [events.amazonaws.com, cloudwatch.amazonaws.com]
+            Action: sns:Publish
+            Resource: !Ref OpsTopic
             Condition:
               StringEquals:
                 aws:SourceAccount: !Ref AWS::AccountId
