@@ -57,42 +57,49 @@ Resources:
 
   BuildLogs:
     Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       LogGroupName: !Sub /aws/codebuild/${CoreStackName}
-      RetentionInDays: 7
+
+  BuildRolePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Least-privilege permissions for BuildRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: [logs:CreateLogStream, logs:PutLogEvents]
+            Resource: !Sub ${BuildLogs.Arn}:*
+          - Effect: Allow
+            Action: [s3:GetObject, s3:GetObjectVersion, s3:PutObject]
+            Resource: !Sub ${ArtifactBucket.Arn}/*
+          - Effect: Allow
+            Action: [codebuild:CreateReportGroup, codebuild:CreateReport, codebuild:UpdateReport, codebuild:BatchPutTestCases]
+            Resource: !Sub arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:report-group/${CoreStackName}-*
+          - Effect: Allow
+            Action: cloudformation:DescribeStacks
+            Resource: !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${CoreStackName}/*
+          - Effect: Allow
+            Action: [s3:PutObject, s3:GetObject, s3:DeleteObject]
+            Resource: !Sub arn:aws:s3:::${CoreStackName}-web-${AWS::AccountId}-${AWS::Region}/*
+          - Effect: Allow
+            Action: s3:ListBucket
+            Resource: !Sub arn:aws:s3:::${CoreStackName}-web-${AWS::AccountId}-${AWS::Region}
 
   BuildRole:
     Type: AWS::IAM::Role
     Properties:
+      Path: /service-role/
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
           - Effect: Allow
             Principal: {Service: codebuild.amazonaws.com}
             Action: sts:AssumeRole
-      Policies:
-        - PolicyName: build
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action: [logs:CreateLogStream, logs:PutLogEvents]
-                Resource: !Sub ${BuildLogs.Arn}:*
-              - Effect: Allow
-                Action: [s3:GetObject, s3:GetObjectVersion, s3:PutObject]
-                Resource: !Sub ${ArtifactBucket.Arn}/*
-              - Effect: Allow
-                Action: [codebuild:CreateReportGroup, codebuild:CreateReport, codebuild:UpdateReport, codebuild:BatchPutTestCases]
-                Resource: !Sub arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:report-group/${CoreStackName}-*
-              - Effect: Allow
-                Action: cloudformation:DescribeStacks
-                Resource: !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${CoreStackName}/*
-              - Effect: Allow
-                Action: [s3:PutObject, s3:GetObject, s3:DeleteObject]
-                Resource: !Sub arn:aws:s3:::${CoreStackName}-web-${AWS::AccountId}-${AWS::Region}/*
-              - Effect: Allow
-                Action: s3:ListBucket
-                Resource: !Sub arn:aws:s3:::${CoreStackName}-web-${AWS::AccountId}-${AWS::Region}
+      ManagedPolicyArns:
+        - !Ref BuildRolePolicy
 
   TestProject:
     Type: AWS::CodeBuild::Project
@@ -140,29 +147,35 @@ Resources:
           GroupName: !Ref BuildLogs
           StreamName: deploy-web
 
+  PipelineRolePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Least-privilege permissions for PipelineRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: [s3:GetObject, s3:GetObjectVersion, s3:GetBucketVersioning, s3:ListBucket]
+            Resource: [!GetAtt SourceBucket.Arn, !Sub '${SourceBucket.Arn}/*']
+          - Effect: Allow
+            Action: [s3:GetObject, s3:GetObjectVersion, s3:PutObject, s3:GetBucketVersioning, s3:ListBucket]
+            Resource: [!GetAtt ArtifactBucket.Arn, !Sub '${ArtifactBucket.Arn}/*']
+          - Effect: Allow
+            Action: [codebuild:StartBuild, codebuild:BatchGetBuilds]
+            Resource: [!GetAtt TestProject.Arn, !GetAtt DeployWebProject.Arn]
+
   PipelineRole:
     Type: AWS::IAM::Role
     Properties:
+      Path: /service-role/
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
           - Effect: Allow
             Principal: {Service: codepipeline.amazonaws.com}
             Action: sts:AssumeRole
-      Policies:
-        - PolicyName: pipeline
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action: [s3:GetObject, s3:GetObjectVersion, s3:GetBucketVersioning, s3:ListBucket]
-                Resource: [!GetAtt SourceBucket.Arn, !Sub '${SourceBucket.Arn}/*']
-              - Effect: Allow
-                Action: [s3:GetObject, s3:GetObjectVersion, s3:PutObject, s3:GetBucketVersioning, s3:ListBucket]
-                Resource: [!GetAtt ArtifactBucket.Arn, !Sub '${ArtifactBucket.Arn}/*']
-              - Effect: Allow
-                Action: [codebuild:StartBuild, codebuild:BatchGetBuilds]
-                Resource: [!GetAtt TestProject.Arn, !GetAtt DeployWebProject.Arn]
+      ManagedPolicyArns:
+        - !Ref PipelineRolePolicy
 
   Pipeline:
     Type: AWS::CodePipeline::Pipeline
@@ -202,23 +215,29 @@ Resources:
               InputArtifacts:
                 - Name: SourceOutput
 
+  StartPipelineRolePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Least-privilege permissions for StartPipelineRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: codepipeline:StartPipelineExecution
+            Resource: !Sub arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${Pipeline}
+
   StartPipelineRole:
     Type: AWS::IAM::Role
     Properties:
+      Path: /service-role/
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
           - Effect: Allow
             Principal: {Service: events.amazonaws.com}
             Action: sts:AssumeRole
-      Policies:
-        - PolicyName: start-pipeline
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action: codepipeline:StartPipelineExecution
-                Resource: !Sub arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${Pipeline}
+      ManagedPolicyArns:
+        - !Ref StartPipelineRolePolicy
 
   SourceUploadedRule:
     Type: AWS::Events::Rule

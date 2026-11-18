@@ -60,27 +60,34 @@ Resources:
 
   TrailLogs:
     Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       LogGroupName: !Sub /aws/cloudtrail/${CoreStackName}
-      RetentionInDays: 7
+
+  TrailLogsRolePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Least-privilege permissions for TrailLogsRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: [logs:CreateLogStream, logs:PutLogEvents]
+            Resource: !Sub ${TrailLogs.Arn}:*
 
   TrailLogsRole:
     Type: AWS::IAM::Role
     Properties:
+      Path: /service-role/
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
           - Effect: Allow
             Principal: {Service: cloudtrail.amazonaws.com}
             Action: sts:AssumeRole
-      Policies:
-        - PolicyName: deliver-to-logs
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action: [logs:CreateLogStream, logs:PutLogEvents]
-                Resource: !Sub ${TrailLogs.Arn}:*
+      ManagedPolicyArns:
+        - !Ref TrailLogsRolePolicy
 
   Trail:
     Type: AWS::CloudTrail::Trail
@@ -141,6 +148,7 @@ Resources:
     Type: AWS::IAM::Role
     Condition: CreateRecorder
     Properties:
+      Path: /service-role/
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
