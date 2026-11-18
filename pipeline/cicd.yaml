@@ -1,0 +1,247 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Request Hub CI/CD: an S3-sourced CodePipeline (V2) started by an EventBridge rule.
+  Test stage = unit tests, cfn-lint, Bandit SAST and a JavaScript syntax check.
+  Deploy stage = publish the web app. Sized for the playground limits (small
+  CodeBuild compute, builds under 10 minutes, at most 3 pipelines).
+
+Parameters:
+  CoreStackName:
+    Type: String
+    Default: request-hub
+
+Resources:
+  SourceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${CoreStackName}-source-${AWS::AccountId}-${AWS::Region}
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: keep-recent-releases
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 3
+
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${CoreStackName}-artifacts-${AWS::AccountId}-${AWS::Region}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-artifacts
+            Status: Enabled
+            ExpirationInDays: 3
+
+  BuildLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/codebuild/${CoreStackName}
+      RetentionInDays: 7
+
+  BuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: codebuild.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: build
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub ${BuildLogs.Arn}:*
+              - Effect: Allow
+                Action: [s3:GetObject, s3:GetObjectVersion, s3:PutObject]
+                Resource: !Sub ${ArtifactBucket.Arn}/*
+              - Effect: Allow
+                Action: [codebuild:CreateReportGroup, codebuild:CreateReport, codebuild:UpdateReport, codebuild:BatchPutTestCases]
+                Resource: !Sub arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:report-group/${CoreStackName}-*
+              - Effect: Allow
+                Action: cloudformation:DescribeStacks
+                Resource: !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${CoreStackName}/*
+              - Effect: Allow
+                Action: [s3:PutObject, s3:GetObject, s3:DeleteObject]
+                Resource: !Sub arn:aws:s3:::${CoreStackName}-web-${AWS::AccountId}-${AWS::Region}/*
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub arn:aws:s3:::${CoreStackName}-web-${AWS::AccountId}-${AWS::Region}
+
+  TestProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${CoreStackName}-test
+      Description: Unit tests, cfn-lint, Bandit SAST and JavaScript syntax check
+      ServiceRole: !GetAtt BuildRole.Arn
+      Artifacts: {Type: CODEPIPELINE}
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: pipeline/buildspec-test.yml
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL      # playground allows SMALL or Lambda compute only
+        Image: aws/codebuild/amazonlinux-x86_64-standard:5.0
+      TimeoutInMinutes: 10                     # playground maximum
+      QueuedTimeoutInMinutes: 10
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref BuildLogs
+          StreamName: test
+
+  DeployWebProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${CoreStackName}-deploy-web
+      Description: Publishes the web app and its runtime config to the web bucket
+      ServiceRole: !GetAtt BuildRole.Arn
+      Artifacts: {Type: CODEPIPELINE}
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: pipeline/buildspec-deploy.yml
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux-x86_64-standard:5.0
+        EnvironmentVariables:
+          - {Name: STACK, Value: !Ref CoreStackName}
+      TimeoutInMinutes: 10
+      QueuedTimeoutInMinutes: 10
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref BuildLogs
+          StreamName: deploy-web
+
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: codepipeline.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: pipeline
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:GetObjectVersion, s3:GetBucketVersioning, s3:ListBucket]
+                Resource: [!GetAtt SourceBucket.Arn, !Sub '${SourceBucket.Arn}/*']
+              - Effect: Allow
+                Action: [s3:GetObject, s3:GetObjectVersion, s3:PutObject, s3:GetBucketVersioning, s3:ListBucket]
+                Resource: [!GetAtt ArtifactBucket.Arn, !Sub '${ArtifactBucket.Arn}/*']
+              - Effect: Allow
+                Action: [codebuild:StartBuild, codebuild:BatchGetBuilds]
+                Resource: [!GetAtt TestProject.Arn, !GetAtt DeployWebProject.Arn]
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub ${CoreStackName}-pipeline
+      PipelineType: V2
+      ExecutionMode: SUPERSEDED
+      RoleArn: !GetAtt PipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId: {Category: Source, Owner: AWS, Provider: S3, Version: '1'}
+              Configuration:
+                S3Bucket: !Ref SourceBucket
+                S3ObjectKey: request-hub.zip
+                PollForSourceChanges: false
+              OutputArtifacts:
+                - Name: SourceOutput
+        - Name: Test
+          Actions:
+            - Name: UnitLintSast
+              ActionTypeId: {Category: Build, Owner: AWS, Provider: CodeBuild, Version: '1'}
+              Configuration:
+                ProjectName: !Ref TestProject
+              InputArtifacts:
+                - Name: SourceOutput
+        - Name: Deploy
+          Actions:
+            - Name: PublishWebApp
+              ActionTypeId: {Category: Build, Owner: AWS, Provider: CodeBuild, Version: '1'}
+              Configuration:
+                ProjectName: !Ref DeployWebProject
+              InputArtifacts:
+                - Name: SourceOutput
+
+  StartPipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: events.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: start-pipeline
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: codepipeline:StartPipelineExecution
+                Resource: !Sub arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${Pipeline}
+
+  SourceUploadedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${CoreStackName}-source-uploaded
+      Description: Start the pipeline when a new release zip lands in the source bucket
+      EventPattern:
+        source: [aws.s3]
+        detail-type: [Object Created]
+        detail:
+          bucket:
+            name: [!Ref SourceBucket]
+          object:
+            key: [request-hub.zip]
+      Targets:
+        - Id: pipeline
+          Arn: !Sub arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${Pipeline}
+          RoleArn: !GetAtt StartPipelineRole.Arn
+
+Outputs:
+  SourceBucketName:
+    Value: !Ref SourceBucket
+  ArtifactBucketName:
+    Value: !Ref ArtifactBucket
+  PipelineName:
+    Value: !Ref Pipeline

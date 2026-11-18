@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# One-command deploy for Request Hub. Run from AWS CloudShell inside the playground.
+#
+#   ./scripts/deploy.sh                                  # core stack + web app + CI/CD pipeline
+#   NOTIFICATION_EMAIL=you@example.com ./scripts/deploy.sh
+#   USE_PIPES=false ./scripts/deploy.sh                  # Lambda CDC publisher instead of EventBridge Pipes
+#   WITH_GOVERNANCE=true ./scripts/deploy.sh             # also CloudTrail + AWS Config rules
+#
+set -euo pipefail
+
+STACK="${STACK:-request-hub}"
+REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-us-east-1}}"
+export AWS_REGION="$REGION" AWS_DEFAULT_REGION="$REGION" STACK
+NOTIFICATION_EMAIL="${NOTIFICATION_EMAIL:-}"
+USE_PIPES="${USE_PIPES:-true}"
+API_LOGGING="${API_LOGGING:-true}"
+SLA_SECONDS="${SLA_SECONDS:-180}"
+WITH_PIPELINE="${WITH_PIPELINE:-true}"
+WITH_GOVERNANCE="${WITH_GOVERNANCE:-false}"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT"
+
+step() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
+started=$(date +%s)
+
+step "Identity and region"
+aws sts get-caller-identity --query '[Account, Arn]' --output text
+echo "Region: $REGION   Stack: $STACK"
+
+PARAMS=(
+  "NotificationEmail=$NOTIFICATION_EMAIL"
+  "UseEventBridgePipes=$USE_PIPES"
+  "EnableApiGatewayAccountLogging=$API_LOGGING"
+  "ApprovalSlaSeconds=$SLA_SECONDS"
+  "EscalationSlaSeconds=$SLA_SECONDS"
+)
+
+step "Deploying core stack ($STACK)"
+if command -v sam >/dev/null 2>&1; then
+  sam deploy \
+    --template-file template.yaml \
+    --stack-name "$STACK" \
+    --region "$REGION" \
+    --resolve-s3 \
+    --s3-prefix "$STACK" \
+    --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND \
+    --no-confirm-changeset \
+    --no-fail-on-empty-changeset \
+    --parameter-overrides "${PARAMS[@]}" \
+    --tags Project=request-hub Environment=playground
+else
+  echo "SAM CLI not found, falling back to aws cloudformation package/deploy"
+  ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+  ARTIFACTS="${STACK}-artifacts-${ACCOUNT}-${REGION}"
+  aws s3api head-bucket --bucket "$ARTIFACTS" 2>/dev/null || aws s3 mb "s3://$ARTIFACTS" --region "$REGION"
+  aws cloudformation package --template-file template.yaml --s3-bucket "$ARTIFACTS" --s3-prefix "$STACK" \
+    --output-template-file /tmp/packaged.yaml
+  aws cloudformation deploy --template-file /tmp/packaged.yaml --stack-name "$STACK" \
+    --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND \
+    --no-fail-on-empty-changeset --parameter-overrides "${PARAMS[@]}" \
+    --tags Project=request-hub Environment=playground
+fi
+
+step "Publishing the web app"
+"$ROOT/scripts/publish-web.sh"
+
+if [[ "$WITH_PIPELINE" == "true" ]]; then
+  step "Deploying CI/CD stack (${STACK}-cicd)"
+  aws cloudformation deploy \
+    --template-file pipeline/cicd.yaml \
+    --stack-name "${STACK}-cicd" \
+    --capabilities CAPABILITY_IAM \
+    --no-fail-on-empty-changeset \
+    --parameter-overrides "CoreStackName=$STACK" \
+    --tags Project=request-hub Environment=playground
+  echo "Pipeline ready. Run ./scripts/release.sh to push this code through it."
+fi
+
+if [[ "$WITH_GOVERNANCE" == "true" ]]; then
+  step "Deploying governance stack (${STACK}-governance)"
+  existing=$(aws configservice describe-configuration-recorders --query 'length(ConfigurationRecorders)' --output text 2>/dev/null || echo 0)
+  create_recorder=true
+  if [[ "$existing" != "0" ]]; then
+    echo "An AWS Config recorder already exists in this account, so only the rules are deployed."
+    create_recorder=false
+  fi
+  aws cloudformation deploy \
+    --template-file governance/governance.yaml \
+    --stack-name "${STACK}-governance" \
+    --capabilities CAPABILITY_IAM \
+    --no-fail-on-empty-changeset \
+    --parameter-overrides "CoreStackName=$STACK" "CreateConfigRecorder=$create_recorder" \
+    --tags Project=request-hub Environment=playground
+fi
+
+step "Done in $(( $(date +%s) - started ))s"
+aws cloudformation describe-stacks --stack-name "$STACK" \
+  --query "Stacks[0].Outputs[?contains(['AppUrl','UserPoolId','CognitoDomain','DashboardUrl','CdcMode'], OutputKey)].[OutputKey, OutputValue]" \
+  --output table
+cat <<'EOF'
+
+Next:
+  python3 scripts/seed-users.py      # creates requester, approver and admin test users (MFA enrolled)
+  python3 scripts/smoke-test.py      # end-to-end checks through WAF, API Gateway, workflow and fulfilment
+EOF

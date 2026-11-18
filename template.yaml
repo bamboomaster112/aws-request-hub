@@ -1,0 +1,1886 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  Request Hub (core stack): an industry-agnostic, event-driven request and approval
+  platform. API Gateway + WAF + Cognito at the edge, a functionless create path into
+  DynamoDB, change data capture through EventBridge Pipes, a Step Functions approval
+  workflow with SLA escalation, SQS-driven fulfilment, SNS notifications, a Firehose
+  audit lake in S3, and CloudWatch/X-Ray observability. Sized for the KodeKloud AWS
+  Playground limits.
+
+Parameters:
+  NotificationEmail:
+    Type: String
+    Default: ''
+    Description: Optional email address subscribed to the approvals, updates and ops topics (you must confirm the subscription emails).
+  UseEventBridgePipes:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'true'
+    Description: true = DynamoDB Streams -> EventBridge Pipes (functionless CDC). false = fall back to a small Lambda publisher.
+  ApprovalSlaSeconds:
+    Type: Number
+    Default: 180
+    MinValue: 60
+    Description: Seconds an approver has before the request escalates to admins (kept short for demos).
+  EscalationSlaSeconds:
+    Type: Number
+    Default: 180
+    MinValue: 60
+    Description: Seconds admins have on an escalated request before it expires.
+  EnableApiGatewayAccountLogging:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'true'
+    Description: Sets the account-level API Gateway CloudWatch role and enables API access logs.
+
+Conditions:
+  HasEmail: !Not [!Equals [!Ref NotificationEmail, '']]
+  UsePipes: !Equals [!Ref UseEventBridgePipes, 'true']
+  UseLambdaPublisher: !Equals [!Ref UseEventBridgePipes, 'false']
+  ApiLogging: !Equals [!Ref EnableApiGatewayAccountLogging, 'true']
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [x86_64]
+    MemorySize: 256      # playground maximum
+    Timeout: 8           # playground maximum is 10 seconds
+    Tracing: Active
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref RequestsTable
+        METRICS_NAMESPACE: RequestHub
+    Tags:
+      Project: request-hub
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # Encryption
+  # ---------------------------------------------------------------------------
+  AppKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Request Hub customer managed key (DynamoDB, S3, SQS, SNS, Secrets Manager, CloudWatch Logs)
+      EnableKeyRotation: true
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AccountAdministration
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+          - Sid: UseThroughAwsServicesFromThisAccountOnly
+            Effect: Allow
+            Principal:
+              AWS: '*'
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+              - kms:CreateGrant
+            Resource: '*'
+            Condition:
+              StringEquals:
+                kms:CallerAccount: !Ref AWS::AccountId
+                kms:ViaService:
+                  - !Sub dynamodb.${AWS::Region}.amazonaws.com
+                  - !Sub sqs.${AWS::Region}.amazonaws.com
+                  - !Sub sns.${AWS::Region}.amazonaws.com
+                  - !Sub s3.${AWS::Region}.amazonaws.com
+                  - !Sub secretsmanager.${AWS::Region}.amazonaws.com
+          - Sid: AllowEventBridgeAndAlarmsToUseEncryptedQueuesAndTopics
+            Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+                - cloudwatch.amazonaws.com
+            Action:
+              - kms:GenerateDataKey*
+              - kms:Decrypt
+            Resource: '*'
+          - Sid: AllowCloudWatchLogsEncryption
+            Effect: Allow
+            Principal:
+              Service: !Sub logs.${AWS::Region}.amazonaws.com
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:Describe*
+            Resource: '*'
+            Condition:
+              ArnLike:
+                kms:EncryptionContext:aws:logs:arn: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*
+
+  AppKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub alias/${AWS::StackName}
+      TargetKeyId: !Ref AppKey
+
+  # ---------------------------------------------------------------------------
+  # Data: single-table DynamoDB design
+  #   META item  PK=REQ#<id> SK=META           (status transitions only)
+  #   ATT items  PK=REQ#<id> SK=ATT#<attId>    (attachment metadata)
+  #   GSI1       USER#<sub>  / createdAt        ("my requests")
+  #   GSI2       STATUS#<s>  / createdAt        (approval inboxes)
+  # ---------------------------------------------------------------------------
+  RequestsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${AWS::StackName}-requests
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: PK, AttributeType: S}
+        - {AttributeName: SK, AttributeType: S}
+        - {AttributeName: GSI1PK, AttributeType: S}
+        - {AttributeName: GSI1SK, AttributeType: N}
+        - {AttributeName: GSI2PK, AttributeType: S}
+        - {AttributeName: GSI2SK, AttributeType: N}
+      KeySchema:
+        - {AttributeName: PK, KeyType: HASH}
+        - {AttributeName: SK, KeyType: RANGE}
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1
+          KeySchema:
+            - {AttributeName: GSI1PK, KeyType: HASH}
+            - {AttributeName: GSI1SK, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+        - IndexName: GSI2
+          KeySchema:
+            - {AttributeName: GSI2PK, KeyType: HASH}
+            - {AttributeName: GSI2SK, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref AppKey
+      Tags:
+        - {Key: Project, Value: request-hub}
+
+  # ---------------------------------------------------------------------------
+  # Storage: web app, attachments and audit lake
+  # ---------------------------------------------------------------------------
+  WebBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${AWS::StackName}-web-${AWS::AccountId}-${AWS::Region}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt AppKey.Arn
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+
+  AttachmentsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${AWS::StackName}-attachments-${AWS::AccountId}-${AWS::Region}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt AppKey.Arn
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      CorsConfiguration:
+        CorsRules:
+          # Uploads use short-lived presigned POST policies, so the signature (not the origin) is the control.
+          - AllowedMethods: [POST, GET]
+            AllowedOrigins: ['*']
+            AllowedHeaders: ['*']
+            MaxAge: 3000
+      LifecycleConfiguration:
+        Rules:
+          - Id: abort-incomplete-uploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+
+  AuditBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${AWS::StackName}-audit-${AWS::AccountId}-${AWS::Region}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt AppKey.Arn
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-delivery-errors
+            Status: Enabled
+            Prefix: errors/
+            ExpirationInDays: 7
+
+  WebBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebBucket
+      PolicyDocument:
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource: [!GetAtt WebBucket.Arn, !Sub '${WebBucket.Arn}/*']
+            Condition: {Bool: {aws:SecureTransport: 'false'}}
+
+  AttachmentsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AttachmentsBucket
+      PolicyDocument:
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource: [!GetAtt AttachmentsBucket.Arn, !Sub '${AttachmentsBucket.Arn}/*']
+            Condition: {Bool: {aws:SecureTransport: 'false'}}
+
+  AuditBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AuditBucket
+      PolicyDocument:
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource: [!GetAtt AuditBucket.Arn, !Sub '${AuditBucket.Arn}/*']
+            Condition: {Bool: {aws:SecureTransport: 'false'}}
+
+  # ---------------------------------------------------------------------------
+  # Configuration and secrets
+  # ---------------------------------------------------------------------------
+  PolicyRulesParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${AWS::StackName}/policy-rules
+      Type: String
+      Description: Approval policy evaluated by the policy engine. Change thresholds here without redeploying code.
+      Value: !Sub |
+        {
+          "version": "2026-11-18",
+          "default": {
+            "autoApproveMax": -1,
+            "highRiskMin": null,
+            "approverGroup": "approvers",
+            "highRiskApproverGroup": "admins",
+            "slaSeconds": ${ApprovalSlaSeconds},
+            "escalationSeconds": ${EscalationSlaSeconds}
+          },
+          "types": {
+            "PURCHASE": {"autoApproveMax": 499, "highRiskMin": 5000},
+            "ACCESS":   {"autoApproveMax": -1},
+            "LEAVE":    {"autoApproveMax": 2, "highRiskMin": 15},
+            "CHANGE":   {"autoApproveMax": -1, "highRiskMin": 0},
+            "GENERAL":  {"autoApproveMax": 100, "highRiskMin": 10000}
+          }
+        }
+
+  DownstreamApiSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${AWS::StackName}/downstream-api
+      Description: Credential for the (simulated) downstream fulfilment system, for example an ERP or ITSM tool
+      KmsKeyId: !Ref AppKey
+      GenerateSecretString:
+        SecretStringTemplate: '{"endpoint": "https://erp.example.internal/api"}'
+        GenerateStringKey: apiKey
+        PasswordLength: 40
+        ExcludePunctuation: true
+
+  # ---------------------------------------------------------------------------
+  # Identity: Cognito user pool with mandatory TOTP MFA (playground policy)
+  # ---------------------------------------------------------------------------
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub ${AWS::StackName}-users
+      UserPoolTier: PLUS
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      MfaConfiguration: 'ON'
+      EnabledMfas: [SOFTWARE_TOKEN_MFA]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          TemporaryPasswordValidityDays: 3
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - {Name: verified_email, Priority: 1}
+      UserPoolAddOns:
+        AdvancedSecurityMode: ENFORCED
+      DeletionProtection: INACTIVE
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+
+  RequestersGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: requesters
+      Description: Can raise and track their own requests
+      UserPoolId: !Ref UserPool
+      Precedence: 30
+
+  ApproversGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: approvers
+      Description: Approve or reject standard-risk requests
+      UserPoolId: !Ref UserPool
+      Precedence: 20
+
+  AdminsGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: admins
+      Description: Approve high-risk and escalated requests
+      UserPoolId: !Ref UserPool
+      Precedence: 10
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub ${AWS::StackName}-${AWS::AccountId}
+      UserPoolId: !Ref UserPool
+      ManagedLoginVersion: 1
+
+  WebClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: request-hub-web
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid, email, profile]
+      SupportedIdentityProviders: [COGNITO]
+      CallbackURLs:
+        - !Sub https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/v1/
+      LogoutURLs:
+        - !Sub https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/v1/
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_ADMIN_USER_PASSWORD_AUTH   # used only by the CloudShell test scripts
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      RefreshTokenValidity: 1
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: days
+
+  # ---------------------------------------------------------------------------
+  # Events: custom bus, archive, queues and topics
+  # ---------------------------------------------------------------------------
+  EventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub ${AWS::StackName}-bus
+
+  EventArchive:
+    Type: AWS::Events::Archive
+    Properties:
+      ArchiveName: !Sub ${AWS::StackName}-events
+      Description: Replayable history of Request Hub domain events
+      SourceArn: !GetAtt EventBus.Arn
+      RetentionDays: 1
+      EventPattern:
+        source:
+          - prefix: request-hub
+
+  EventsDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-events-dlq
+      MessageRetentionPeriod: 345600
+      KmsMasterKeyId: !Ref AppKey
+
+  FulfilmentDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-fulfilment-dlq
+      MessageRetentionPeriod: 345600
+      KmsMasterKeyId: !Ref AppKey
+
+  FulfilmentQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-fulfilment
+      VisibilityTimeout: 60
+      KmsMasterKeyId: !Ref AppKey
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt FulfilmentDlq.Arn
+        maxReceiveCount: 3
+
+  QueuePolicies:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref EventsDlq, !Ref FulfilmentQueue]
+      PolicyDocument:
+        Statement:
+          - Sid: AllowEventBridgeRulesOnTheAppBus
+            Effect: Allow
+            Principal: {Service: events.amazonaws.com}
+            Action: sqs:SendMessage
+            Resource: [!GetAtt EventsDlq.Arn, !GetAtt FulfilmentQueue.Arn]
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/${AWS::StackName}-bus/*
+
+  ApprovalsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${AWS::StackName}-approvals
+      DisplayName: Request Hub approvals
+      KmsMasterKeyId: !Ref AppKey
+
+  UpdatesTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${AWS::StackName}-updates
+      DisplayName: Request Hub updates
+      KmsMasterKeyId: !Ref AppKey
+
+  OpsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${AWS::StackName}-ops-alerts
+      DisplayName: Request Hub ops alerts
+      KmsMasterKeyId: !Ref AppKey
+
+  TopicsPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref ApprovalsTopic, !Ref UpdatesTopic, !Ref OpsTopic]
+      PolicyDocument:
+        Statement:
+          - Sid: AllowEventBridgeAndCloudWatchAlarms
+            Effect: Allow
+            Principal:
+              Service: [events.amazonaws.com, cloudwatch.amazonaws.com]
+            Action: sns:Publish
+            Resource: [!Ref ApprovalsTopic, !Ref UpdatesTopic, !Ref OpsTopic]
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  ApprovalsEmail:
+    Type: AWS::SNS::Subscription
+    Condition: HasEmail
+    Properties:
+      TopicArn: !Ref ApprovalsTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  UpdatesEmail:
+    Type: AWS::SNS::Subscription
+    Condition: HasEmail
+    Properties:
+      TopicArn: !Ref UpdatesTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  OpsEmail:
+    Type: AWS::SNS::Subscription
+    Condition: HasEmail
+    Properties:
+      TopicArn: !Ref OpsTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # ---------------------------------------------------------------------------
+  # Change data capture: DynamoDB Streams -> EventBridge Pipes -> custom bus
+  # Every write to a META item is a status transition, so each MODIFY is an event.
+  # ---------------------------------------------------------------------------
+  PipeRole:
+    Type: AWS::IAM::Role
+    Condition: UsePipes
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: pipes.amazonaws.com}
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: cdc-to-bus
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:DescribeStream
+                  - dynamodb:GetRecords
+                  - dynamodb:GetShardIterator
+                  - dynamodb:ListStreams
+                Resource: !GetAtt RequestsTable.StreamArn
+              - Effect: Allow
+                Action: events:PutEvents
+                Resource: !GetAtt EventBus.Arn
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt EventsDlq.Arn
+
+  SubmittedPipe:
+    Type: AWS::Pipes::Pipe
+    Condition: UsePipes
+    Properties:
+      Name: !Sub ${AWS::StackName}-submitted
+      Description: New request items become "Request Submitted" domain events
+      RoleArn: !GetAtt PipeRole.Arn
+      Source: !GetAtt RequestsTable.StreamArn
+      SourceParameters:
+        DynamoDBStreamParameters:
+          StartingPosition: LATEST
+          BatchSize: 1
+          MaximumRetryAttempts: 3
+          DeadLetterConfig:
+            Arn: !GetAtt EventsDlq.Arn
+        FilterCriteria:
+          Filters:
+            - Pattern: '{"eventName": ["INSERT"], "dynamodb": {"NewImage": {"SK": {"S": ["META"]}}}}'
+      Target: !GetAtt EventBus.Arn
+      TargetParameters:
+        EventBridgeEventBusParameters:
+          Source: request-hub.requests
+          DetailType: Request Submitted
+        InputTemplate: >-
+          {"version": "1", "requestId": "<$.dynamodb.NewImage.requestId.S>",
+          "type": "<$.dynamodb.NewImage.type.S>", "amount": "<$.dynamodb.NewImage.amount.N>",
+          "currency": "<$.dynamodb.NewImage.currency.S>", "requesterId": "<$.dynamodb.NewImage.requesterId.S>",
+          "requesterEmail": "<$.dynamodb.NewImage.requesterEmail.S>", "status": "<$.dynamodb.NewImage.status.S>",
+          "previousStatus": "NONE", "riskTier": "<$.dynamodb.NewImage.riskTier.S>",
+          "approverGroup": "<$.dynamodb.NewImage.approverGroup.S>"}
+
+  StatusChangedPipe:
+    Type: AWS::Pipes::Pipe
+    Condition: UsePipes
+    Properties:
+      Name: !Sub ${AWS::StackName}-status-changed
+      Description: Updates to request items become "Request Status Changed" domain events
+      RoleArn: !GetAtt PipeRole.Arn
+      Source: !GetAtt RequestsTable.StreamArn
+      SourceParameters:
+        DynamoDBStreamParameters:
+          StartingPosition: LATEST
+          BatchSize: 1
+          MaximumRetryAttempts: 3
+          DeadLetterConfig:
+            Arn: !GetAtt EventsDlq.Arn
+        FilterCriteria:
+          Filters:
+            - Pattern: '{"eventName": ["MODIFY"], "dynamodb": {"NewImage": {"SK": {"S": ["META"]}}}}'
+      Target: !GetAtt EventBus.Arn
+      TargetParameters:
+        EventBridgeEventBusParameters:
+          Source: request-hub.requests
+          DetailType: Request Status Changed
+        InputTemplate: >-
+          {"version": "1", "requestId": "<$.dynamodb.NewImage.requestId.S>",
+          "type": "<$.dynamodb.NewImage.type.S>", "amount": "<$.dynamodb.NewImage.amount.N>",
+          "currency": "<$.dynamodb.NewImage.currency.S>", "requesterId": "<$.dynamodb.NewImage.requesterId.S>",
+          "requesterEmail": "<$.dynamodb.NewImage.requesterEmail.S>", "status": "<$.dynamodb.NewImage.status.S>",
+          "previousStatus": "<$.dynamodb.OldImage.status.S>", "riskTier": "<$.dynamodb.NewImage.riskTier.S>",
+          "approverGroup": "<$.dynamodb.NewImage.approverGroup.S>"}
+
+  StreamPublisherFunction:
+    Type: AWS::Serverless::Function
+    Condition: UseLambdaPublisher
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-stream-publisher
+      Description: Fallback CDC publisher used when EventBridge Pipes is unavailable
+      CodeUri: src/stream_publisher/
+      Handler: app.handler
+      Environment:
+        Variables:
+          EVENT_BUS_NAME: !Ref EventBus
+      Policies:
+        - EventBridgePutEventsPolicy:
+            EventBusName: !Ref EventBus
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt EventsDlq.QueueName
+      Events:
+        Stream:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt RequestsTable.StreamArn
+            StartingPosition: LATEST
+            BatchSize: 25
+            MaximumBatchingWindowInSeconds: 2
+            MaximumRetryAttempts: 3
+            BisectBatchOnFunctionError: true
+            DestinationConfig:
+              OnFailure:
+                Type: SQS
+                Destination: !GetAtt EventsDlq.Arn
+            FilterCriteria:
+              Filters:
+                - Pattern: '{"dynamodb": {"NewImage": {"SK": {"S": ["META"]}}}}'
+
+  # ---------------------------------------------------------------------------
+  # Business logic (Lambda is used only where code adds value)
+  # ---------------------------------------------------------------------------
+  PolicyEngineFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: PolicyEngineLogs
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-policy-engine
+      Description: Evaluates approval policy (risk tier, approver group, SLA) from rules in Parameter Store
+      CodeUri: src/policy_engine/
+      Handler: app.handler
+      Environment:
+        Variables:
+          POLICY_PARAMETER: !Ref PolicyRulesParameter
+      Policies:
+        - SSMParameterReadPolicy:
+            ParameterName: !Sub ${AWS::StackName}/policy-rules
+
+  QueryApiFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: QueryApiLogs
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-query-api
+      Description: Read API - my requests, request detail with attachment links, approval inbox
+      CodeUri: src/query_api/
+      Handler: app.handler
+      Environment:
+        Variables:
+          ATTACHMENTS_BUCKET: !Ref AttachmentsBucket
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref RequestsTable
+        - S3ReadPolicy:
+            BucketName: !Ref AttachmentsBucket
+
+  DecisionHandlerFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: DecisionHandlerLogs
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-decision-handler
+      Description: Authorises an approver's decision and resumes the paused workflow with SendTaskSuccess
+      CodeUri: src/decision_handler/
+      Handler: app.handler
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref RequestsTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - states:SendTaskSuccess
+                - states:SendTaskFailure
+              Resource: !Ref ApprovalWorkflow
+
+  AttachmentPresignerFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: AttachmentPresignerLogs
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-attachment-presigner
+      Description: Issues size- and type-restricted presigned S3 POST policies for request attachments
+      CodeUri: src/attachment_presigner/
+      Handler: app.handler
+      Environment:
+        Variables:
+          ATTACHMENTS_BUCKET: !Ref AttachmentsBucket
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RequestsTable
+        - Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub ${AttachmentsBucket.Arn}/requests/*
+
+  FulfilmentWorkerFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: FulfilmentWorkerLogs
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-fulfilment-worker
+      Description: Fulfils approved requests against a (simulated) downstream system, idempotently
+      CodeUri: src/fulfilment_worker/
+      Handler: app.handler
+      Environment:
+        Variables:
+          DOWNSTREAM_SECRET_ARN: !Ref DownstreamApiSecret
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RequestsTable
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Ref DownstreamApiSecret
+      Events:
+        Fulfilment:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt FulfilmentQueue.Arn
+            BatchSize: 5
+            MaximumBatchingWindowInSeconds: 5
+            FunctionResponseTypes: [ReportBatchItemFailures]
+
+  PolicyEngineLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-policy-engine
+      RetentionInDays: 7
+      KmsKeyId: !GetAtt AppKey.Arn
+
+  QueryApiLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-query-api
+      RetentionInDays: 7
+      KmsKeyId: !GetAtt AppKey.Arn
+
+  DecisionHandlerLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-decision-handler
+      RetentionInDays: 7
+      KmsKeyId: !GetAtt AppKey.Arn
+
+  AttachmentPresignerLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-attachment-presigner
+      RetentionInDays: 7
+      KmsKeyId: !GetAtt AppKey.Arn
+
+  FulfilmentWorkerLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-fulfilment-worker
+      RetentionInDays: 7
+      KmsKeyId: !GetAtt AppKey.Arn
+
+  # ---------------------------------------------------------------------------
+  # Orchestration: Step Functions approval workflow
+  # ---------------------------------------------------------------------------
+  WorkflowLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/vendedlogs/states/${AWS::StackName}-approval-workflow
+      RetentionInDays: 7
+      KmsKeyId: !GetAtt AppKey.Arn
+
+  ApprovalWorkflow:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Sub ${AWS::StackName}-approval-workflow
+      Type: STANDARD
+      DefinitionUri: statemachine/approval-workflow.asl.json
+      DefinitionSubstitutions:
+        TableName: !Ref RequestsTable
+        PolicyEngineFunctionArn: !GetAtt PolicyEngineFunction.Arn
+      Logging:
+        Level: ALL
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt WorkflowLogs.Arn
+      Tracing:
+        Enabled: true
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref PolicyEngineFunction
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RequestsTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - logs:CreateLogDelivery
+                - logs:GetLogDelivery
+                - logs:UpdateLogDelivery
+                - logs:DeleteLogDelivery
+                - logs:ListLogDeliveries
+                - logs:PutResourcePolicy
+                - logs:DescribeResourcePolicies
+                - logs:DescribeLogGroups
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - xray:PutTraceSegments
+                - xray:PutTelemetryRecords
+                - xray:GetSamplingRules
+                - xray:GetSamplingTargets
+              Resource: '*'
+      Events:
+        RequestSubmitted:
+          Type: EventBridgeRule
+          Properties:
+            EventBusName: !Ref EventBus
+            Pattern:
+              source: [request-hub.requests]
+              detail-type: [Request Submitted]
+            RetryPolicy:
+              MaximumRetryAttempts: 4
+              MaximumEventAgeInSeconds: 3600
+            DeadLetterConfig:
+              Arn: !GetAtt EventsDlq.Arn
+
+  # ---------------------------------------------------------------------------
+  # Event routing (all functionless): notifications, fulfilment, audit lake
+  # ---------------------------------------------------------------------------
+  ApprovalNeededRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${AWS::StackName}-approval-needed
+      Description: Notify approvers when a request is waiting for a decision
+      EventBusName: !Ref EventBus
+      EventPattern:
+        source: [request-hub.requests]
+        detail-type: [Request Status Changed]
+        detail:
+          status: [PENDING_APPROVAL]
+      Targets:
+        - Id: approvals-topic
+          Arn: !Ref ApprovalsTopic
+          DeadLetterConfig: {Arn: !GetAtt EventsDlq.Arn}
+          RetryPolicy: {MaximumRetryAttempts: 4, MaximumEventAgeInSeconds: 3600}
+          InputTransformer:
+            InputPathsMap:
+              id: $.detail.requestId
+              type: $.detail.type
+              amount: $.detail.amount
+              currency: $.detail.currency
+              risk: $.detail.riskTier
+              group: $.detail.approverGroup
+              requester: $.detail.requesterEmail
+            InputTemplate: !Sub '"Approval needed: <type> request <id> from <requester> for <amount> <currency> (risk <risk>, approver group: <group>). Review it in the Request Hub: https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/v1/"'
+
+  EscalatedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${AWS::StackName}-escalated
+      Description: Tell admins when an approval SLA has been missed
+      EventBusName: !Ref EventBus
+      EventPattern:
+        source: [request-hub.requests]
+        detail-type: [Request Status Changed]
+        detail:
+          status: [ESCALATED]
+      Targets:
+        - Id: approvals-topic
+          Arn: !Ref ApprovalsTopic
+          DeadLetterConfig: {Arn: !GetAtt EventsDlq.Arn}
+          RetryPolicy: {MaximumRetryAttempts: 4, MaximumEventAgeInSeconds: 3600}
+          InputTransformer:
+            InputPathsMap:
+              id: $.detail.requestId
+              type: $.detail.type
+              requester: $.detail.requesterEmail
+            InputTemplate: !Sub '"Escalated to admins: <type> request <id> from <requester> missed its approval SLA. Review it in the Request Hub: https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/v1/"'
+
+  OutcomeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${AWS::StackName}-outcome
+      Description: Tell the requester about decisions and fulfilment
+      EventBusName: !Ref EventBus
+      EventPattern:
+        source: [request-hub.requests]
+        detail-type: [Request Status Changed]
+        detail:
+          status: [APPROVED, AUTO_APPROVED, REJECTED, EXPIRED, FULFILLED]
+      Targets:
+        - Id: updates-topic
+          Arn: !Ref UpdatesTopic
+          DeadLetterConfig: {Arn: !GetAtt EventsDlq.Arn}
+          RetryPolicy: {MaximumRetryAttempts: 4, MaximumEventAgeInSeconds: 3600}
+          InputTransformer:
+            InputPathsMap:
+              id: $.detail.requestId
+              type: $.detail.type
+              status: $.detail.status
+              requester: $.detail.requesterEmail
+            InputTemplate: '"Update for <requester>: your <type> request <id> is now <status>."'
+
+  FailureRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${AWS::StackName}-workflow-failure
+      Description: Page the ops topic when a request workflow fails
+      EventBusName: !Ref EventBus
+      EventPattern:
+        source: [request-hub.requests]
+        detail-type: [Request Status Changed]
+        detail:
+          status: [FAILED]
+      Targets:
+        - Id: ops-topic
+          Arn: !Ref OpsTopic
+          DeadLetterConfig: {Arn: !GetAtt EventsDlq.Arn}
+          InputTransformer:
+            InputPathsMap:
+              id: $.detail.requestId
+            InputTemplate: '"Request Hub workflow FAILED for request <id>. Check the approval-workflow logs and the failureCause attribute on the item."'
+
+  FulfilmentRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${AWS::StackName}-fulfilment
+      Description: Queue approved requests for fulfilment
+      EventBusName: !Ref EventBus
+      EventPattern:
+        source: [request-hub.requests]
+        detail-type: [Request Status Changed]
+        detail:
+          status: [APPROVED, AUTO_APPROVED]
+      Targets:
+        - Id: fulfilment-queue
+          Arn: !GetAtt FulfilmentQueue.Arn
+          DeadLetterConfig: {Arn: !GetAtt EventsDlq.Arn}
+          RetryPolicy: {MaximumRetryAttempts: 4, MaximumEventAgeInSeconds: 3600}
+
+  EventsToFirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: events.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: put-audit-records
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [firehose:PutRecord, firehose:PutRecordBatch]
+                Resource: !GetAtt AuditDeliveryStream.Arn
+
+  AuditRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${AWS::StackName}-audit
+      Description: Copy every domain event to the S3 audit lake
+      EventBusName: !Ref EventBus
+      EventPattern:
+        source:
+          - prefix: request-hub
+      Targets:
+        - Id: audit-firehose
+          Arn: !GetAtt AuditDeliveryStream.Arn
+          RoleArn: !GetAtt EventsToFirehoseRole.Arn
+          DeadLetterConfig: {Arn: !GetAtt EventsDlq.Arn}
+          InputTransformer:
+            InputTemplate: "<aws.events.event.json>\n"
+
+  # ---------------------------------------------------------------------------
+  # Audit lake: Firehose -> S3 (Hive-style date partitions, gzip, KMS at rest)
+  # ---------------------------------------------------------------------------
+  FirehoseLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/kinesisfirehose/${AWS::StackName}-audit
+      RetentionInDays: 7
+
+  FirehoseLogStream:
+    Type: AWS::Logs::LogStream
+    Properties:
+      LogGroupName: !Ref FirehoseLogs
+      LogStreamName: S3Delivery
+
+  AuditFirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: firehose.amazonaws.com}
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: deliver-to-audit-bucket
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                Resource: [!GetAtt AuditBucket.Arn, !Sub '${AuditBucket.Arn}/*']
+              - Effect: Allow
+                Action: logs:PutLogEvents
+                Resource: !GetAtt FirehoseLogs.Arn
+
+  AuditDeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: !Sub ${AWS::StackName}-audit
+      DeliveryStreamType: DirectPut
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !GetAtt AuditBucket.Arn
+        RoleARN: !GetAtt AuditFirehoseRole.Arn
+        Prefix: 'events/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/'
+        ErrorOutputPrefix: 'errors/!{firehose:error-output-type}/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/'
+        BufferingHints:
+          IntervalInSeconds: 60   # playground minimum
+          SizeInMBs: 1            # playground maximum is 5
+        CompressionFormat: GZIP
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: !Ref FirehoseLogs
+          LogStreamName: !Ref FirehoseLogStream
+
+  # ---------------------------------------------------------------------------
+  # Edge: REST API (serves the SPA from S3 and the JSON API), WAF in front
+  # ---------------------------------------------------------------------------
+  ApiGatewayServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: apigateway.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: direct-integrations
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: CreateRequestItems
+                Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !GetAtt RequestsTable.Arn
+              - Sid: ServeWebApp
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub ${WebBucket.Arn}/*
+
+  ApiGatewayCloudWatchRole:
+    Type: AWS::IAM::Role
+    Condition: ApiLogging
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: apigateway.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+
+  ApiGatewayAccount:
+    Type: AWS::ApiGateway::Account
+    Condition: ApiLogging
+    Properties:
+      CloudWatchRoleArn: !GetAtt ApiGatewayCloudWatchRole.Arn
+
+  ApiAccessLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/apigateway/${AWS::StackName}-access
+      RetentionInDays: 7
+      KmsKeyId: !GetAtt AppKey.Arn
+
+  RestApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub ${AWS::StackName}-api
+      StageName: v1
+      OpenApiVersion: '3.0.1'
+      EndpointConfiguration:
+        Type: REGIONAL
+      TracingEnabled: true
+      Variables:
+        # Creates an implicit dependency so the stage waits for the account logging role.
+        accountSettings: !If [ApiLogging, !Ref ApiGatewayAccount, none]
+      AccessLogSetting: !If
+        - ApiLogging
+        - DestinationArn: !GetAtt ApiAccessLogs.Arn
+          Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","time":"$context.requestTime","method":"$context.httpMethod","resource":"$context.resourcePath","status":"$context.status","latencyMs":"$context.responseLatency","integrationLatencyMs":"$context.integrationLatency","user":"$context.authorizer.claims.sub","waf":"$context.wafResponseCode","xray":"$context.xrayTraceId"}'
+        - !Ref AWS::NoValue
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          MetricsEnabled: true
+          ThrottlingRateLimit: 20
+          ThrottlingBurstLimit: 40
+          LoggingLevel: !If [ApiLogging, ERROR, 'OFF']
+      DefinitionBody:
+        openapi: 3.0.1
+        info:
+          title: !Sub ${AWS::StackName}-api
+          version: '1.0'
+        x-amazon-apigateway-request-validators:
+          body:
+            validateRequestBody: true
+            validateRequestParameters: true
+          params:
+            validateRequestBody: false
+            validateRequestParameters: true
+        x-amazon-apigateway-gateway-responses:
+          BAD_REQUEST_BODY:
+            statusCode: 400
+            responseTemplates:
+              application/json: '{"message": "Invalid request body", "details": "$context.error.validationErrorString", "requestId": "$context.requestId"}'
+          DEFAULT_4XX:
+            responseTemplates:
+              application/json: '{"message": $context.error.messageString, "requestId": "$context.requestId"}'
+          DEFAULT_5XX:
+            responseTemplates:
+              application/json: '{"message": $context.error.messageString, "requestId": "$context.requestId"}'
+        components:
+          securitySchemes:
+            CognitoAuth:
+              type: apiKey
+              name: Authorization
+              in: header
+              x-amazon-apigateway-authtype: cognito_user_pools
+              x-amazon-apigateway-authorizer:
+                type: cognito_user_pools
+                providerARNs:
+                  - !GetAtt UserPool.Arn
+          schemas:
+            CreateRequest:
+              type: object
+              required: [type, title]
+              additionalProperties: false
+              properties:
+                type:
+                  type: string
+                  enum: [PURCHASE, ACCESS, LEAVE, CHANGE, GENERAL]
+                title:
+                  type: string
+                  minLength: 3
+                  maxLength: 120
+                description:
+                  type: string
+                  maxLength: 2000
+                amount:
+                  type: number
+                  minimum: 0
+                  maximum: 1000000
+                currency:
+                  type: string
+                  pattern: '^[A-Z]{3}$'
+            Decision:
+              type: object
+              required: [decision]
+              additionalProperties: false
+              properties:
+                decision:
+                  type: string
+                  enum: [APPROVED, REJECTED]
+                comment:
+                  type: string
+                  maxLength: 500
+            AttachmentRequest:
+              type: object
+              required: [fileName, contentType]
+              additionalProperties: false
+              properties:
+                fileName:
+                  type: string
+                  minLength: 1
+                  maxLength: 150
+                contentType:
+                  type: string
+                  maxLength: 120
+        paths:
+          /:
+            get:
+              summary: Web app (index.html from S3)
+              responses:
+                '200':
+                  description: OK
+                  headers:
+                    Content-Type: {schema: {type: string}}
+                    Cache-Control: {schema: {type: string}}
+                    X-Content-Type-Options: {schema: {type: string}}
+                    X-Frame-Options: {schema: {type: string}}
+                    Referrer-Policy: {schema: {type: string}}
+                    Strict-Transport-Security: {schema: {type: string}}
+                '404':
+                  description: Not found
+              x-amazon-apigateway-integration:
+                type: aws
+                httpMethod: GET
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:s3:path/${WebBucket}/index.html
+                credentials: !GetAtt ApiGatewayServiceRole.Arn
+                passthroughBehavior: when_no_match
+                responses:
+                  default:
+                    statusCode: '200'
+                    responseParameters:
+                      method.response.header.Content-Type: integration.response.header.Content-Type
+                      method.response.header.Cache-Control: "'no-cache'"
+                      method.response.header.X-Content-Type-Options: "'nosniff'"
+                      method.response.header.X-Frame-Options: "'DENY'"
+                      method.response.header.Referrer-Policy: "'no-referrer'"
+                      method.response.header.Strict-Transport-Security: "'max-age=31536000; includeSubDomains'"
+                  '4\d{2}':
+                    statusCode: '404'
+          /config.json:
+            get:
+              summary: Runtime configuration for the web app
+              responses:
+                '200':
+                  description: OK
+                  headers:
+                    Content-Type: {schema: {type: string}}
+                    Cache-Control: {schema: {type: string}}
+                '404':
+                  description: Not found
+              x-amazon-apigateway-integration:
+                type: aws
+                httpMethod: GET
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:s3:path/${WebBucket}/config.json
+                credentials: !GetAtt ApiGatewayServiceRole.Arn
+                passthroughBehavior: when_no_match
+                responses:
+                  default:
+                    statusCode: '200'
+                    responseParameters:
+                      method.response.header.Content-Type: "'application/json'"
+                      method.response.header.Cache-Control: "'no-store'"
+                  '4\d{2}':
+                    statusCode: '404'
+          /assets/{file}:
+            get:
+              summary: Static assets (JavaScript, CSS) from S3
+              parameters:
+                - name: file
+                  in: path
+                  required: true
+                  schema: {type: string}
+              x-amazon-apigateway-request-validator: params
+              responses:
+                '200':
+                  description: OK
+                  headers:
+                    Content-Type: {schema: {type: string}}
+                    Cache-Control: {schema: {type: string}}
+                    X-Content-Type-Options: {schema: {type: string}}
+                '404':
+                  description: Not found
+              x-amazon-apigateway-integration:
+                type: aws
+                httpMethod: GET
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:s3:path/${WebBucket}/assets/{file}
+                credentials: !GetAtt ApiGatewayServiceRole.Arn
+                passthroughBehavior: when_no_match
+                requestParameters:
+                  integration.request.path.file: method.request.path.file
+                responses:
+                  default:
+                    statusCode: '200'
+                    responseParameters:
+                      method.response.header.Content-Type: integration.response.header.Content-Type
+                      method.response.header.Cache-Control: "'no-cache'"
+                      method.response.header.X-Content-Type-Options: "'nosniff'"
+                  '4\d{2}':
+                    statusCode: '404'
+          /requests:
+            get:
+              summary: List the caller's requests
+              security:
+                - CognitoAuth: []
+              responses:
+                '200': {description: OK}
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                httpMethod: POST
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${QueryApiFunction.Arn}/invocations
+                passthroughBehavior: when_no_match
+            post:
+              summary: Create a request (functionless - API Gateway writes straight to DynamoDB)
+              security:
+                - CognitoAuth: []
+              x-amazon-apigateway-request-validator: body
+              requestBody:
+                required: true
+                content:
+                  application/json:
+                    schema:
+                      $ref: '#/components/schemas/CreateRequest'
+              responses:
+                '201': {description: Created}
+                '400': {description: Rejected}
+                '500': {description: Error}
+              x-amazon-apigateway-integration:
+                type: aws
+                httpMethod: POST
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:dynamodb:action/PutItem
+                credentials: !GetAtt ApiGatewayServiceRole.Arn
+                passthroughBehavior: never
+                requestTemplates:
+                  application/json: !Sub |
+                    #set($b = $input.path('$'))
+                    #set($amount = $b.amount)
+                    #if("$!amount" == "")#set($amount = 0)#end
+                    #set($currency = $b.currency)
+                    #if("$!currency" == "")#set($currency = "USD")#end
+                    #set($description = $b.description)
+                    #if("$!description" == "")#set($description = "")#end
+                    #set($id = $context.requestId)
+                    #set($now = $context.requestTimeEpoch)
+                    #set($sub = $context.authorizer.claims.sub)
+                    {
+                      "TableName": "${RequestsTable}",
+                      "ConditionExpression": "attribute_not_exists(PK)",
+                      "Item": {
+                        "PK": {"S": "REQ#$id"},
+                        "SK": {"S": "META"},
+                        "entity": {"S": "REQUEST"},
+                        "requestId": {"S": "$id"},
+                        "type": {"S": "$b.type"},
+                        "title": {"S": "$util.escapeJavaScript($b.title).replaceAll("\\'", "'")"},
+                        "description": {"S": "$util.escapeJavaScript($description).replaceAll("\\'", "'")"},
+                        "amount": {"N": "$amount"},
+                        "currency": {"S": "$currency"},
+                        "requesterId": {"S": "$sub"},
+                        "requesterEmail": {"S": "$context.authorizer.claims.email"},
+                        "status": {"S": "SUBMITTED"},
+                        "riskTier": {"S": "UNASSESSED"},
+                        "approverGroup": {"S": "none"},
+                        "createdAt": {"N": "$now"},
+                        "GSI1PK": {"S": "USER#$sub"},
+                        "GSI1SK": {"N": "$now"},
+                        "GSI2PK": {"S": "STATUS#SUBMITTED"},
+                        "GSI2SK": {"N": "$now"}
+                      }
+                    }
+                responses:
+                  default:
+                    statusCode: '201'
+                    responseTemplates:
+                      application/json: '{"requestId": "$context.requestId", "status": "SUBMITTED"}'
+                  '4\d{2}':
+                    statusCode: '400'
+                    responseTemplates:
+                      application/json: '{"message": "The request could not be stored", "requestId": "$context.requestId"}'
+                  '5\d{2}':
+                    statusCode: '500'
+                    responseTemplates:
+                      application/json: '{"message": "Storage is unavailable, try again", "requestId": "$context.requestId"}'
+          /requests/{requestId}:
+            get:
+              summary: Request detail with attachment download links
+              security:
+                - CognitoAuth: []
+              parameters:
+                - name: requestId
+                  in: path
+                  required: true
+                  schema: {type: string}
+              responses:
+                '200': {description: OK}
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                httpMethod: POST
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${QueryApiFunction.Arn}/invocations
+                passthroughBehavior: when_no_match
+          /requests/{requestId}/decision:
+            post:
+              summary: Approve or reject a pending request
+              security:
+                - CognitoAuth: []
+              x-amazon-apigateway-request-validator: body
+              parameters:
+                - name: requestId
+                  in: path
+                  required: true
+                  schema: {type: string}
+              requestBody:
+                required: true
+                content:
+                  application/json:
+                    schema:
+                      $ref: '#/components/schemas/Decision'
+              responses:
+                '202': {description: Accepted}
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                httpMethod: POST
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DecisionHandlerFunction.Arn}/invocations
+                passthroughBehavior: when_no_match
+          /requests/{requestId}/attachments:
+            post:
+              summary: Get a presigned upload policy for an attachment
+              security:
+                - CognitoAuth: []
+              x-amazon-apigateway-request-validator: body
+              parameters:
+                - name: requestId
+                  in: path
+                  required: true
+                  schema: {type: string}
+              requestBody:
+                required: true
+                content:
+                  application/json:
+                    schema:
+                      $ref: '#/components/schemas/AttachmentRequest'
+              responses:
+                '201': {description: Created}
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                httpMethod: POST
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AttachmentPresignerFunction.Arn}/invocations
+                passthroughBehavior: when_no_match
+          /approvals:
+            get:
+              summary: Approval inbox for approvers and admins
+              security:
+                - CognitoAuth: []
+              responses:
+                '200': {description: OK}
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                httpMethod: POST
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${QueryApiFunction.Arn}/invocations
+                passthroughBehavior: when_no_match
+
+  QueryApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref QueryApiFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*
+
+  DecisionHandlerInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref DecisionHandlerFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*
+
+  AttachmentPresignerInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref AttachmentPresignerFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*
+
+  WebAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub ${AWS::StackName}-web-acl
+      Description: Rate limiting plus SQL injection and XSS protection for the Request Hub API and web app
+      Scope: REGIONAL
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub ${AWS::StackName}-web-acl
+      Rules:
+        - Name: rate-limit-per-ip
+          Priority: 0
+          Action:
+            Block: {}
+          Statement:
+            RateBasedStatement:
+              Limit: 300
+              EvaluationWindowSec: 300
+              AggregateKeyType: IP
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: rate-limit-per-ip
+        - Name: block-sql-injection
+          Priority: 1
+          Action:
+            Block: {}
+          Statement:
+            OrStatement:
+              Statements:
+                - SqliMatchStatement:
+                    FieldToMatch:
+                      Body:
+                        OversizeHandling: CONTINUE
+                    TextTransformations:
+                      - {Priority: 0, Type: URL_DECODE}
+                      - {Priority: 1, Type: HTML_ENTITY_DECODE}
+                - SqliMatchStatement:
+                    FieldToMatch:
+                      QueryString: {}
+                    TextTransformations:
+                      - {Priority: 0, Type: URL_DECODE}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: block-sql-injection
+        - Name: block-cross-site-scripting
+          Priority: 2
+          Action:
+            Block: {}
+          Statement:
+            OrStatement:
+              Statements:
+                - XssMatchStatement:
+                    FieldToMatch:
+                      Body:
+                        OversizeHandling: CONTINUE
+                    TextTransformations:
+                      - {Priority: 0, Type: URL_DECODE}
+                      - {Priority: 1, Type: HTML_ENTITY_DECODE}
+                - XssMatchStatement:
+                    FieldToMatch:
+                      QueryString: {}
+                    TextTransformations:
+                      - {Priority: 0, Type: URL_DECODE}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: block-cross-site-scripting
+
+  WebAclAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Properties:
+      WebACLArn: !GetAtt WebAcl.Arn
+      ResourceArn: !Join
+        - ''
+        - - 'arn:aws:apigateway:'
+          - !Ref AWS::Region
+          - '::/restapis/'
+          - !Ref RestApi
+          - '/stages/'
+          - !Ref RestApi.Stage
+
+  # ---------------------------------------------------------------------------
+  # Observability: alarms, dashboard, saved Logs Insights queries
+  # ---------------------------------------------------------------------------
+  Api5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-api-5xx
+      AlarmDescription: The API returned server errors
+      Namespace: AWS/ApiGateway
+      MetricName: 5XXError
+      Dimensions:
+        - {Name: ApiName, Value: !Sub '${AWS::StackName}-api'}
+        - {Name: Stage, Value: v1}
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref OpsTopic]
+
+  WorkflowFailedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-workflow-failed
+      AlarmDescription: An approval workflow execution failed
+      Namespace: AWS/States
+      MetricName: ExecutionsFailed
+      Dimensions:
+        - {Name: StateMachineArn, Value: !Ref ApprovalWorkflow}
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref OpsTopic]
+
+  FulfilmentDlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-fulfilment-dlq
+      AlarmDescription: Fulfilment messages failed three times and landed in the dead-letter queue
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - {Name: QueueName, Value: !GetAtt FulfilmentDlq.QueueName}
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref OpsTopic]
+
+  EventsDlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-events-dlq
+      AlarmDescription: EventBridge or Pipes could not deliver an event
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - {Name: QueueName, Value: !GetAtt EventsDlq.QueueName}
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref OpsTopic]
+
+  LambdaErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-lambda-errors
+      AlarmDescription: One or more Request Hub functions raised errors
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Threshold: 1
+      EvaluationPeriods: 1
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref OpsTopic]
+      Metrics:
+        - Id: total
+          Label: Errors across functions
+          Expression: SUM([e1, e2, e3, e4, e5])
+          ReturnData: true
+        - Id: e1
+          ReturnData: false
+          MetricStat:
+            Metric: {Namespace: AWS/Lambda, MetricName: Errors, Dimensions: [{Name: FunctionName, Value: !Ref PolicyEngineFunction}]}
+            Period: 300
+            Stat: Sum
+        - Id: e2
+          ReturnData: false
+          MetricStat:
+            Metric: {Namespace: AWS/Lambda, MetricName: Errors, Dimensions: [{Name: FunctionName, Value: !Ref QueryApiFunction}]}
+            Period: 300
+            Stat: Sum
+        - Id: e3
+          ReturnData: false
+          MetricStat:
+            Metric: {Namespace: AWS/Lambda, MetricName: Errors, Dimensions: [{Name: FunctionName, Value: !Ref DecisionHandlerFunction}]}
+            Period: 300
+            Stat: Sum
+        - Id: e4
+          ReturnData: false
+          MetricStat:
+            Metric: {Namespace: AWS/Lambda, MetricName: Errors, Dimensions: [{Name: FunctionName, Value: !Ref AttachmentPresignerFunction}]}
+            Period: 300
+            Stat: Sum
+        - Id: e5
+          ReturnData: false
+          MetricStat:
+            Metric: {Namespace: AWS/Lambda, MetricName: Errors, Dimensions: [{Name: FunctionName, Value: !Ref FulfilmentWorkerFunction}]}
+            Period: 300
+            Stat: Sum
+
+  LambdaInvocationBudgetAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-lambda-invocation-budget
+      AlarmDescription: >-
+        A function passed 200 invocations in an hour. The KodeKloud playground deletes any
+        function invoked more than 300 times in an hour, so slow down testing.
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 200
+      EvaluationPeriods: 1
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref OpsTopic]
+      Metrics:
+        - Id: busiest
+          Label: Busiest function, invocations per hour
+          Expression: MAX([i1, i2, i3, i4, i5])
+          ReturnData: true
+        - Id: i1
+          ReturnData: false
+          MetricStat:
+            Metric: {Namespace: AWS/Lambda, MetricName: Invocations, Dimensions: [{Name: FunctionName, Value: !Ref PolicyEngineFunction}]}
+            Period: 3600
+            Stat: Sum
+        - Id: i2
+          ReturnData: false
+          MetricStat:
+            Metric: {Namespace: AWS/Lambda, MetricName: Invocations, Dimensions: [{Name: FunctionName, Value: !Ref QueryApiFunction}]}
+            Period: 3600
+            Stat: Sum
+        - Id: i3
+          ReturnData: false
+          MetricStat:
+            Metric: {Namespace: AWS/Lambda, MetricName: Invocations, Dimensions: [{Name: FunctionName, Value: !Ref DecisionHandlerFunction}]}
+            Period: 3600
+            Stat: Sum
+        - Id: i4
+          ReturnData: false
+          MetricStat:
+            Metric: {Namespace: AWS/Lambda, MetricName: Invocations, Dimensions: [{Name: FunctionName, Value: !Ref AttachmentPresignerFunction}]}
+            Period: 3600
+            Stat: Sum
+        - Id: i5
+          ReturnData: false
+          MetricStat:
+            Metric: {Namespace: AWS/Lambda, MetricName: Invocations, Dimensions: [{Name: FunctionName, Value: !Ref FulfilmentWorkerFunction}]}
+            Period: 3600
+            Stat: Sum
+
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub ${AWS::StackName}-operations
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {"type": "text", "x": 0, "y": 0, "width": 24, "height": 2,
+             "properties": {"markdown": "## Request Hub operations\nEdge (WAF, API Gateway) -> workflow (Step Functions) -> async (SQS, Lambda) -> audit (Firehose). The Lambda budget widget tracks the playground's 300 invocations per function per hour limit."}},
+            {"type": "metric", "x": 0, "y": 2, "width": 8, "height": 6,
+             "properties": {"title": "API traffic and errors", "region": "${AWS::Region}", "stat": "Sum", "period": 300, "view": "timeSeries",
+              "metrics": [["AWS/ApiGateway", "Count", "ApiName", "${AWS::StackName}-api", "Stage", "v1"], [".", "4XXError", ".", ".", ".", "."], [".", "5XXError", ".", ".", ".", "."]]}},
+            {"type": "metric", "x": 8, "y": 2, "width": 8, "height": 6,
+             "properties": {"title": "API latency (p90, ms)", "region": "${AWS::Region}", "stat": "p90", "period": 300, "view": "timeSeries",
+              "metrics": [["AWS/ApiGateway", "Latency", "ApiName", "${AWS::StackName}-api", "Stage", "v1"], [".", "IntegrationLatency", ".", ".", ".", "."]]}},
+            {"type": "metric", "x": 16, "y": 2, "width": 8, "height": 6,
+             "properties": {"title": "WAF blocked requests", "region": "${AWS::Region}", "stat": "Sum", "period": 300, "view": "timeSeries",
+              "metrics": [["AWS/WAFV2", "BlockedRequests", "WebACL", "${AWS::StackName}-web-acl", "Region", "${AWS::Region}", "Rule", "ALL"]]}},
+            {"type": "metric", "x": 0, "y": 8, "width": 8, "height": 6,
+             "properties": {"title": "Approval workflow executions", "region": "${AWS::Region}", "stat": "Sum", "period": 300, "view": "timeSeries",
+              "metrics": [["AWS/States", "ExecutionsStarted", "StateMachineArn", "${ApprovalWorkflow}"], [".", "ExecutionsSucceeded", ".", "."], [".", "ExecutionsFailed", ".", "."], [".", "ExecutionsTimedOut", ".", "."]]}},
+            {"type": "metric", "x": 8, "y": 8, "width": 8, "height": 6,
+             "properties": {"title": "Lambda invocations per hour vs playground budget", "region": "${AWS::Region}", "stat": "Sum", "period": 3600, "view": "timeSeries",
+              "annotations": {"horizontal": [{"label": "Playground deletes function", "value": 300, "color": "#d62728"}, {"label": "Budget alarm", "value": 200, "color": "#ff7f0e"}]},
+              "metrics": [["AWS/Lambda", "Invocations", "FunctionName", "${PolicyEngineFunction}"], ["...", "${QueryApiFunction}"], ["...", "${DecisionHandlerFunction}"], ["...", "${AttachmentPresignerFunction}"], ["...", "${FulfilmentWorkerFunction}"]]}},
+            {"type": "metric", "x": 16, "y": 8, "width": 8, "height": 6,
+             "properties": {"title": "Queues (fulfilment backlog and dead letters)", "region": "${AWS::Region}", "stat": "Maximum", "period": 60, "view": "timeSeries",
+              "metrics": [["AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${FulfilmentQueue.QueueName}"], ["...", "${FulfilmentDlq.QueueName}"], ["...", "${EventsDlq.QueueName}"]]}},
+            {"type": "metric", "x": 0, "y": 14, "width": 8, "height": 6,
+             "properties": {"title": "Business KPIs (custom EMF metrics)", "region": "${AWS::Region}", "stat": "Sum", "period": 300, "view": "timeSeries",
+              "metrics": [["RequestHub", "PolicyEvaluations", "RiskTier", "LOW"], ["...", "MEDIUM"], ["...", "HIGH"], ["RequestHub", "Decisions", "Decision", "APPROVED"], ["...", "REJECTED"]]}},
+            {"type": "metric", "x": 8, "y": 14, "width": 8, "height": 6,
+             "properties": {"title": "Lambda errors and duration (ms, p90)", "region": "${AWS::Region}", "period": 300, "view": "timeSeries",
+              "metrics": [["AWS/Lambda", "Errors", "FunctionName", "${FulfilmentWorkerFunction}", {"stat": "Sum"}], ["...", "${DecisionHandlerFunction}", {"stat": "Sum"}], ["AWS/Lambda", "Duration", "FunctionName", "${QueryApiFunction}", {"stat": "p90"}]]}},
+            {"type": "metric", "x": 16, "y": 14, "width": 8, "height": 6,
+             "properties": {"title": "Audit lake delivery (Firehose -> S3)", "region": "${AWS::Region}", "stat": "Sum", "period": 300, "view": "timeSeries",
+              "metrics": [["AWS/Firehose", "IncomingRecords", "DeliveryStreamName", "${AuditDeliveryStream}"], [".", "DeliveryToS3.Records", ".", "."]]}}
+          ]
+        }
+
+  WorkflowFailuresQuery:
+    Type: AWS::Logs::QueryDefinition
+    Properties:
+      Name: !Sub ${AWS::StackName}/workflow-failures
+      LogGroupNames: [!Ref WorkflowLogs]
+      QueryString: |
+        fields @timestamp, type, execution_arn, details.error, details.cause
+        | filter type like /Failed|TimedOut|Aborted/
+        | sort @timestamp desc
+        | limit 50
+
+  SlowApiCallsQuery:
+    Type: AWS::Logs::QueryDefinition
+    Properties:
+      Name: !Sub ${AWS::StackName}/slow-api-calls
+      LogGroupNames: [!Ref ApiAccessLogs]
+      QueryString: |
+        fields @timestamp, method, resource, status, latencyMs, integrationLatencyMs, waf
+        | sort latencyMs desc
+        | limit 25
+
+  FunctionErrorsQuery:
+    Type: AWS::Logs::QueryDefinition
+    Properties:
+      Name: !Sub ${AWS::StackName}/function-errors
+      LogGroupNames:
+        - !Ref PolicyEngineLogs
+        - !Ref QueryApiLogs
+        - !Ref DecisionHandlerLogs
+        - !Ref AttachmentPresignerLogs
+        - !Ref FulfilmentWorkerLogs
+      QueryString: |
+        fields @timestamp, @log, @message
+        | filter @message like /ERROR|Traceback|Task timed out/
+        | sort @timestamp desc
+        | limit 50
+
+Outputs:
+  AppUrl:
+    Description: Open this URL to use the Request Hub web app
+    Value: !Sub https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/v1/
+  ApiBaseUrl:
+    Value: !Sub https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/v1
+  ApiId:
+    Value: !Ref RestApi
+  UserPoolId:
+    Value: !Ref UserPool
+  WebClientId:
+    Value: !Ref WebClient
+  CognitoDomain:
+    Value: !Sub https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com
+  TableName:
+    Value: !Ref RequestsTable
+  WebBucketName:
+    Value: !Ref WebBucket
+  AttachmentsBucketName:
+    Value: !Ref AttachmentsBucket
+  AuditBucketName:
+    Value: !Ref AuditBucket
+  EventBusName:
+    Value: !Ref EventBus
+  StateMachineArn:
+    Value: !Ref ApprovalWorkflow
+  FulfilmentDlqUrl:
+    Value: !Ref FulfilmentDlq
+  EventsDlqUrl:
+    Value: !Ref EventsDlq
+  PolicyParameterName:
+    Value: !Ref PolicyRulesParameter
+  WebAclName:
+    Value: !Sub ${AWS::StackName}-web-acl
+  DashboardUrl:
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AWS::StackName}-operations
+  CdcMode:
+    Value: !If [UsePipes, eventbridge-pipes, lambda-publisher]

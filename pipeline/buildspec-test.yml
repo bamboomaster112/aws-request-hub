@@ -1,0 +1,18 @@
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.12
+    commands:
+      - pip install --quiet --upgrade boto3 cfn-lint bandit
+  build:
+    commands:
+      - echo "Unit tests"
+      - AWS_DEFAULT_REGION=us-east-1 python -m unittest discover -s tests -v
+      - echo "Infrastructure lint (fails on errors, reports warnings)"
+      - cfn-lint --non-zero-exit-code error template.yaml pipeline/cicd.yaml governance/governance.yaml
+      - echo "Static application security testing (medium severity and above)"
+      - bandit -r src -ll
+      - echo "JavaScript syntax check"
+      - node --check web/assets/app.js

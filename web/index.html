@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' https://*.amazoncognito.com https://*.amazonaws.com; base-uri 'self'; form-action 'self' https://*.amazoncognito.com; object-src 'none'">
+  <title>Request Hub</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="assets/styles.css">
+  <script type="module" src="assets/app.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="#/mine" aria-label="Request Hub home">
+      <span class="logo" aria-hidden="true">RH</span>
+      <span>Request Hub</span>
+    </a>
+    <nav id="nav" class="tabs" hidden>
+      <a href="#/mine" data-view="mine">My requests</a>
+      <a href="#/new" data-view="new">New request</a>
+      <a href="#/inbox" data-view="inbox" id="inboxTab" hidden>Approvals</a>
+    </nav>
+    <div class="who" id="who"></div>
+  </header>
+
+  <main id="app" aria-live="polite">
+    <p class="muted">Loading...</p>
+  </main>
+
+  <div id="toast" class="toast" role="status" hidden></div>
+
+  <footer class="footer">
+    Serverless on AWS: WAF, API Gateway, Cognito, DynamoDB, EventBridge Pipes, Step Functions, SQS, SNS, Firehose, KMS
+  </footer>
+</body>
+</html>

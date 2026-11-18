@@ -1,0 +1,276 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Request Hub governance (optional): a CloudTrail trail with log file validation and
+  CloudWatch Logs delivery, plus AWS Config managed rules that continuously check the
+  security posture of the core stack (encryption, PITR, WAF, X-Ray, logging).
+
+Parameters:
+  CoreStackName:
+    Type: String
+    Default: request-hub
+  CreateConfigRecorder:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'true'
+    Description: Set to false when the account already has a Config recorder (only one is allowed).
+
+Conditions:
+  CreateRecorder: !Equals [!Ref CreateConfigRecorder, 'true']
+
+Resources:
+  # ---------------- CloudTrail ----------------
+  TrailBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${CoreStackName}-trail-${AWS::AccountId}-${AWS::Region}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  TrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref TrailBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: CloudTrailAclCheck
+            Effect: Allow
+            Principal: {Service: cloudtrail.amazonaws.com}
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt TrailBucket.Arn
+            Condition:
+              StringEquals:
+                aws:SourceArn: !Sub arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${CoreStackName}-trail
+          - Sid: CloudTrailWrite
+            Effect: Allow
+            Principal: {Service: cloudtrail.amazonaws.com}
+            Action: s3:PutObject
+            Resource: !Sub ${TrailBucket.Arn}/AWSLogs/${AWS::AccountId}/*
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+                aws:SourceArn: !Sub arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${CoreStackName}-trail
+
+  TrailLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/cloudtrail/${CoreStackName}
+      RetentionInDays: 7
+
+  TrailLogsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: cloudtrail.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: deliver-to-logs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub ${TrailLogs.Arn}:*
+
+  Trail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: TrailBucketPolicy
+    Properties:
+      TrailName: !Sub ${CoreStackName}-trail
+      S3BucketName: !Ref TrailBucket
+      IsLogging: true
+      IsMultiRegionTrail: false
+      IncludeGlobalServiceEvents: true
+      EnableLogFileValidation: true
+      CloudWatchLogsLogGroupArn: !GetAtt TrailLogs.Arn
+      CloudWatchLogsRoleArn: !GetAtt TrailLogsRole.Arn
+
+  # ---------------- AWS Config ----------------
+  ConfigBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateRecorder
+    Properties:
+      BucketName: !Sub ${CoreStackName}-config-${AWS::AccountId}-${AWS::Region}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  ConfigBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: CreateRecorder
+    Properties:
+      Bucket: !Ref ConfigBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ConfigAclCheck
+            Effect: Allow
+            Principal: {Service: config.amazonaws.com}
+            Action: [s3:GetBucketAcl, s3:ListBucket]
+            Resource: !GetAtt ConfigBucket.Arn
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+          - Sid: ConfigWrite
+            Effect: Allow
+            Principal: {Service: config.amazonaws.com}
+            Action: s3:PutObject
+            Resource: !Sub ${ConfigBucket.Arn}/AWSLogs/${AWS::AccountId}/Config/*
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  ConfigRole:
+    Type: AWS::IAM::Role
+    Condition: CreateRecorder
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: config.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWS_ConfigRole
+
+  ConfigRecorder:
+    Type: AWS::Config::ConfigurationRecorder
+    Condition: CreateRecorder
+    Properties:
+      Name: !Sub ${CoreStackName}-recorder
+      RoleARN: !GetAtt ConfigRole.Arn
+      RecordingGroup:
+        AllSupported: false
+        IncludeGlobalResourceTypes: false
+        ResourceTypes:
+          - AWS::S3::Bucket
+          - AWS::DynamoDB::Table
+          - AWS::ApiGateway::Stage
+          - AWS::ApiGateway::RestApi
+          - AWS::Lambda::Function
+          - AWS::SNS::Topic
+          - AWS::SQS::Queue
+          - AWS::Logs::LogGroup
+          - AWS::CloudTrail::Trail
+          - AWS::WAFv2::WebACL
+
+  DeliveryChannel:
+    Type: AWS::Config::DeliveryChannel
+    Condition: CreateRecorder
+    DependsOn: ConfigBucketPolicy
+    Properties:
+      Name: !Sub ${CoreStackName}-delivery
+      S3BucketName: !Ref ConfigBucket
+      ConfigSnapshotDeliveryProperties:
+        DeliveryFrequency: TwentyFour_Hours
+
+  RecorderReady:
+    Type: AWS::CloudFormation::WaitConditionHandle
+    Metadata:
+      recorder: !If [CreateRecorder, !Ref ConfigRecorder, existing]
+      channel: !If [CreateRecorder, !Ref DeliveryChannel, existing]
+
+  S3EncryptionRule:
+    Type: AWS::Config::ConfigRule
+    DependsOn: RecorderReady
+    Properties:
+      ConfigRuleName: !Sub ${CoreStackName}-s3-encryption
+      Source: {Owner: AWS, SourceIdentifier: S3_BUCKET_SERVER_SIDE_ENCRYPTION_ENABLED}
+      Scope: {ComplianceResourceTypes: [AWS::S3::Bucket]}
+
+  S3PublicReadRule:
+    Type: AWS::Config::ConfigRule
+    DependsOn: RecorderReady
+    Properties:
+      ConfigRuleName: !Sub ${CoreStackName}-s3-no-public-read
+      Source: {Owner: AWS, SourceIdentifier: S3_BUCKET_PUBLIC_READ_PROHIBITED}
+      Scope: {ComplianceResourceTypes: [AWS::S3::Bucket]}
+
+  S3TlsRule:
+    Type: AWS::Config::ConfigRule
+    DependsOn: RecorderReady
+    Properties:
+      ConfigRuleName: !Sub ${CoreStackName}-s3-tls-only
+      Source: {Owner: AWS, SourceIdentifier: S3_BUCKET_SSL_REQUESTS_ONLY}
+      Scope: {ComplianceResourceTypes: [AWS::S3::Bucket]}
+
+  DynamoPitrRule:
+    Type: AWS::Config::ConfigRule
+    DependsOn: RecorderReady
+    Properties:
+      ConfigRuleName: !Sub ${CoreStackName}-dynamodb-pitr
+      Source: {Owner: AWS, SourceIdentifier: DYNAMODB_PITR_ENABLED}
+      Scope: {ComplianceResourceTypes: [AWS::DynamoDB::Table]}
+
+  DynamoKmsRule:
+    Type: AWS::Config::ConfigRule
+    DependsOn: RecorderReady
+    Properties:
+      ConfigRuleName: !Sub ${CoreStackName}-dynamodb-kms
+      Source: {Owner: AWS, SourceIdentifier: DYNAMODB_TABLE_ENCRYPTED_KMS}
+      Scope: {ComplianceResourceTypes: [AWS::DynamoDB::Table]}
+
+  ApiWafRule:
+    Type: AWS::Config::ConfigRule
+    DependsOn: RecorderReady
+    Properties:
+      ConfigRuleName: !Sub ${CoreStackName}-api-has-waf
+      Source: {Owner: AWS, SourceIdentifier: API_GW_ASSOCIATED_WITH_WAF}
+      Scope: {ComplianceResourceTypes: [AWS::ApiGateway::Stage]}
+
+  ApiXrayRule:
+    Type: AWS::Config::ConfigRule
+    DependsOn: RecorderReady
+    Properties:
+      ConfigRuleName: !Sub ${CoreStackName}-api-xray
+      Source: {Owner: AWS, SourceIdentifier: API_GW_XRAY_ENABLED}
+      Scope: {ComplianceResourceTypes: [AWS::ApiGateway::Stage]}
+
+  SnsKmsRule:
+    Type: AWS::Config::ConfigRule
+    DependsOn: RecorderReady
+    Properties:
+      ConfigRuleName: !Sub ${CoreStackName}-sns-kms
+      Source: {Owner: AWS, SourceIdentifier: SNS_ENCRYPTED_KMS}
+      Scope: {ComplianceResourceTypes: [AWS::SNS::Topic]}
+
+  LogGroupKmsRule:
+    Type: AWS::Config::ConfigRule
+    DependsOn: RecorderReady
+    Properties:
+      ConfigRuleName: !Sub ${CoreStackName}-log-groups-kms
+      Source: {Owner: AWS, SourceIdentifier: CLOUDWATCH_LOG_GROUP_ENCRYPTED}
+      Scope: {ComplianceResourceTypes: [AWS::Logs::LogGroup]}
+
+  TrailEnabledRule:
+    Type: AWS::Config::ConfigRule
+    DependsOn: RecorderReady
+    Properties:
+      ConfigRuleName: !Sub ${CoreStackName}-cloudtrail-enabled
+      Source: {Owner: AWS, SourceIdentifier: CLOUD_TRAIL_ENABLED}
+      MaximumExecutionFrequency: TwentyFour_Hours
+
+Outputs:
+  TrailBucketName:
+    Value: !Ref TrailBucket
+  ConfigBucketName:
+    Value: !If [CreateRecorder, !Ref ConfigBucket, '']
+  TrailLogGroup:
+    Value: !Ref TrailLogs

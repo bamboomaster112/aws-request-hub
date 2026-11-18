@@ -1,0 +1,363 @@
+{
+  "Comment": "Request Hub approval workflow. Evaluates policy, auto-approves low-risk requests, otherwise pauses on a task token stored in DynamoDB until an approver decides. Missed SLAs escalate to admins, then expire. Every status change is written to the META item, and DynamoDB Streams turns it into a domain event.",
+  "StartAt": "EvaluatePolicy",
+  "States": {
+    "EvaluatePolicy": {
+      "Type": "Task",
+      "Comment": "The one Lambda call in the workflow: business rules read from Parameter Store.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${PolicyEngineFunctionArn}",
+        "Payload": {
+          "request.$": "$.detail",
+          "executionId.$": "$$.Execution.Id"
+        }
+      },
+      "ResultSelector": {
+        "riskTier.$": "$.Payload.riskTier",
+        "autoApprove.$": "$.Payload.autoApprove",
+        "approverGroup.$": "$.Payload.approverGroup",
+        "slaSeconds.$": "$.Payload.slaSeconds",
+        "escalationSeconds.$": "$.Payload.escalationSeconds",
+        "reasons.$": "$.Payload.reasons",
+        "rulesVersion.$": "$.Payload.rulesVersion"
+      },
+      "ResultPath": "$.policy",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "MarkFailed"
+        }
+      ],
+      "Next": "IsAutoApproved"
+    },
+    "IsAutoApproved": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.policy.autoApprove",
+          "BooleanEquals": true,
+          "Next": "AutoApprove"
+        }
+      ],
+      "Default": "RequestApproval"
+    },
+    "AutoApprove": {
+      "Type": "Task",
+      "Comment": "Functionless write. The condition makes duplicate executions harmless.",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "${TableName}",
+        "Key": {
+          "PK": {"S.$": "States.Format('REQ#{}', $.detail.requestId)"},
+          "SK": {"S": "META"}
+        },
+        "UpdateExpression": "SET #s = :s, riskTier = :r, approverGroup = :g, policyReasons = :why, rulesVersion = :rv, decidedBy = :by, decidedAt = :now, lastUpdated = :now, executionArn = :x, GSI2PK = :g2",
+        "ConditionExpression": "#s = :submitted",
+        "ExpressionAttributeNames": {"#s": "status"},
+        "ExpressionAttributeValues": {
+          ":s": {"S": "AUTO_APPROVED"},
+          ":r": {"S.$": "$.policy.riskTier"},
+          ":g": {"S": "policy"},
+          ":why": {"S.$": "States.JsonToString($.policy.reasons)"},
+          ":rv": {"S.$": "$.policy.rulesVersion"},
+          ":by": {"S": "policy-engine"},
+          ":now": {"S.$": "$$.State.EnteredTime"},
+          ":x": {"S.$": "$$.Execution.Id"},
+          ":g2": {"S": "STATUS#AUTO_APPROVED"},
+          ":submitted": {"S": "SUBMITTED"}
+        }
+      },
+      "ResultPath": null,
+      "Retry": [
+        {
+          "ErrorEquals": ["DynamoDB.ProvisionedThroughputExceededException", "DynamoDB.ThrottlingException", "DynamoDB.InternalServerErrorException"],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["DynamoDB.ConditionalCheckFailedException", "DynamoDb.ConditionalCheckFailedException"],
+          "ResultPath": "$.error",
+          "Next": "AlreadyHandled"
+        },
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "MarkFailed"
+        }
+      ],
+      "End": true
+    },
+    "RequestApproval": {
+      "Type": "Task",
+      "Comment": "AWS SDK integration with .waitForTaskToken: stores the token on the item and pauses until SendTaskSuccess or the SLA timeout.",
+      "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem.waitForTaskToken",
+      "TimeoutSecondsPath": "$.policy.slaSeconds",
+      "Parameters": {
+        "TableName": "${TableName}",
+        "Key": {
+          "PK": {"S.$": "States.Format('REQ#{}', $.detail.requestId)"},
+          "SK": {"S": "META"}
+        },
+        "UpdateExpression": "SET #s = :s, riskTier = :r, approverGroup = :g, policyReasons = :why, rulesVersion = :rv, approvalToken = :t, slaSeconds = :sla, lastUpdated = :now, executionArn = :x, GSI2PK = :g2",
+        "ConditionExpression": "#s = :submitted",
+        "ExpressionAttributeNames": {"#s": "status"},
+        "ExpressionAttributeValues": {
+          ":s": {"S": "PENDING_APPROVAL"},
+          ":r": {"S.$": "$.policy.riskTier"},
+          ":g": {"S.$": "$.policy.approverGroup"},
+          ":why": {"S.$": "States.JsonToString($.policy.reasons)"},
+          ":rv": {"S.$": "$.policy.rulesVersion"},
+          ":t": {"S.$": "$$.Task.Token"},
+          ":sla": {"N.$": "States.Format('{}', $.policy.slaSeconds)"},
+          ":now": {"S.$": "$$.State.EnteredTime"},
+          ":x": {"S.$": "$$.Execution.Id"},
+          ":g2": {"S": "STATUS#PENDING_APPROVAL"},
+          ":submitted": {"S": "SUBMITTED"}
+        }
+      },
+      "ResultPath": "$.decision",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.Timeout"],
+          "ResultPath": "$.timeout",
+          "Next": "Escalate"
+        },
+        {
+          "ErrorEquals": ["DynamoDb.ConditionalCheckFailedException", "DynamoDB.ConditionalCheckFailedException"],
+          "ResultPath": "$.error",
+          "Next": "AlreadyHandled"
+        },
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "MarkFailed"
+        }
+      ],
+      "Next": "ApplyDecision"
+    },
+    "Escalate": {
+      "Type": "Task",
+      "Comment": "SLA missed: hand the request to admins with a fresh task token and a second timer.",
+      "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem.waitForTaskToken",
+      "TimeoutSecondsPath": "$.policy.escalationSeconds",
+      "Parameters": {
+        "TableName": "${TableName}",
+        "Key": {
+          "PK": {"S.$": "States.Format('REQ#{}', $.detail.requestId)"},
+          "SK": {"S": "META"}
+        },
+        "UpdateExpression": "SET #s = :s, approverGroup = :g, approvalToken = :t, escalatedAt = :now, lastUpdated = :now, GSI2PK = :g2",
+        "ConditionExpression": "#s = :pending",
+        "ExpressionAttributeNames": {"#s": "status"},
+        "ExpressionAttributeValues": {
+          ":s": {"S": "ESCALATED"},
+          ":g": {"S": "admins"},
+          ":t": {"S.$": "$$.Task.Token"},
+          ":now": {"S.$": "$$.State.EnteredTime"},
+          ":g2": {"S": "STATUS#ESCALATED"},
+          ":pending": {"S": "PENDING_APPROVAL"}
+        }
+      },
+      "ResultPath": "$.decision",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.Timeout"],
+          "ResultPath": "$.timeout",
+          "Next": "Expire"
+        },
+        {
+          "ErrorEquals": ["DynamoDb.ConditionalCheckFailedException", "DynamoDB.ConditionalCheckFailedException"],
+          "ResultPath": "$.error",
+          "Next": "AlreadyHandled"
+        },
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "MarkFailed"
+        }
+      ],
+      "Next": "ApplyDecision"
+    },
+    "Expire": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "${TableName}",
+        "Key": {
+          "PK": {"S.$": "States.Format('REQ#{}', $.detail.requestId)"},
+          "SK": {"S": "META"}
+        },
+        "UpdateExpression": "SET #s = :s, lastUpdated = :now, GSI2PK = :g2 REMOVE approvalToken",
+        "ConditionExpression": "#s = :escalated",
+        "ExpressionAttributeNames": {"#s": "status"},
+        "ExpressionAttributeValues": {
+          ":s": {"S": "EXPIRED"},
+          ":now": {"S.$": "$$.State.EnteredTime"},
+          ":g2": {"S": "STATUS#EXPIRED"},
+          ":escalated": {"S": "ESCALATED"}
+        }
+      },
+      "ResultPath": null,
+      "Catch": [
+        {
+          "ErrorEquals": ["DynamoDB.ConditionalCheckFailedException", "DynamoDb.ConditionalCheckFailedException"],
+          "ResultPath": "$.error",
+          "Next": "AlreadyHandled"
+        },
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "MarkFailed"
+        }
+      ],
+      "End": true
+    },
+    "ApplyDecision": {
+      "Type": "Choice",
+      "Choices": [
+        {"Variable": "$.decision.decision", "StringEquals": "APPROVED", "Next": "MarkApproved"},
+        {"Variable": "$.decision.decision", "StringEquals": "REJECTED", "Next": "MarkRejected"}
+      ],
+      "Default": "InvalidDecision"
+    },
+    "InvalidDecision": {
+      "Type": "Pass",
+      "Result": {"Error": "InvalidDecision", "Cause": "The callback did not contain APPROVED or REJECTED"},
+      "ResultPath": "$.error",
+      "Next": "MarkFailed"
+    },
+    "MarkApproved": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "${TableName}",
+        "Key": {
+          "PK": {"S.$": "States.Format('REQ#{}', $.detail.requestId)"},
+          "SK": {"S": "META"}
+        },
+        "UpdateExpression": "SET #s = :s, decidedBy = :by, decidedByEmail = :em, decisionComment = :c, decidedAt = :now, lastUpdated = :now, GSI2PK = :g2 REMOVE approvalToken",
+        "ConditionExpression": "#s IN (:pending, :escalated)",
+        "ExpressionAttributeNames": {"#s": "status"},
+        "ExpressionAttributeValues": {
+          ":s": {"S": "APPROVED"},
+          ":by": {"S.$": "$.decision.decidedBy"},
+          ":em": {"S.$": "$.decision.decidedByEmail"},
+          ":c": {"S.$": "$.decision.comment"},
+          ":now": {"S.$": "$$.State.EnteredTime"},
+          ":g2": {"S": "STATUS#APPROVED"},
+          ":pending": {"S": "PENDING_APPROVAL"},
+          ":escalated": {"S": "ESCALATED"}
+        }
+      },
+      "ResultPath": null,
+      "Catch": [
+        {
+          "ErrorEquals": ["DynamoDB.ConditionalCheckFailedException", "DynamoDb.ConditionalCheckFailedException"],
+          "ResultPath": "$.error",
+          "Next": "AlreadyHandled"
+        },
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "MarkFailed"
+        }
+      ],
+      "End": true
+    },
+    "MarkRejected": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "${TableName}",
+        "Key": {
+          "PK": {"S.$": "States.Format('REQ#{}', $.detail.requestId)"},
+          "SK": {"S": "META"}
+        },
+        "UpdateExpression": "SET #s = :s, decidedBy = :by, decidedByEmail = :em, decisionComment = :c, decidedAt = :now, lastUpdated = :now, GSI2PK = :g2 REMOVE approvalToken",
+        "ConditionExpression": "#s IN (:pending, :escalated)",
+        "ExpressionAttributeNames": {"#s": "status"},
+        "ExpressionAttributeValues": {
+          ":s": {"S": "REJECTED"},
+          ":by": {"S.$": "$.decision.decidedBy"},
+          ":em": {"S.$": "$.decision.decidedByEmail"},
+          ":c": {"S.$": "$.decision.comment"},
+          ":now": {"S.$": "$$.State.EnteredTime"},
+          ":g2": {"S": "STATUS#REJECTED"},
+          ":pending": {"S": "PENDING_APPROVAL"},
+          ":escalated": {"S": "ESCALATED"}
+        }
+      },
+      "ResultPath": null,
+      "Catch": [
+        {
+          "ErrorEquals": ["DynamoDB.ConditionalCheckFailedException", "DynamoDb.ConditionalCheckFailedException"],
+          "ResultPath": "$.error",
+          "Next": "AlreadyHandled"
+        },
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "MarkFailed"
+        }
+      ],
+      "End": true
+    },
+    "MarkFailed": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "${TableName}",
+        "Key": {
+          "PK": {"S.$": "States.Format('REQ#{}', $.detail.requestId)"},
+          "SK": {"S": "META"}
+        },
+        "UpdateExpression": "SET #s = :s, failureCause = :cause, lastUpdated = :now, executionArn = :x, GSI2PK = :g2 REMOVE approvalToken",
+        "ExpressionAttributeNames": {"#s": "status"},
+        "ExpressionAttributeValues": {
+          ":s": {"S": "FAILED"},
+          ":cause": {"S.$": "States.JsonToString($.error)"},
+          ":now": {"S.$": "$$.State.EnteredTime"},
+          ":x": {"S.$": "$$.Execution.Id"},
+          ":g2": {"S": "STATUS#FAILED"}
+        }
+      },
+      "ResultPath": null,
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.markFailedError",
+          "Next": "WorkflowFailed"
+        }
+      ],
+      "Next": "WorkflowFailed"
+    },
+    "WorkflowFailed": {
+      "Type": "Fail",
+      "Error": "RequestWorkflowFailed",
+      "Cause": "See the failureCause attribute on the request item and the execution history."
+    },
+    "AlreadyHandled": {
+      "Type": "Succeed",
+      "Comment": "Another execution or a newer state already moved this request on (for example a duplicate event delivery), so this run stops without changing anything."
+    }
+  }
+}
