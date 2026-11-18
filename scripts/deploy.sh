@@ -52,6 +52,16 @@ PARAMS=(
 )
 
 step "Deploying core stack ($STACK)"
+# A first deploy that rolled back leaves a ROLLBACK_COMPLETE stack, which cannot be updated.
+status=$(aws cloudformation describe-stacks --stack-name "$STACK" --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo NONE)
+if [[ "$status" == "ROLLBACK_COMPLETE" || "$status" == "ROLLBACK_FAILED" || "$status" == "DELETE_FAILED" ]]; then
+  echo "Removing the previous failed stack ($status) first..."
+  aws cloudformation delete-stack --stack-name "$STACK"
+  aws cloudformation wait stack-delete-complete --stack-name "$STACK" 2>/dev/null || {
+    aws cloudformation delete-stack --stack-name "$STACK" --deletion-mode FORCE_DELETE_STACK
+    aws cloudformation wait stack-delete-complete --stack-name "$STACK"
+  }
+fi
 if command -v sam >/dev/null 2>&1; then
   sam deploy \
     --template-file template.yaml \
@@ -62,8 +72,7 @@ if command -v sam >/dev/null 2>&1; then
     --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND \
     --no-confirm-changeset \
     --no-fail-on-empty-changeset \
-    --parameter-overrides "${PARAMS[@]}" \
-    --tags Project=request-hub Environment=playground
+    --parameter-overrides "${PARAMS[@]}"
 else
   echo "SAM CLI not found, falling back to aws cloudformation package/deploy"
   ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
@@ -73,8 +82,7 @@ else
     --output-template-file /tmp/packaged.yaml
   aws cloudformation deploy --template-file /tmp/packaged.yaml --stack-name "$STACK" \
     --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND \
-    --no-fail-on-empty-changeset --parameter-overrides "${PARAMS[@]}" \
-    --tags Project=request-hub Environment=playground
+    --no-fail-on-empty-changeset --parameter-overrides "${PARAMS[@]}"
 fi
 
 step "Publishing the web app"
@@ -87,8 +95,7 @@ if [[ "$WITH_PIPELINE" == "true" ]]; then
     --stack-name "${STACK}-cicd" \
     --capabilities CAPABILITY_IAM \
     --no-fail-on-empty-changeset \
-    --parameter-overrides "CoreStackName=$STACK" \
-    --tags Project=request-hub Environment=playground
+    --parameter-overrides "CoreStackName=$STACK"
   echo "Pipeline ready. Run ./scripts/release.sh to push this code through it."
 fi
 
@@ -105,8 +112,7 @@ if [[ "$WITH_GOVERNANCE" == "true" ]]; then
     --stack-name "${STACK}-governance" \
     --capabilities CAPABILITY_IAM \
     --no-fail-on-empty-changeset \
-    --parameter-overrides "CoreStackName=$STACK" "CreateConfigRecorder=$create_recorder" \
-    --tags Project=request-hub Environment=playground
+    --parameter-overrides "CoreStackName=$STACK" "CreateConfigRecorder=$create_recorder"
 fi
 
 step "Done in $(( $(date +%s) - started ))s"

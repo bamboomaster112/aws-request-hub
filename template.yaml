@@ -57,8 +57,6 @@ Globals:
       Variables:
         TABLE_NAME: !Ref RequestsTable
         METRICS_NAMESPACE: RequestHub
-    Tags:
-      Project: request-hub
 
 Resources:
   # ---------------------------------------------------------------------------
@@ -170,8 +168,6 @@ Resources:
         SSEEnabled: true
         SSEType: KMS
         KMSMasterKeyId: !Ref AppKey
-      Tags:
-        - {Key: Project, Value: request-hub}
 
   # ---------------------------------------------------------------------------
   # Storage: web app, attachments and audit lake
