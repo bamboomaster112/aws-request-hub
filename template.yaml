@@ -66,10 +66,12 @@ Resources:
   # ---------------------------------------------------------------------------
   AppKey:
     Type: AWS::KMS::Key
+    # The playground denies kms:EnableKeyRotation and kms:ScheduleKeyDeletion, so rotation stays off
+    # and the key is retained on delete. Turn rotation on in a real account.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
-      Description: Request Hub customer managed key (DynamoDB, S3, SQS, SNS, Secrets Manager, CloudWatch Logs)
-      EnableKeyRotation: true
-      PendingWindowInDays: 7
+      Description: Request Hub customer managed key (DynamoDB, S3, SQS, SNS, Secrets Manager)
       KeyPolicy:
         Version: '2012-10-17'
         Statement:
@@ -125,12 +127,6 @@ Resources:
               ArnLike:
                 kms:EncryptionContext:aws:logs:arn: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*
 
-  AppKeyAlias:
-    Type: AWS::KMS::Alias
-    Properties:
-      AliasName: !Sub alias/${AWS::StackName}
-      TargetKeyId: !Ref AppKey
-
   # ---------------------------------------------------------------------------
   # Data: single-table DynamoDB design
   #   META item  PK=REQ#<id> SK=META           (status transitions only)
@@ -141,7 +137,9 @@ Resources:
   RequestsTable:
     Type: AWS::DynamoDB::Table
     Properties:
-      TableName: !Sub ${AWS::StackName}-requests
+      TableName: !Sub
+        - '${AWS::StackName}-requests-${Suffix}'
+        - Suffix: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]
       BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
         - {AttributeName: PK, AttributeType: S}
@@ -298,8 +296,12 @@ Resources:
   # ---------------------------------------------------------------------------
   PolicyRulesParameter:
     Type: AWS::SSM::Parameter
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
-      Name: !Sub /${AWS::StackName}/policy-rules
+      Name: !Sub
+        - '/${AWS::StackName}/${Suffix}/policy-rules'
+        - Suffix: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]
       Type: String
       Description: Approval policy evaluated by the policy engine. Change thresholds here without redeploying code.
       Value: !Sub |
@@ -325,7 +327,9 @@ Resources:
   DownstreamApiSecret:
     Type: AWS::SecretsManager::Secret
     Properties:
-      Name: !Sub ${AWS::StackName}/downstream-api
+      Name: !Sub
+        - '${AWS::StackName}/${Suffix}/downstream-api'
+        - Suffix: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]
       Description: Credential for the (simulated) downstream fulfilment system, for example an ERP or ITSM tool
       KmsKeyId: !Ref AppKey
       GenerateSecretString:
@@ -449,21 +453,18 @@ Resources:
   EventsDlq:
     Type: AWS::SQS::Queue
     Properties:
-      QueueName: !Sub ${AWS::StackName}-events-dlq
       MessageRetentionPeriod: 345600
       KmsMasterKeyId: !Ref AppKey
 
   FulfilmentDlq:
     Type: AWS::SQS::Queue
     Properties:
-      QueueName: !Sub ${AWS::StackName}-fulfilment-dlq
       MessageRetentionPeriod: 345600
       KmsMasterKeyId: !Ref AppKey
 
   FulfilmentQueue:
     Type: AWS::SQS::Queue
     Properties:
-      QueueName: !Sub ${AWS::StackName}-fulfilment
       VisibilityTimeout: 60
       KmsMasterKeyId: !Ref AppKey
       RedrivePolicy:
@@ -550,37 +551,46 @@ Resources:
   # Change data capture: DynamoDB Streams -> EventBridge Pipes -> custom bus
   # Every write to a META item is a status transition, so each MODIFY is an event.
   # ---------------------------------------------------------------------------
+  PipeRolePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Condition: UsePipes
+    Properties:
+      Description: Least-privilege permissions for PipeRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - dynamodb:DescribeStream
+              - dynamodb:GetRecords
+              - dynamodb:GetShardIterator
+              - dynamodb:ListStreams
+            Resource:
+              - !GetAtt RequestsTable.StreamArn
+          - Effect: Allow
+            Action:
+              - events:PutEvents
+            Resource:
+              - !GetAtt EventBus.Arn
+          - Effect: Allow
+            Action:
+              - sqs:SendMessage
+            Resource:
+              - !GetAtt EventsDlq.Arn
+
   PipeRole:
     Type: AWS::IAM::Role
     Condition: UsePipes
     Properties:
+      Path: /service-role/
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
           - Effect: Allow
             Principal: {Service: pipes.amazonaws.com}
             Action: sts:AssumeRole
-            Condition:
-              StringEquals:
-                aws:SourceAccount: !Ref AWS::AccountId
-      Policies:
-        - PolicyName: cdc-to-bus
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - dynamodb:DescribeStream
-                  - dynamodb:GetRecords
-                  - dynamodb:GetShardIterator
-                  - dynamodb:ListStreams
-                Resource: !GetAtt RequestsTable.StreamArn
-              - Effect: Allow
-                Action: events:PutEvents
-                Resource: !GetAtt EventBus.Arn
-              - Effect: Allow
-                Action: sqs:SendMessage
-                Resource: !GetAtt EventsDlq.Arn
+      ManagedPolicyArns:
+        - !Ref PipeRolePolicy
 
   SubmittedPipe:
     Type: AWS::Pipes::Pipe
@@ -644,6 +654,42 @@ Resources:
           "previousStatus": "<$.dynamodb.OldImage.status.S>", "riskTier": "<$.dynamodb.NewImage.riskTier.S>",
           "approverGroup": "<$.dynamodb.NewImage.approverGroup.S>"}
 
+  StreamPublisherRolePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Condition: UseLambdaPublisher
+    Properties:
+      Description: Least-privilege permissions for StreamPublisherRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - events:PutEvents
+            Resource:
+              - !GetAtt EventBus.Arn
+          - Effect: Allow
+            Action:
+              - sqs:SendMessage
+            Resource:
+              - !GetAtt EventsDlq.Arn
+
+  StreamPublisherRole:
+    Type: AWS::IAM::Role
+    Condition: UseLambdaPublisher
+    Properties:
+      Path: /service-role/
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref StreamPublisherRolePolicy
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaDynamoDBExecutionRole
+
   StreamPublisherFunction:
     Type: AWS::Serverless::Function
     Condition: UseLambdaPublisher
@@ -655,11 +701,7 @@ Resources:
       Environment:
         Variables:
           EVENT_BUS_NAME: !Ref EventBus
-      Policies:
-        - EventBridgePutEventsPolicy:
-            EventBusName: !Ref EventBus
-        - SQSSendMessagePolicy:
-            QueueName: !GetAtt EventsDlq.QueueName
+      Role: !GetAtt StreamPublisherRole.Arn
       Events:
         Stream:
           Type: DynamoDB
@@ -681,91 +723,228 @@ Resources:
   # ---------------------------------------------------------------------------
   # Business logic (Lambda is used only where code adds value)
   # ---------------------------------------------------------------------------
+  PolicyEngineRolePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Least-privilege permissions for PolicyEngineRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - ssm:GetParameter
+            Resource:
+              - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${PolicyRulesParameter}'
+
+  PolicyEngineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /service-role/
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref PolicyEngineRolePolicy
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+
+  QueryApiRolePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Least-privilege permissions for QueryApiRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - dynamodb:GetItem
+              - dynamodb:Query
+            Resource:
+              - !GetAtt RequestsTable.Arn
+              - !Sub '${RequestsTable.Arn}/index/*'
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+            Resource:
+              - !Sub '${AttachmentsBucket.Arn}/requests/*'
+
+  QueryApiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /service-role/
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref QueryApiRolePolicy
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+
+  DecisionHandlerRolePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Least-privilege permissions for DecisionHandlerRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - dynamodb:GetItem
+            Resource:
+              - !GetAtt RequestsTable.Arn
+          - Effect: Allow
+            Action:
+              - states:SendTaskSuccess
+              - states:SendTaskFailure
+            Resource:
+              - !Ref ApprovalWorkflow
+
+  DecisionHandlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /service-role/
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref DecisionHandlerRolePolicy
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+
+  AttachmentPresignerRolePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Least-privilege permissions for AttachmentPresignerRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - dynamodb:GetItem
+              - dynamodb:PutItem
+            Resource:
+              - !GetAtt RequestsTable.Arn
+          - Effect: Allow
+            Action:
+              - s3:PutObject
+            Resource:
+              - !Sub '${AttachmentsBucket.Arn}/requests/*'
+
+  AttachmentPresignerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /service-role/
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref AttachmentPresignerRolePolicy
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+
+  FulfilmentWorkerRolePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Least-privilege permissions for FulfilmentWorkerRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - dynamodb:GetItem
+              - dynamodb:UpdateItem
+            Resource:
+              - !GetAtt RequestsTable.Arn
+          - Effect: Allow
+            Action:
+              - secretsmanager:GetSecretValue
+            Resource:
+              - !Ref DownstreamApiSecret
+
+  FulfilmentWorkerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /service-role/
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref FulfilmentWorkerRolePolicy
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole
+
   PolicyEngineFunction:
     Type: AWS::Serverless::Function
-    DependsOn: PolicyEngineLogs
     Properties:
       FunctionName: !Sub ${AWS::StackName}-policy-engine
       Description: Evaluates approval policy (risk tier, approver group, SLA) from rules in Parameter Store
       CodeUri: src/policy_engine/
+      Role: !GetAtt PolicyEngineRole.Arn
       Handler: app.handler
       Environment:
         Variables:
           POLICY_PARAMETER: !Ref PolicyRulesParameter
-      Policies:
-        - SSMParameterReadPolicy:
-            ParameterName: !Sub ${AWS::StackName}/policy-rules
 
   QueryApiFunction:
     Type: AWS::Serverless::Function
-    DependsOn: QueryApiLogs
     Properties:
       FunctionName: !Sub ${AWS::StackName}-query-api
       Description: Read API - my requests, request detail with attachment links, approval inbox
       CodeUri: src/query_api/
+      Role: !GetAtt QueryApiRole.Arn
       Handler: app.handler
       Environment:
         Variables:
           ATTACHMENTS_BUCKET: !Ref AttachmentsBucket
-      Policies:
-        - DynamoDBReadPolicy:
-            TableName: !Ref RequestsTable
-        - S3ReadPolicy:
-            BucketName: !Ref AttachmentsBucket
 
   DecisionHandlerFunction:
     Type: AWS::Serverless::Function
-    DependsOn: DecisionHandlerLogs
     Properties:
       FunctionName: !Sub ${AWS::StackName}-decision-handler
       Description: Authorises an approver's decision and resumes the paused workflow with SendTaskSuccess
       CodeUri: src/decision_handler/
+      Role: !GetAtt DecisionHandlerRole.Arn
       Handler: app.handler
-      Policies:
-        - DynamoDBReadPolicy:
-            TableName: !Ref RequestsTable
-        - Statement:
-            - Effect: Allow
-              Action:
-                - states:SendTaskSuccess
-                - states:SendTaskFailure
-              Resource: !Ref ApprovalWorkflow
 
   AttachmentPresignerFunction:
     Type: AWS::Serverless::Function
-    DependsOn: AttachmentPresignerLogs
     Properties:
       FunctionName: !Sub ${AWS::StackName}-attachment-presigner
       Description: Issues size- and type-restricted presigned S3 POST policies for request attachments
       CodeUri: src/attachment_presigner/
+      Role: !GetAtt AttachmentPresignerRole.Arn
       Handler: app.handler
       Environment:
         Variables:
           ATTACHMENTS_BUCKET: !Ref AttachmentsBucket
-      Policies:
-        - DynamoDBCrudPolicy:
-            TableName: !Ref RequestsTable
-        - Statement:
-            - Effect: Allow
-              Action: s3:PutObject
-              Resource: !Sub ${AttachmentsBucket.Arn}/requests/*
 
   FulfilmentWorkerFunction:
     Type: AWS::Serverless::Function
-    DependsOn: FulfilmentWorkerLogs
     Properties:
       FunctionName: !Sub ${AWS::StackName}-fulfilment-worker
       Description: Fulfils approved requests against a (simulated) downstream system, idempotently
       CodeUri: src/fulfilment_worker/
+      Role: !GetAtt FulfilmentWorkerRole.Arn
       Handler: app.handler
       Environment:
         Variables:
           DOWNSTREAM_SECRET_ARN: !Ref DownstreamApiSecret
-      Policies:
-        - DynamoDBCrudPolicy:
-            TableName: !Ref RequestsTable
-        - AWSSecretsManagerGetSecretValuePolicy:
-            SecretArn: !Ref DownstreamApiSecret
       Events:
         Fulfilment:
           Type: SQS
@@ -775,56 +954,71 @@ Resources:
             MaximumBatchingWindowInSeconds: 5
             FunctionResponseTypes: [ReportBatchItemFailures]
 
-  PolicyEngineLogs:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-policy-engine
-      RetentionInDays: 7
-      KmsKeyId: !GetAtt AppKey.Arn
-
-  QueryApiLogs:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-query-api
-      RetentionInDays: 7
-      KmsKeyId: !GetAtt AppKey.Arn
-
-  DecisionHandlerLogs:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-decision-handler
-      RetentionInDays: 7
-      KmsKeyId: !GetAtt AppKey.Arn
-
-  AttachmentPresignerLogs:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-attachment-presigner
-      RetentionInDays: 7
-      KmsKeyId: !GetAtt AppKey.Arn
-
-  FulfilmentWorkerLogs:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-fulfilment-worker
-      RetentionInDays: 7
-      KmsKeyId: !GetAtt AppKey.Arn
-
   # ---------------------------------------------------------------------------
   # Orchestration: Step Functions approval workflow
   # ---------------------------------------------------------------------------
   WorkflowLogs:
     Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
-      LogGroupName: !Sub /aws/vendedlogs/states/${AWS::StackName}-approval-workflow
-      RetentionInDays: 7
-      KmsKeyId: !GetAtt AppKey.Arn
+      LogGroupName: !Sub
+        - '/aws/vendedlogs/states/${AWS::StackName}-approval-workflow-${Suffix}'
+        - Suffix: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]
+
+  WorkflowRolePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Least-privilege permissions for WorkflowRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - lambda:InvokeFunction
+            Resource:
+              - !GetAtt PolicyEngineFunction.Arn
+              - !Sub '${PolicyEngineFunction.Arn}:*'
+          - Effect: Allow
+            Action:
+              - dynamodb:UpdateItem
+            Resource:
+              - !GetAtt RequestsTable.Arn
+          - Effect: Allow
+            Action:
+              - logs:CreateLogDelivery
+              - logs:GetLogDelivery
+              - logs:UpdateLogDelivery
+              - logs:DeleteLogDelivery
+              - logs:ListLogDeliveries
+              - logs:PutResourcePolicy
+              - logs:DescribeResourcePolicies
+              - logs:DescribeLogGroups
+              - xray:PutTraceSegments
+              - xray:PutTelemetryRecords
+              - xray:GetSamplingRules
+              - xray:GetSamplingTargets
+            Resource:
+              - '*'
+
+  WorkflowRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /service-role/
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: states.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref WorkflowRolePolicy
 
   ApprovalWorkflow:
     Type: AWS::Serverless::StateMachine
     Properties:
-      Name: !Sub ${AWS::StackName}-approval-workflow
       Type: STANDARD
+      Role: !GetAtt WorkflowRole.Arn
       DefinitionUri: statemachine/approval-workflow.asl.json
       DefinitionSubstitutions:
         TableName: !Ref RequestsTable
@@ -837,43 +1031,48 @@ Resources:
               LogGroupArn: !GetAtt WorkflowLogs.Arn
       Tracing:
         Enabled: true
-      Policies:
-        - LambdaInvokePolicy:
-            FunctionName: !Ref PolicyEngineFunction
-        - DynamoDBCrudPolicy:
-            TableName: !Ref RequestsTable
-        - Statement:
-            - Effect: Allow
-              Action:
-                - logs:CreateLogDelivery
-                - logs:GetLogDelivery
-                - logs:UpdateLogDelivery
-                - logs:DeleteLogDelivery
-                - logs:ListLogDeliveries
-                - logs:PutResourcePolicy
-                - logs:DescribeResourcePolicies
-                - logs:DescribeLogGroups
-              Resource: '*'
-            - Effect: Allow
-              Action:
-                - xray:PutTraceSegments
-                - xray:PutTelemetryRecords
-                - xray:GetSamplingRules
-                - xray:GetSamplingTargets
-              Resource: '*'
-      Events:
-        RequestSubmitted:
-          Type: EventBridgeRule
-          Properties:
-            EventBusName: !Ref EventBus
-            Pattern:
-              source: [request-hub.requests]
-              detail-type: [Request Submitted]
-            RetryPolicy:
-              MaximumRetryAttempts: 4
-              MaximumEventAgeInSeconds: 3600
-            DeadLetterConfig:
-              Arn: !GetAtt EventsDlq.Arn
+
+  EventsToWorkflowRolePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Least-privilege permissions for EventsToWorkflowRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - states:StartExecution
+            Resource:
+              - !Ref ApprovalWorkflow
+
+  EventsToWorkflowRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /service-role/
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: events.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref EventsToWorkflowRolePolicy
+
+  SubmittedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${AWS::StackName}-start-approval
+      Description: Start the approval workflow for every new request
+      EventBusName: !Ref EventBus
+      EventPattern:
+        source: [request-hub.requests]
+        detail-type: [Request Submitted]
+      Targets:
+        - Id: approval-workflow
+          Arn: !Ref ApprovalWorkflow
+          RoleArn: !GetAtt EventsToWorkflowRole.Arn
+          DeadLetterConfig: {Arn: !GetAtt EventsDlq.Arn}
+          RetryPolicy: {MaximumRetryAttempts: 4, MaximumEventAgeInSeconds: 3600}
 
   # ---------------------------------------------------------------------------
   # Event routing (all functionless): notifications, fulfilment, audit lake
@@ -989,23 +1188,32 @@ Resources:
           DeadLetterConfig: {Arn: !GetAtt EventsDlq.Arn}
           RetryPolicy: {MaximumRetryAttempts: 4, MaximumEventAgeInSeconds: 3600}
 
+  EventsToFirehoseRolePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Least-privilege permissions for EventsToFirehoseRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - firehose:PutRecord
+              - firehose:PutRecordBatch
+            Resource:
+              - !GetAtt AuditDeliveryStream.Arn
+
   EventsToFirehoseRole:
     Type: AWS::IAM::Role
     Properties:
+      Path: /service-role/
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
           - Effect: Allow
             Principal: {Service: events.amazonaws.com}
             Action: sts:AssumeRole
-      Policies:
-        - PolicyName: put-audit-records
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action: [firehose:PutRecord, firehose:PutRecordBatch]
-                Resource: !GetAtt AuditDeliveryStream.Arn
+      ManagedPolicyArns:
+        - !Ref EventsToFirehoseRolePolicy
 
   AuditRule:
     Type: AWS::Events::Rule
@@ -1027,21 +1235,29 @@ Resources:
   # ---------------------------------------------------------------------------
   # Audit lake: Firehose -> S3 (Hive-style date partitions, gzip, KMS at rest)
   # ---------------------------------------------------------------------------
-  FirehoseLogs:
-    Type: AWS::Logs::LogGroup
+  AuditFirehoseRolePolicy:
+    Type: AWS::IAM::ManagedPolicy
     Properties:
-      LogGroupName: !Sub /aws/kinesisfirehose/${AWS::StackName}-audit
-      RetentionInDays: 7
-
-  FirehoseLogStream:
-    Type: AWS::Logs::LogStream
-    Properties:
-      LogGroupName: !Ref FirehoseLogs
-      LogStreamName: S3Delivery
+      Description: Least-privilege permissions for AuditFirehoseRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:AbortMultipartUpload
+              - s3:GetBucketLocation
+              - s3:GetObject
+              - s3:ListBucket
+              - s3:ListBucketMultipartUploads
+              - s3:PutObject
+            Resource:
+              - !GetAtt AuditBucket.Arn
+              - !Sub '${AuditBucket.Arn}/*'
 
   AuditFirehoseRole:
     Type: AWS::IAM::Role
     Properties:
+      Path: /service-role/
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -1051,28 +1267,12 @@ Resources:
             Condition:
               StringEquals:
                 sts:ExternalId: !Ref AWS::AccountId
-      Policies:
-        - PolicyName: deliver-to-audit-bucket
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - s3:AbortMultipartUpload
-                  - s3:GetBucketLocation
-                  - s3:GetObject
-                  - s3:ListBucket
-                  - s3:ListBucketMultipartUploads
-                  - s3:PutObject
-                Resource: [!GetAtt AuditBucket.Arn, !Sub '${AuditBucket.Arn}/*']
-              - Effect: Allow
-                Action: logs:PutLogEvents
-                Resource: !GetAtt FirehoseLogs.Arn
+      ManagedPolicyArns:
+        - !Ref AuditFirehoseRolePolicy
 
   AuditDeliveryStream:
     Type: AWS::KinesisFirehose::DeliveryStream
     Properties:
-      DeliveryStreamName: !Sub ${AWS::StackName}-audit
       DeliveryStreamType: DirectPut
       ExtendedS3DestinationConfiguration:
         BucketARN: !GetAtt AuditBucket.Arn
@@ -1083,41 +1283,48 @@ Resources:
           IntervalInSeconds: 60   # playground minimum
           SizeInMBs: 1            # playground maximum is 5
         CompressionFormat: GZIP
-        CloudWatchLoggingOptions:
-          Enabled: true
-          LogGroupName: !Ref FirehoseLogs
-          LogStreamName: !Ref FirehoseLogStream
 
   # ---------------------------------------------------------------------------
   # Edge: REST API (serves the SPA from S3 and the JSON API), WAF in front
   # ---------------------------------------------------------------------------
+  ApiGatewayServiceRolePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Least-privilege permissions for ApiGatewayServiceRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: CreateRequestItems
+            Effect: Allow
+            Action:
+              - dynamodb:PutItem
+            Resource:
+              - !GetAtt RequestsTable.Arn
+          - Sid: ServeWebApp
+            Effect: Allow
+            Action:
+              - s3:GetObject
+            Resource:
+              - !Sub '${WebBucket.Arn}/*'
+
   ApiGatewayServiceRole:
     Type: AWS::IAM::Role
     Properties:
+      Path: /service-role/
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
           - Effect: Allow
             Principal: {Service: apigateway.amazonaws.com}
             Action: sts:AssumeRole
-      Policies:
-        - PolicyName: direct-integrations
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Sid: CreateRequestItems
-                Effect: Allow
-                Action: dynamodb:PutItem
-                Resource: !GetAtt RequestsTable.Arn
-              - Sid: ServeWebApp
-                Effect: Allow
-                Action: s3:GetObject
-                Resource: !Sub ${WebBucket.Arn}/*
+      ManagedPolicyArns:
+        - !Ref ApiGatewayServiceRolePolicy
 
   ApiGatewayCloudWatchRole:
     Type: AWS::IAM::Role
     Condition: ApiLogging
     Properties:
+      Path: /service-role/
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -1135,10 +1342,12 @@ Resources:
 
   ApiAccessLogs:
     Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
-      LogGroupName: !Sub /aws/apigateway/${AWS::StackName}-access
-      RetentionInDays: 7
-      KmsKeyId: !GetAtt AppKey.Arn
+      LogGroupName: !Sub
+        - '/aws/apigateway/${AWS::StackName}-access-${Suffix}'
+        - Suffix: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]
 
   RestApi:
     Type: AWS::Serverless::Api
@@ -1837,22 +2046,6 @@ Resources:
         fields @timestamp, method, resource, status, latencyMs, integrationLatencyMs, waf
         | sort latencyMs desc
         | limit 25
-
-  FunctionErrorsQuery:
-    Type: AWS::Logs::QueryDefinition
-    Properties:
-      Name: !Sub ${AWS::StackName}/function-errors
-      LogGroupNames:
-        - !Ref PolicyEngineLogs
-        - !Ref QueryApiLogs
-        - !Ref DecisionHandlerLogs
-        - !Ref AttachmentPresignerLogs
-        - !Ref FulfilmentWorkerLogs
-      QueryString: |
-        fields @timestamp, @log, @message
-        | filter @message like /ERROR|Traceback|Task timed out/
-        | sort @timestamp desc
-        | limit 50
 
 Outputs:
   AppUrl:
