@@ -1,5 +1,4 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Transform: AWS::Serverless-2016-10-31
 Description: >-
   Request Hub (core stack): an industry-agnostic, event-driven request and approval
   platform. API Gateway + WAF + Cognito at the edge, a functionless create path into
@@ -45,18 +44,6 @@ Conditions:
   UsePipes: !Equals [!Ref UseEventBridgePipes, 'true']
   UseLambdaPublisher: !Equals [!Ref UseEventBridgePipes, 'false']
   ApiLogging: !Equals [!Ref EnableApiGatewayAccountLogging, 'true']
-
-Globals:
-  Function:
-    Runtime: python3.12
-    Architectures: [x86_64]
-    MemorySize: 256      # playground maximum
-    Timeout: 8           # playground maximum is 10 seconds
-    Tracing: Active
-    Environment:
-      Variables:
-        TABLE_NAME: !Ref RequestsTable
-        METRICS_NAMESPACE: RequestHub
 
 Resources:
   # ---------------------------------------------------------------------------
@@ -687,34 +674,43 @@ Resources:
         - arn:aws:iam::aws:policy/service-role/AWSLambdaDynamoDBExecutionRole
 
   StreamPublisherFunction:
-    Type: AWS::Serverless::Function
+    Type: AWS::Lambda::Function
     Condition: UseLambdaPublisher
     Properties:
       FunctionName: !Sub ${AWS::StackName}-stream-publisher
-      Description: Fallback CDC publisher used when EventBridge Pipes is unavailable
-      CodeUri: src/stream_publisher/
+      Description: CDC publisher (DynamoDB Streams -> EventBridge), used when EventBridge Pipes is unavailable
+      Code: src/stream_publisher/
       Handler: app.handler
+      Role: !GetAtt StreamPublisherRole.Arn
+      Runtime: python3.12
+      Architectures: [x86_64]
+      MemorySize: 256   # playground maximum
+      Timeout: 8        # playground maximum is 10 seconds
+      TracingConfig:
+        Mode: Active
       Environment:
         Variables:
+          TABLE_NAME: !Ref RequestsTable
+          METRICS_NAMESPACE: RequestHub
           EVENT_BUS_NAME: !Ref EventBus
-      Role: !GetAtt StreamPublisherRole.Arn
-      Events:
-        Stream:
-          Type: DynamoDB
-          Properties:
-            Stream: !GetAtt RequestsTable.StreamArn
-            StartingPosition: LATEST
-            BatchSize: 25
-            MaximumBatchingWindowInSeconds: 2
-            MaximumRetryAttempts: 3
-            BisectBatchOnFunctionError: true
-            DestinationConfig:
-              OnFailure:
-                Type: SQS
-                Destination: !GetAtt EventsDlq.Arn
-            FilterCriteria:
-              Filters:
-                - Pattern: '{"dynamodb": {"NewImage": {"SK": {"S": ["META"]}}}}'
+
+  StreamPublisherMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Condition: UseLambdaPublisher
+    Properties:
+      FunctionName: !Ref StreamPublisherFunction
+      EventSourceArn: !GetAtt RequestsTable.StreamArn
+      StartingPosition: LATEST
+      BatchSize: 25
+      MaximumBatchingWindowInSeconds: 2
+      MaximumRetryAttempts: 3
+      BisectBatchOnFunctionError: true
+      DestinationConfig:
+        OnFailure:
+          Destination: !GetAtt EventsDlq.Arn
+      FilterCriteria:
+        Filters:
+          - Pattern: '{"dynamodb": {"NewImage": {"SK": {"S": ["META"]}}}}'
 
   # ---------------------------------------------------------------------------
   # Business logic (Lambda is used only where code adds value)
@@ -886,69 +882,112 @@ Resources:
         - arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole
 
   PolicyEngineFunction:
-    Type: AWS::Serverless::Function
+    Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub ${AWS::StackName}-policy-engine
       Description: Evaluates approval policy (risk tier, approver group, SLA) from rules in Parameter Store
-      CodeUri: src/policy_engine/
-      Role: !GetAtt PolicyEngineRole.Arn
+      Code: src/policy_engine/
       Handler: app.handler
+      Role: !GetAtt PolicyEngineRole.Arn
+      Runtime: python3.12
+      Architectures: [x86_64]
+      MemorySize: 256   # playground maximum
+      Timeout: 8        # playground maximum is 10 seconds
+      TracingConfig:
+        Mode: Active
       Environment:
         Variables:
+          TABLE_NAME: !Ref RequestsTable
+          METRICS_NAMESPACE: RequestHub
           POLICY_PARAMETER: !Ref PolicyRulesParameter
 
   QueryApiFunction:
-    Type: AWS::Serverless::Function
+    Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub ${AWS::StackName}-query-api
       Description: Read API - my requests, request detail with attachment links, approval inbox
-      CodeUri: src/query_api/
-      Role: !GetAtt QueryApiRole.Arn
+      Code: src/query_api/
       Handler: app.handler
+      Role: !GetAtt QueryApiRole.Arn
+      Runtime: python3.12
+      Architectures: [x86_64]
+      MemorySize: 256   # playground maximum
+      Timeout: 8        # playground maximum is 10 seconds
+      TracingConfig:
+        Mode: Active
       Environment:
         Variables:
+          TABLE_NAME: !Ref RequestsTable
+          METRICS_NAMESPACE: RequestHub
           ATTACHMENTS_BUCKET: !Ref AttachmentsBucket
 
   DecisionHandlerFunction:
-    Type: AWS::Serverless::Function
+    Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub ${AWS::StackName}-decision-handler
       Description: Authorises an approver's decision and resumes the paused workflow with SendTaskSuccess
-      CodeUri: src/decision_handler/
-      Role: !GetAtt DecisionHandlerRole.Arn
+      Code: src/decision_handler/
       Handler: app.handler
+      Role: !GetAtt DecisionHandlerRole.Arn
+      Runtime: python3.12
+      Architectures: [x86_64]
+      MemorySize: 256   # playground maximum
+      Timeout: 8        # playground maximum is 10 seconds
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref RequestsTable
+          METRICS_NAMESPACE: RequestHub
 
   AttachmentPresignerFunction:
-    Type: AWS::Serverless::Function
+    Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub ${AWS::StackName}-attachment-presigner
       Description: Issues size- and type-restricted presigned S3 POST policies for request attachments
-      CodeUri: src/attachment_presigner/
-      Role: !GetAtt AttachmentPresignerRole.Arn
+      Code: src/attachment_presigner/
       Handler: app.handler
+      Role: !GetAtt AttachmentPresignerRole.Arn
+      Runtime: python3.12
+      Architectures: [x86_64]
+      MemorySize: 256   # playground maximum
+      Timeout: 8        # playground maximum is 10 seconds
+      TracingConfig:
+        Mode: Active
       Environment:
         Variables:
+          TABLE_NAME: !Ref RequestsTable
+          METRICS_NAMESPACE: RequestHub
           ATTACHMENTS_BUCKET: !Ref AttachmentsBucket
 
   FulfilmentWorkerFunction:
-    Type: AWS::Serverless::Function
+    Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub ${AWS::StackName}-fulfilment-worker
       Description: Fulfils approved requests against a (simulated) downstream system, idempotently
-      CodeUri: src/fulfilment_worker/
-      Role: !GetAtt FulfilmentWorkerRole.Arn
+      Code: src/fulfilment_worker/
       Handler: app.handler
+      Role: !GetAtt FulfilmentWorkerRole.Arn
+      Runtime: python3.12
+      Architectures: [x86_64]
+      MemorySize: 256   # playground maximum
+      Timeout: 8        # playground maximum is 10 seconds
+      TracingConfig:
+        Mode: Active
       Environment:
         Variables:
+          TABLE_NAME: !Ref RequestsTable
+          METRICS_NAMESPACE: RequestHub
           DOWNSTREAM_SECRET_ARN: !Ref DownstreamApiSecret
-      Events:
-        Fulfilment:
-          Type: SQS
-          Properties:
-            Queue: !GetAtt FulfilmentQueue.Arn
-            BatchSize: 5
-            MaximumBatchingWindowInSeconds: 5
-            FunctionResponseTypes: [ReportBatchItemFailures]
+
+  FulfilmentWorkerMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      FunctionName: !Ref FulfilmentWorkerFunction
+      EventSourceArn: !GetAtt FulfilmentQueue.Arn
+      BatchSize: 5
+      MaximumBatchingWindowInSeconds: 5
+      FunctionResponseTypes: [ReportBatchItemFailures]
 
   # ---------------------------------------------------------------------------
   # Orchestration: Step Functions approval workflow
@@ -1011,21 +1050,21 @@ Resources:
         - !Ref WorkflowRolePolicy
 
   ApprovalWorkflow:
-    Type: AWS::Serverless::StateMachine
+    Type: AWS::StepFunctions::StateMachine
     Properties:
-      Type: STANDARD
-      Role: !GetAtt WorkflowRole.Arn
-      DefinitionUri: statemachine/approval-workflow.asl.json
+      StateMachineType: STANDARD
+      RoleArn: !GetAtt WorkflowRole.Arn
+      DefinitionS3Location: statemachine/approval-workflow.asl.json
       DefinitionSubstitutions:
         TableName: !Ref RequestsTable
         PolicyEngineFunctionArn: !GetAtt PolicyEngineFunction.Arn
-      Logging:
+      LoggingConfiguration:
         Level: ALL
         IncludeExecutionData: true
         Destinations:
           - CloudWatchLogsLogGroup:
               LogGroupArn: !GetAtt WorkflowLogs.Arn
-      Tracing:
+      TracingConfiguration:
         Enabled: true
 
   EventsToWorkflowRolePolicy:
@@ -1346,30 +1385,12 @@ Resources:
         - Suffix: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]
 
   RestApi:
-    Type: AWS::Serverless::Api
+    Type: AWS::ApiGateway::RestApi
     Properties:
       Name: !Sub ${AWS::StackName}-api
-      StageName: v1
-      OpenApiVersion: '3.0.1'
       EndpointConfiguration:
-        Type: REGIONAL
-      TracingEnabled: true
-      Variables:
-        # Creates an implicit dependency so the stage waits for the account logging role.
-        accountSettings: !If [ApiLogging, !Ref ApiGatewayAccount, none]
-      AccessLogSetting: !If
-        - ApiLogging
-        - DestinationArn: !GetAtt ApiAccessLogs.Arn
-          Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","time":"$context.requestTime","method":"$context.httpMethod","resource":"$context.resourcePath","status":"$context.status","latencyMs":"$context.responseLatency","integrationLatencyMs":"$context.integrationLatency","user":"$context.authorizer.claims.sub","waf":"$context.wafResponseCode","xray":"$context.xrayTraceId"}'
-        - !Ref AWS::NoValue
-      MethodSettings:
-        - ResourcePath: '/*'
-          HttpMethod: '*'
-          MetricsEnabled: true
-          ThrottlingRateLimit: 20
-          ThrottlingBurstLimit: 40
-          LoggingLevel: !If [ApiLogging, ERROR, 'OFF']
-      DefinitionBody:
+        Types: [REGIONAL]
+      Body:
         openapi: 3.0.1
         info:
           title: !Sub ${AWS::StackName}-api
@@ -1704,6 +1725,36 @@ Resources:
                 uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${QueryApiFunction.Arn}/invocations
                 passthroughBehavior: when_no_match
 
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    Properties:
+      RestApiId: !Ref RestApi
+      Description: Initial deployment (deploy.sh creates a fresh deployment after every stack update)
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref RestApi
+      DeploymentId: !Ref ApiDeployment
+      StageName: v1
+      TracingEnabled: true
+      Variables:
+        # Creates an implicit dependency so the stage waits for the account logging role.
+        accountSettings: !If [ApiLogging, !Ref ApiGatewayAccount, none]
+      AccessLogSetting: !If
+        - ApiLogging
+        - DestinationArn: !GetAtt ApiAccessLogs.Arn
+          Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","time":"$context.requestTime","method":"$context.httpMethod","resource":"$context.resourcePath","status":"$context.status","latencyMs":"$context.responseLatency","integrationLatencyMs":"$context.integrationLatency","user":"$context.authorizer.claims.sub","waf":"$context.wafResponseCode","xray":"$context.xrayTraceId"}'
+        - !Ref AWS::NoValue
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          MetricsEnabled: true
+          ThrottlingRateLimit: 20
+          ThrottlingBurstLimit: 40
+          LoggingLevel: !If [ApiLogging, ERROR, 'OFF']
+
+
   QueryApiInvokePermission:
     Type: AWS::Lambda::Permission
     Properties:
@@ -1814,7 +1865,7 @@ Resources:
           - '::/restapis/'
           - !Ref RestApi
           - '/stages/'
-          - !Ref RestApi.Stage
+          - !Ref ApiStage
 
   # ---------------------------------------------------------------------------
   # Observability: alarms, dashboard, saved Logs Insights queries
