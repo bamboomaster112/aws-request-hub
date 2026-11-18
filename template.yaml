@@ -167,7 +167,9 @@ Resources:
   WebBucket:
     Type: AWS::S3::Bucket
     Properties:
-      BucketName: !Sub ${AWS::StackName}-web-${AWS::AccountId}-${AWS::Region}
+      BucketName: !Sub
+        - '${AWS::StackName}-web-${AWS::AccountId}-${Suffix}'
+        - Suffix: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
@@ -186,7 +188,9 @@ Resources:
   AttachmentsBucket:
     Type: AWS::S3::Bucket
     Properties:
-      BucketName: !Sub ${AWS::StackName}-attachments-${AWS::AccountId}-${AWS::Region}
+      BucketName: !Sub
+        - '${AWS::StackName}-attachments-${AWS::AccountId}-${Suffix}'
+        - Suffix: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
@@ -218,7 +222,9 @@ Resources:
   AuditBucket:
     Type: AWS::S3::Bucket
     Properties:
-      BucketName: !Sub ${AWS::StackName}-audit-${AWS::AccountId}-${AWS::Region}
+      BucketName: !Sub
+        - '${AWS::StackName}-audit-${AWS::AccountId}-${Suffix}'
+        - Suffix: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
@@ -385,7 +391,9 @@ Resources:
   UserPoolDomain:
     Type: AWS::Cognito::UserPoolDomain
     Properties:
-      Domain: !Sub ${AWS::StackName}-${AWS::AccountId}
+      Domain: !Sub
+        - '${AWS::StackName}-${AWS::AccountId}-${Suffix}'
+        - Suffix: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]
       UserPoolId: !Ref UserPool
       ManagedLoginVersion: 1
 
@@ -683,7 +691,9 @@ Resources:
     Type: AWS::Lambda::Function
     Condition: UseLambdaPublisher
     Properties:
-      FunctionName: !Sub ${AWS::StackName}-stream-publisher
+      FunctionName: !Sub
+        - '${AWS::StackName}-stream-publisher-${Suffix}'
+        - Suffix: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]
       Description: CDC publisher (DynamoDB Streams -> EventBridge), used when EventBridge Pipes is unavailable
       Code: src/stream_publisher/
       Handler: app.handler
@@ -900,7 +910,9 @@ Resources:
   PolicyEngineFunction:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: !Sub ${AWS::StackName}-policy-engine
+      FunctionName: !Sub
+        - '${AWS::StackName}-policy-engine-${Suffix}'
+        - Suffix: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]
       Description: Evaluates approval policy (risk tier, approver group, SLA) from rules in Parameter Store
       Code: src/policy_engine/
       Handler: app.handler
@@ -920,7 +932,9 @@ Resources:
   QueryApiFunction:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: !Sub ${AWS::StackName}-query-api
+      FunctionName: !Sub
+        - '${AWS::StackName}-query-api-${Suffix}'
+        - Suffix: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]
       Description: Read API - my requests, request detail with attachment links, approval inbox
       Code: src/query_api/
       Handler: app.handler
@@ -940,7 +954,9 @@ Resources:
   DecisionHandlerFunction:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: !Sub ${AWS::StackName}-decision-handler
+      FunctionName: !Sub
+        - '${AWS::StackName}-decision-handler-${Suffix}'
+        - Suffix: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]
       Description: Authorises an approver's decision and resumes the paused workflow with SendTaskSuccess
       Code: src/decision_handler/
       Handler: app.handler
@@ -959,7 +975,9 @@ Resources:
   AttachmentPresignerFunction:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: !Sub ${AWS::StackName}-attachment-presigner
+      FunctionName: !Sub
+        - '${AWS::StackName}-attachment-presigner-${Suffix}'
+        - Suffix: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]
       Description: Issues size- and type-restricted presigned S3 POST policies for request attachments
       Code: src/attachment_presigner/
       Handler: app.handler
@@ -979,7 +997,9 @@ Resources:
   FulfilmentWorkerFunction:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: !Sub ${AWS::StackName}-fulfilment-worker
+      FunctionName: !Sub
+        - '${AWS::StackName}-fulfilment-worker-${Suffix}'
+        - Suffix: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]
       Description: Fulfils approved requests against a (simulated) downstream system, idempotently
       Code: src/fulfilment_worker/
       Handler: app.handler
@@ -1116,7 +1136,9 @@ Resources:
   SubmittedRule:
     Type: AWS::Events::Rule
     Properties:
-      Name: !Sub ${AWS::StackName}-start-approval
+      Name: !Sub
+        - '${AWS::StackName}-start-approval-${Suffix}'
+        - Suffix: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]
       Description: Start the approval workflow for every new request
       EventBusName: default
       EventPattern:
@@ -1135,7 +1157,9 @@ Resources:
   ApprovalNeededRule:
     Type: AWS::Events::Rule
     Properties:
-      Name: !Sub ${AWS::StackName}-approval-needed
+      Name: !Sub
+        - '${AWS::StackName}-approval-needed-${Suffix}'
+        - Suffix: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]
       Description: Notify approvers when a request is waiting for a decision
       EventBusName: default
       EventPattern:
@@ -1162,7 +1186,9 @@ Resources:
   EscalatedRule:
     Type: AWS::Events::Rule
     Properties:
-      Name: !Sub ${AWS::StackName}-escalated
+      Name: !Sub
+        - '${AWS::StackName}-escalated-${Suffix}'
+        - Suffix: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]
       Description: Tell admins when an approval SLA has been missed
       EventBusName: default
       EventPattern:
@@ -1185,7 +1211,9 @@ Resources:
   OutcomeRule:
     Type: AWS::Events::Rule
     Properties:
-      Name: !Sub ${AWS::StackName}-outcome
+      Name: !Sub
+        - '${AWS::StackName}-outcome-${Suffix}'
+        - Suffix: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]
       Description: Tell the requester about decisions and fulfilment
       EventBusName: default
       EventPattern:
@@ -1209,7 +1237,9 @@ Resources:
   FailureRule:
     Type: AWS::Events::Rule
     Properties:
-      Name: !Sub ${AWS::StackName}-workflow-failure
+      Name: !Sub
+        - '${AWS::StackName}-workflow-failure-${Suffix}'
+        - Suffix: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]
       Description: Page the ops topic when a request workflow fails
       EventBusName: default
       EventPattern:
@@ -1229,7 +1259,9 @@ Resources:
   FulfilmentRule:
     Type: AWS::Events::Rule
     Properties:
-      Name: !Sub ${AWS::StackName}-fulfilment
+      Name: !Sub
+        - '${AWS::StackName}-fulfilment-${Suffix}'
+        - Suffix: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]
       Description: Queue approved requests for fulfilment
       EventBusName: default
       EventPattern:
@@ -1275,7 +1307,9 @@ Resources:
   AuditRule:
     Type: AWS::Events::Rule
     Properties:
-      Name: !Sub ${AWS::StackName}-audit
+      Name: !Sub
+        - '${AWS::StackName}-audit-${Suffix}'
+        - Suffix: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]
       Description: Copy every domain event to the S3 audit lake
       EventBusName: default
       EventPattern:

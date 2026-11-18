@@ -83,10 +83,10 @@ Resources:
             Resource: !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${CoreStackName}/*
           - Effect: Allow
             Action: [s3:PutObject, s3:GetObject, s3:DeleteObject]
-            Resource: !Sub arn:aws:s3:::${CoreStackName}-web-${AWS::AccountId}-${AWS::Region}/*
+            Resource: !Sub arn:aws:s3:::${CoreStackName}-web-${AWS::AccountId}-*/*
           - Effect: Allow
             Action: s3:ListBucket
-            Resource: !Sub arn:aws:s3:::${CoreStackName}-web-${AWS::AccountId}-${AWS::Region}
+            Resource: !Sub arn:aws:s3:::${CoreStackName}-web-${AWS::AccountId}-*
 
   BuildRole:
     Type: AWS::IAM::Role
