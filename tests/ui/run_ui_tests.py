@@ -221,6 +221,30 @@ class LiveTarget:
     def route_uploads(self, context):
         pass  # real S3
 
+    def pace(self, limit):
+        """Waits while any Lambda function is near the playground's 300-calls-an-hour limit."""
+        if not limit:
+            return
+        waited = 0
+        while True:
+            try:
+                usage = self.kit.lambda_usage()
+            except Exception as exc:  # noqa: BLE001 (CloudWatch unavailable: carry on, but say so)
+                print(f"  (could not read Lambda usage: {exc}; not pacing)")
+                return
+            name, busiest = max(usage.items(), key=lambda kv: kv[1], default=("", 0))
+            if busiest < limit:
+                if waited:
+                    print(f"  (resuming: the busiest function, {name}, is now at {busiest} calls in the last hour)")
+                return
+            if not waited:
+                print(f"  (pausing: {name} has {busiest} calls in the last hour, the limit for this run is {limit}; "
+                      "waiting for older calls to age out)")
+            time.sleep(60)
+            waited += 1
+            if waited % 5 == 0:
+                print(f"  (still waiting: {busiest} calls, {waited} min so far)")
+
     def close(self):
         admin = self.token("admin")
         for module in ("PURCHASE", "GENERAL"):
@@ -1713,6 +1737,9 @@ def main():
     parser.add_argument("--only", default="")
     parser.add_argument("--list", action="store_true")
     parser.add_argument("--shots", default=str(SHOTS))
+    parser.add_argument("--pace", type=int, default=220, metavar="CALLS",
+                        help="live only: before each scenario, wait while any Lambda function has this many calls in the "
+                             "last hour (the playground deletes one at 300). 0 turns pacing off. Default 220")
     args = parser.parse_args()
     if args.list:
         for name, _, local_only in SCENARIOS:
@@ -1730,6 +1757,8 @@ def main():
             for name, fn, local_only in SCENARIOS:
                 if (wanted and name not in wanted) or (local_only and target.live):
                     continue
+                if target.live:
+                    target.pace(args.pace)
                 print(f"\n{name.replace('_', ' ').capitalize()}")
                 try:
                     fn(browser, target)

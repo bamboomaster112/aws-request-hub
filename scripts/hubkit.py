@@ -32,6 +32,24 @@ def outputs():
 
 
 # ---------------- TOTP (RFC 6238) ----------------
+def lambda_usage(minutes=60):
+    """Invocations per stack Lambda function over the last `minutes` (CloudWatch lags a minute or two).
+    The KodeKloud playground deletes a function invoked more than 300 times in an hour."""
+    lam = session.client("lambda")
+    cw = session.client("cloudwatch")
+    names = []
+    for page in lam.get_paginator("list_functions").paginate():
+        names += [f["FunctionName"] for f in page["Functions"] if f["FunctionName"].startswith(f"{STACK}-")]
+    end = time.time()
+    usage = {}
+    for name in names:
+        points = cw.get_metric_statistics(
+            Namespace="AWS/Lambda", MetricName="Invocations", Dimensions=[{"Name": "FunctionName", "Value": name}],
+            StartTime=end - minutes * 60, EndTime=end, Period=60, Statistics=["Sum"])["Datapoints"]
+        usage[name] = int(sum(p["Sum"] for p in points))
+    return usage
+
+
 def totp(secret_b32, for_time=None, step=30, digits=6):
     key = base64.b32decode(secret_b32 + "=" * (-len(secret_b32) % 8), casefold=True)
     counter = int((for_time or time.time()) // step)
