@@ -462,7 +462,7 @@ def two_level_chain(browser, t):
         expect(slip(page).nth(0)).to_have_class(re.compile("active")),
         expect(slip(page).nth(0)).to_contain_text("Line manager"),
         expect(slip(page).nth(1)).to_contain_text("Finance")))
-    verify("Requester: no decision buttons on their own request", page, lambda: expect(page.get_by_role("button", name="Approve")).to_have_count(0))
+    verify("Requester: no decision buttons on their own request", page, lambda: expect(page.get_by_role("button", name="Approve", exact=True)).to_have_count(0))
 
     mgr = Session(browser, t, "manager")
     open_from_inbox(mgr, title)
@@ -471,7 +471,7 @@ def two_level_chain(browser, t):
         expect(mp.get_by_role("heading", name="Your decision")).to_be_visible(),
         expect(mp.locator(".decision")).to_contain_text("Level 1 of 2")))
     mp.get_by_label("Decision note").fill("Agreed, the old ones are failing.")
-    mp.get_by_role("button", name="Approve").click()
+    mp.get_by_role("button", name="Approve", exact=True).click()
     verify("Manager: approval recorded", mp, lambda: expect(mp.locator("#toast")).to_contain_text("Approved. The workflow"))
     mgr.go("#/inbox")
     verify("Manager: it leaves their inbox (they cannot approve level 2 as well)", mp, lambda: (
@@ -484,7 +484,7 @@ def two_level_chain(browser, t):
     verify("Finance: level 2 of 2, the last level", fp, lambda: (
         expect(fp.locator(".decision")).to_contain_text("Level 2 of 2"),
         expect(fp.get_by_text("This is the last level")).to_be_visible()))
-    fp.get_by_role("button", name="Approve").click()
+    fp.get_by_role("button", name="Approve", exact=True).click()
     verify("Finance: approval recorded", fp, lambda: expect(fp.locator("#toast")).to_contain_text("Approved. The workflow"))
 
     req.go(f"#/requests/{rid}")
@@ -511,14 +511,14 @@ def rejection_needs_a_note(browser, t):
     mp = mgr.page
     posts = []
     mp.on("request", lambda r: posts.append(r.url) if r.method == "POST" and r.url.endswith("/decision") else None)
-    mp.get_by_role("button", name="Reject").click()
+    mp.get_by_role("button", name="Reject", exact=True).click()
     verify("Rejecting without a note asks for one next to the note box, and sends nothing", mp, lambda: (
         expect(mp.locator(".dyn-field.has-error", has_text="Decision note")).to_contain_text("Add a note"),
         expect(mp.get_by_label("Decision note")).to_be_focused(),
-        expect(mp.get_by_role("button", name="Reject")).to_be_enabled()))
+        expect(mp.get_by_role("button", name="Reject", exact=True)).to_be_enabled()))
     check("No decision was sent without a note", not posts, posts)
     mp.get_by_label("Decision note").fill("No budget this quarter.")
-    mp.get_by_role("button", name="Reject").click()
+    mp.get_by_role("button", name="Reject", exact=True).click()
     verify("Rejection with a note is recorded", mp, lambda: expect(mp.locator("#toast")).to_contain_text("Rejected. The workflow"))
     req.go(f"#/requests/{rid}")
     status = wait_for_status(req.page, ["REJECTED"])
@@ -652,7 +652,7 @@ def close_request(browser, t, request_id):
     mgr = Session(browser, t, "manager")
     mgr.go(f"#/requests/{request_id}")
     mgr.page.get_by_label("Decision note").fill("Closing a UI test request.")
-    mgr.page.get_by_role("button", name="Reject").click()
+    mgr.page.get_by_role("button", name="Reject", exact=True).click()
     verify("Test request closed so nothing is left in an inbox", mgr.page, lambda: expect(mgr.page.locator("#toast")).to_contain_text("Rejected. The workflow"))
     mgr.close()
 
@@ -764,12 +764,12 @@ def approver_raises_own_request(browser, t):
     verify("Manager: their own request goes to their own manager", page, lambda: (
         expect(slip(page).nth(0)).to_contain_text("Line manager"),
         expect(slip(page).nth(0)).to_contain_text(t.names["admin"])))
-    verify("Manager: no decision buttons on their own request", page, lambda: expect(page.get_by_role("button", name="Approve")).to_have_count(0))
+    verify("Manager: no decision buttons on their own request", page, lambda: expect(page.get_by_role("button", name="Approve", exact=True)).to_have_count(0))
     adm = Session(browser, t, "admin")
     open_from_inbox(adm, title)
     verify("Admin (their manager): decision panel at level 1 of 1", adm.page, lambda: expect(
         adm.page.locator(".decision")).to_contain_text("Level 1 of 1"))
-    adm.page.get_by_role("button", name="Approve").click()
+    adm.page.get_by_role("button", name="Approve", exact=True).click()
     verify("Admin: approval recorded", adm.page, lambda: expect(adm.page.locator("#toast")).to_contain_text("Approved. The workflow"))
     mgr.go(f"#/requests/{rid}")
     status = wait_for_status(page, ["FULFILLED"], tries=12)
@@ -790,11 +790,11 @@ def admin_sees_everything_but_cannot_jump_the_chain(browser, t):
     verify("Admin: can open anyone's request", adm.page, lambda: expect(adm.page.get_by_role("heading", name=title)).to_be_visible())
     verify("Admin: no decision buttons while it waits for the line manager", adm.page, lambda: (
         expect(adm.page.locator("#slip li.slip-step.active")).to_contain_text("Line manager"),
-        expect(adm.page.get_by_role("button", name="Approve")).to_have_count(0)))
+        expect(adm.page.get_by_role("button", name="Approve", exact=True)).to_have_count(0)))
     mgr = Session(browser, t, "manager")
     open_from_inbox(mgr, title)
     mgr.page.get_by_label("Decision note").fill("Closing the UI test request.")
-    mgr.page.get_by_role("button", name="Reject").click()
+    mgr.page.get_by_role("button", name="Reject", exact=True).click()
     verify("Manager: closes it (rejected with a note)", mgr.page, lambda: expect(mgr.page.locator("#toast")).to_contain_text("Rejected. The workflow"))
     for s in (req, adm, mgr):
         s.close()
