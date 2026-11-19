@@ -154,6 +154,12 @@ class LocalHub:
                    "token_use": "id", "iat": now, "exp": now + ttl}
         return f"{_b64({'alg': 'none', 'typ': 'JWT'})}.{_b64(payload)}.local"
 
+    def token_for_unknown(self, email, ttl=3600):
+        """A valid token for someone who exists in the identity provider but has no access profile."""
+        now = int(time.time())
+        payload = {"sub": "99999999-0000-0000-0000-000000000000", "email": email, "token_use": "id", "iat": now, "exp": now + ttl}
+        return f"{_b64({'alg': 'none', 'typ': 'JWT'})}.{_b64(payload)}.local"
+
     # ------------------------------------------------------------ the "AWS" side
     def invoke(self, name, method, resource, path_params, body, headers=None, query=None, who=None, claims=None):
         claims = claims or {"sub": self.ids[who], "email": self.emails[who]}

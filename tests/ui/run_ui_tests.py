@@ -26,6 +26,7 @@ import re
 import sys
 import time
 import traceback
+import urllib.parse
 
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import expect, sync_playwright
@@ -70,6 +71,7 @@ class LocalTarget:
     live = False
 
     def __init__(self):
+        self.shared = {}
         sys.path.insert(0, str(HERE))
         from local_backend import LocalHub
         self.hub = LocalHub().start()
@@ -106,6 +108,7 @@ class LiveTarget:
     live = True
 
     def __init__(self):
+        self.shared = {}
         sys.path.insert(0, str(ROOT / "scripts"))
         import hubkit
         self.kit = hubkit
@@ -505,12 +508,137 @@ def mobile_layout(browser, t):
 def sign_out(browser, t):
     s = Session(browser, t, "requester")
     page = s.page
+    visited = []
+    page.on("request", lambda r: visited.append(r.url) if r.is_navigation_request() else None)
     page.get_by_role("button", name="Sign out").click()
     verify("Sign out clears the session and returns to the landing page", page, lambda: (
         expect(page.get_by_role("button", name="Sign in")).to_be_visible(timeout=15000),
         expect(page.locator("#nav")).to_be_hidden()))
     has_token = page.evaluate("() => sessionStorage.getItem('id_token')")
     check("No token is left in session storage", not has_token)
+    check("Sign out goes through the identity provider's logout endpoint and back to the app",
+          any("/logout?" in u and "logout_uri=" in u for u in visited) and page.url.startswith(t.base_url), [u[:90] for u in visited[-3:]])
+    s.close()
+
+
+@scenario()
+def sign_in_redirect_uses_pkce(browser, t):
+    s = Session(browser, t, None)
+    page = s.page
+    config = page.evaluate("async () => (await fetch('config.json', {cache: 'no-store'})).json()")
+    page.get_by_role("button", name="Sign in").click()
+    page.wait_for_url(re.compile(r".*/(oauth2/authorize|login)\?.*"), timeout=15000)
+    url = urllib.parse.urlparse(page.url)
+    query = dict(urllib.parse.parse_qsl(url.query))
+    check("Sign in goes to the identity provider's hosted sign-in page", page.url.startswith(config["cognitoDomain"]), page.url[:80])
+    check("It asks for an authorization code for this app and returns to the app",
+          query.get("client_id") == config["clientId"] and query.get("redirect_uri") == config["redirectUri"]
+          and query.get("response_type") == "code", {k: query.get(k) for k in ("client_id", "redirect_uri", "response_type")})
+    check("It uses PKCE (S256 challenge) and a random state value",
+          query.get("code_challenge_method") == "S256" and len(query.get("code_challenge", "")) == 43 and len(query.get("state", "")) >= 16,
+          {k: query.get(k, "")[:12] for k in ("code_challenge_method", "code_challenge", "state")})
+    if t.live:
+        verify("The hosted sign-in page loads with email and password boxes, without an error", page, lambda: (
+            expect(page.locator("input[name=username]:visible").first).to_be_visible(timeout=15000),
+            expect(page.locator("input[name=password]:visible").first).to_be_visible(),
+            expect(page.get_by_text(re.compile("error was encountered|redirect_mismatch", re.I))).to_have_count(0)))
+    page.go_back()
+    page.wait_for_load_state()
+    stored = page.evaluate("() => [sessionStorage.getItem('oauth_state'), (sessionStorage.getItem('pkce_verifier') || '').length]")
+    check("The app kept the state and a 43-character verifier for the return trip", stored[0] == query.get("state") and stored[1] == 43, stored)
+    s.close()
+
+
+@scenario()
+def sign_in_callback_guards(browser, t):
+    s = Session(browser, t, None)
+    page = s.page
+    page.goto(t.base_url + "?code=forged-code&state=forged-state")
+    verify("A sign-in response with the wrong state is refused", page, lambda: (
+        expect(page.locator("#toast")).to_contain_text("state mismatch"),
+        expect(page.get_by_role("button", name="Sign in")).to_be_visible()))
+    check("...and the code is removed from the address bar", "code=" not in page.url, page.url)
+    page.evaluate("() => { sessionStorage.setItem('oauth_state', 'state-ok-1234567890'); sessionStorage.setItem('pkce_verifier', 'v'.repeat(43)); }")
+    page.goto(t.base_url + "?code=not-a-real-code&state=state-ok-1234567890")
+    verify("A made-up authorization code is rejected by the token endpoint", page, lambda: (
+        expect(page.locator("#toast")).to_contain_text("Could not complete sign-in"),
+        expect(page.get_by_role("button", name="Sign in")).to_be_visible()))
+    check("No token is stored after a failed sign-in", not page.evaluate("() => sessionStorage.getItem('id_token')"))
+    check("No JavaScript errors while handling bad sign-in responses", not s.errors, s.errors[:3])
+    s.close()
+
+
+@scenario()
+def approver_raises_own_request(browser, t):
+    title = f"UI test approver's own {stamp()}"
+    mgr = Session(browser, t, "manager")
+    rid = submit_purchase(mgr, title, 200)
+    page = mgr.page
+    wait_for_status(page, ["PENDING_APPROVAL"])
+    verify("Manager: their own request goes to their own manager", page, lambda: (
+        expect(page.locator("ol.chain li.step").nth(0)).to_contain_text("Line manager"),
+        expect(page.locator("ol.chain li.step").nth(0)).to_contain_text(t.names["admin"])))
+    verify("Manager: no decision buttons on their own request", page, lambda: expect(page.get_by_role("button", name="Approve")).to_have_count(0))
+    adm = Session(browser, t, "admin")
+    open_from_inbox(adm, title)
+    verify("Admin (their manager): decision panel at level 1 of 1", adm.page, lambda: expect(
+        adm.page.get_by_role("heading", name="Your decision (level 1 of 1)")).to_be_visible())
+    adm.page.get_by_role("button", name="Approve").click()
+    verify("Admin: approval recorded", adm.page, lambda: expect(adm.page.locator("#toast")).to_contain_text("Recorded: approved"))
+    mgr.go(f"#/requests/{rid}")
+    status = wait_for_status(page, ["FULFILLED"], tries=12)
+    check("Manager: their request is approved by their manager and fulfilled", status == "FULFILLED", status)
+    t.shared["manager_request"] = rid
+    mgr.close()
+    adm.close()
+
+
+@scenario()
+def admin_sees_everything_but_cannot_jump_the_chain(browser, t):
+    title = f"UI test chain order {stamp()}"
+    req = Session(browser, t, "requester")
+    rid = submit_purchase(req, title, 150)
+    wait_for_status(req.page, ["PENDING_APPROVAL"])
+    adm = Session(browser, t, "admin")
+    adm.go(f"#/requests/{rid}")
+    verify("Admin: can open anyone's request", adm.page, lambda: expect(adm.page.get_by_role("heading", name=title)).to_be_visible())
+    verify("Admin: no decision buttons while it waits for the line manager", adm.page, lambda: (
+        expect(adm.page.locator("ol.chain li.step.active")).to_contain_text("Line manager"),
+        expect(adm.page.get_by_role("button", name="Approve")).to_have_count(0)))
+    mgr = Session(browser, t, "manager")
+    open_from_inbox(mgr, title)
+    mgr.page.get_by_label("Decision note").fill("Closing the UI test request.")
+    mgr.page.get_by_role("button", name="Reject").click()
+    verify("Manager: closes it (rejected with a note)", mgr.page, lambda: expect(mgr.page.locator("#toast")).to_contain_text("Recorded: rejected"))
+    for s in (req, adm, mgr):
+        s.close()
+
+
+@scenario()
+def requester_cannot_open_other_peoples_requests(browser, t):
+    other = t.shared.get("manager_request")
+    if not other:
+        check("Requester isolation needs the manager's request from approver_raises_own_request", False, "run it first")
+        return
+    req = Session(browser, t, "requester")
+    req.go(f"#/requests/{other}")
+    verify("Requester: someone else's request is not found (its existence is not revealed)", req.page, lambda: (
+        expect(req.page.locator("#toast")).to_contain_text("Request not found"),
+        expect(req.page.get_by_role("heading", name=re.compile("UI test approver's own"))).to_have_count(0)))
+    req.go("#/inbox")
+    verify("Requester: the approvals inbox is not available", req.page, lambda: expect(req.page).to_have_url(re.compile(r"#/mine$")))
+    req.close()
+
+
+@scenario(local_only=True)
+def signed_in_without_access(browser, t):
+    s = Session(browser, t, None)
+    page = s.page
+    page.evaluate("t => sessionStorage.setItem('id_token', t)", t.hub.token_for_unknown("ghost@example.com"))
+    page.reload()
+    verify("Signed in but no access profile: the app says access is not set up and offers nothing else", page, lambda: (
+        expect(page.get_by_role("heading", name="Your access is not set up yet")).to_be_visible(timeout=10000),
+        expect(page.locator("#nav")).to_be_hidden()))
     s.close()
 
 
