@@ -343,3 +343,8 @@ label.choice input { width: auto; margin-top: .2rem; accent-color: var(--brand);
   .table th, .table td { padding: .65rem .75rem; }
   .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
+
+/* Light fills in dark mode need dark text to stay readable (WCAG AA). Last, so it wins over the base rules. */
+@media (prefers-color-scheme: dark) {
+  .btn.ok, .btn.danger.solid { color: #12131a; }
+}
