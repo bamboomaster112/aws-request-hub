@@ -167,6 +167,22 @@ Set up first, as an admin: give a requester a manager (an Approver), put someone
 
 `python3 scripts/smoke-test.py --escalation --dlq --audit` runs most of these automatically.
 
+## Browser tests
+
+`tests/ui/run_ui_tests.py` drives the real web app in headless Chromium (Playwright). It has two targets that run the same scenarios:
+
+```bash
+pip install playwright "moto[dynamodb,cognitoidp,events,ssm,s3,secretsmanager]"
+python -m playwright install --only-shell chromium     # add --with-deps on Ubuntu
+python3 tests/ui/run_ui_tests.py                        # local: no AWS account, about 20 seconds
+python3 scripts/seed-users.py && python3 tests/ui/run_ui_tests.py --live   # the deployed stack, from CloudShell
+```
+
+* **Local** serves `web/` from `tests/ui/local_backend.py`, which routes `/api/...` to the real Lambda handlers with the same resources as API Gateway, plays the Cognito authorizer, and uses moto for AWS and the state machine interpreter from `local_e2e.py` for Step Functions. It runs in the pipeline's Test stage.
+* **Live** points the same browser at the deployed app. Test users are signed in programmatically (Cognito admin auth with TOTP) and the ID token goes into session storage, where the app keeps the one from the hosted UI, so no test types a password. A live run only adds the test admin to the Finance group and grants one auto-approval, and it undoes both at the end. Steps that change forms, workflows or people, or that would email someone, run locally only.
+* Covered: signed-out and expired sessions, navigation by role and admin-route guarding, per-module form fields, the live route preview and field-level validation, form labels for every control, the two-level chain through three browsers (requester, manager, Finance) to fulfilment, rejection needing a note, auto-approval granted and revoked in the admin area, every admin screen, the manager picker never offering a loop, attachments through presigned S3 POST, the phone layout, sign-out, and locally the invite, form builder, workflow editor, SLA escalation and disable/enable flows.
+* A failed check saves a full-page screenshot in `ui-test-results/`. Other options: `--headed`, `--slow-mo 300`, `--only two_level_chain`, `--list`.
+
 ## Verified in the playground
 
 Live KodeKloud AWS Playground session, 18 Nov 2026 (us-east-1, WAF and Pipes blocked, so the Lambda CDC publisher was used):
@@ -183,7 +199,7 @@ Live KodeKloud AWS Playground session, 18 Nov 2026 (us-east-1, WAF and Pipes blo
 
 ## CI/CD
 
-`./scripts/release.sh` zips the current commit into the pipeline's source bucket. S3 emits an `Object Created` event, an EventBridge rule starts **CodePipeline V2**, the **Test** stage runs unit tests, `cfn-lint`, Bandit SAST and a JavaScript syntax check, and the **Deploy** stage publishes the web app. Infrastructure changes stay with `deploy.sh`, which keeps every pipeline run well inside the 15-minute limit.
+`./scripts/release.sh` zips the current commit into the pipeline's source bucket. S3 emits an `Object Created` event, an EventBridge rule starts **CodePipeline V2**, the **Test** stage runs unit tests, `cfn-lint`, Bandit SAST, a JavaScript syntax check and the browser tests against the local backend, and the **Deploy** stage publishes the web app. Infrastructure changes stay with `deploy.sh`, which keeps every pipeline run well inside the 15-minute limit.
 
 ## Repository layout
 
@@ -198,7 +214,7 @@ pipeline/                          cicd.yaml + buildspecs
 governance/governance.yaml         CloudTrail + AWS Config rules
 scripts/                           preflight, deploy, seed-config, publish-web, seed-users, smoke-test,
                                    create-user, setup-demo-users, release, teardown
-tests/                             unit tests, plus local_e2e.py (moto + state machine interpreter)
+tests/                             unit tests, local_e2e.py (moto + state machine interpreter), ui/ (browser tests)
 ```
 
 ## Data model (single table)

@@ -45,8 +45,14 @@ fi
 # The playground denies secretsmanager:GetRandomPassword, so generate the downstream API key here.
 DOWNSTREAM_API_KEY="${DOWNSTREAM_API_KEY:-$(openssl rand -hex 24)}"
 
+# On a redeploy, keep the email address the stack already has unless a new one is given.
+if [[ -z "$NOTIFICATION_EMAIL" ]]; then
+  NOTIFICATION_EMAIL=$(aws cloudformation describe-stacks --stack-name "$STACK" \
+    --query "Stacks[0].Parameters[?ParameterKey=='NotificationEmail'].ParameterValue | [0]" --output text 2>/dev/null || true)
+  [[ "$NOTIFICATION_EMAIL" == "None" ]] && NOTIFICATION_EMAIL=""
+fi
+
 PARAMS=(
-  "NotificationEmail=$NOTIFICATION_EMAIL"
   "DownstreamApiKey=$DOWNSTREAM_API_KEY"
   "UseEventBridgePipes=$USE_PIPES"
   "EnableWaf=$ENABLE_WAF"
@@ -54,6 +60,10 @@ PARAMS=(
   "ApprovalSlaSeconds=$SLA_SECONDS"
   "EscalationSlaSeconds=$SLA_SECONDS"
 )
+# The SAM CLI rejects an empty override ("NotificationEmail="), so only pass it when set.
+if [[ -n "$NOTIFICATION_EMAIL" ]]; then
+  PARAMS+=("NotificationEmail=$NOTIFICATION_EMAIL")
+fi
 
 step "Deploying core stack ($STACK)"
 # A first deploy that rolled back leaves a ROLLBACK_COMPLETE stack, which cannot be updated.

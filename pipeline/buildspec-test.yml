@@ -5,7 +5,9 @@ phases:
     runtime-versions:
       python: 3.12
     commands:
-      - pip install --quiet --upgrade boto3 cfn-lint bandit
+      - pip install --quiet --upgrade boto3 cfn-lint bandit playwright "moto[dynamodb,cognitoidp,events,ssm,s3,secretsmanager]"
+      - python -m playwright install --only-shell chromium
+      - dnf install -y -q nss nspr atk at-spi2-atk cups-libs libdrm libxkbcommon libXcomposite libXdamage libXrandr libXext libXfixes mesa-libgbm pango cairo alsa-lib
   build:
     commands:
       - echo "Unit tests"
@@ -16,3 +18,6 @@ phases:
       - bandit -r src -ll
       - echo "JavaScript syntax check (ES modules)"
       - for f in web/assets/*.js; do cp "$f" "/tmp/$(basename "$f" .js).mjs" && node --check "/tmp/$(basename "$f" .js).mjs" || exit 1; done
+      - echo "Browser tests of the web app against the real handlers (local backend, moto)"
+      - python tests/ui/run_ui_tests.py --shots ui-test-results
+
