@@ -47,6 +47,9 @@ h1, h2, h3 { margin: 0 0 .4rem; line-height: 1.2; }
 h2 { font-size: 1.35rem; }
 h3 { font-size: 1rem; }
 
+/* Focus and in-page jumps stop below the sticky top bar instead of under it. */
+html { scroll-padding-top: 5rem; }
+
 .topbar {
   position: sticky; top: 0; z-index: 5;
   display: flex; align-items: center; gap: 1.5rem; flex-wrap: wrap;

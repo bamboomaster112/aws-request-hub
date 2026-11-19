@@ -306,6 +306,9 @@ def dynamic_form_and_validation(browser, t):
         expect(page.locator(".dyn-field", has_text="Title").locator(".field-error")).to_contain_text("3 to 120 characters"),
         expect(page.locator("#toast")).to_contain_text("Check the highlighted fields")))
     check("The form is checked in the browser first: no API call for an incomplete form", not posts, posts)
+    covered = page.evaluate("""() => { const el = document.activeElement, bar = document.querySelector('.topbar');
+        return el && bar ? el.getBoundingClientRect().top < bar.getBoundingClientRect().bottom : true; }""")
+    check("The first problem field gets focus below the sticky top bar, not under it", not covered)
     page.get_by_label("Title").fill("Monitor arm")
     page.get_by_label("What are you buying?").fill("Monitor arm")
     page.get_by_label("Category").select_option("Hardware")
