@@ -501,7 +501,23 @@ function paintChrome() {
     h('button', { class: 'btn ghost', onclick: signOut }, 'Sign out')].filter(Boolean));
 }
 
+// Views load their data asynchronously. If someone navigates while a view is still loading,
+// the older view can finish last and paint over the newer one. Each route has a sequence number;
+// a route that finishes after a newer one has already painted re-runs the router for the current URL.
+let routeSeq = 0;
+let paintedSeq = 0;
+
 async function route() {
+  const seq = ++routeSeq;
+  try {
+    await renderRoute();
+  } finally {
+    if (paintedSeq > seq) route();
+    else paintedSeq = seq;
+  }
+}
+
+async function renderRoute() {
   if (!loadSession()) {
     state.idToken = null;
     paintChrome();

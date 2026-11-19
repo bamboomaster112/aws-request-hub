@@ -11,7 +11,7 @@ Covers what the browser tests cannot see from inside the app:
     at every later sign-in. Wrong passwords, wrong codes, unknown users and disabled users are
     refused, and global sign-out revokes the refresh token.
   * API Gateway's Cognito authorizer: no token, garbage, a tampered token and an access token
-    are all refused with 401; a real ID token without an access profile reaches the app but
+    are all refused before the app sees them; a real ID token without an access profile reaches the app but
     gets no access.
 
 It creates one throwaway user (no email is sent; passwords are generated in memory and never
@@ -189,8 +189,11 @@ def main():
         tampered = f"{head}.{base64.urlsafe_b64encode(json.dumps(forged).encode()).decode().rstrip('=')}.{sig}"
         for label, token in (("no token", None), ("a garbage token", "not.a.jwt"), ("a tampered ID token (claims changed)", tampered),
                              ("an access token instead of an ID token", tokens["AccessToken"])):
-            status, _ = hubkit.http("GET", f"{api}/me", token)
-            check(f"The API refuses {label} (401)", status == 401, status)
+            status, body = hubkit.http("GET", f"{api}/me", token)
+            reached_app = isinstance(body, dict) and "userId" in body
+            # API Gateway answers 401 for a missing or malformed token and 403 for a token whose signature does not match.
+            check(f"The API refuses {label} before the app sees it", status in (401, 403) and not reached_app, f"{status} {body}")
+            print(f"         {status} {json.dumps(body)[:100]}")
 
         section("Disable and sign out everywhere")
         refresh = tokens["RefreshToken"]

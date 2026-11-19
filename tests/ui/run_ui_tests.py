@@ -166,7 +166,7 @@ class LiveTarget:
 class Session:
     """One person in their own browser context, signed in through session storage."""
 
-    def __init__(self, browser, target, who, viewport=None):
+    def __init__(self, browser, target, who, viewport=None, wait_for_home=True):
         self.who, self.target = who, target
         self.context = browser.new_context(viewport=viewport or {"width": 1280, "height": 900})
         target.route_uploads(self.context)
@@ -179,6 +179,8 @@ class Session:
             self.page.evaluate("t => sessionStorage.setItem('id_token', t)", target.token(who))
             self.page.reload()
             expect(self.page.get_by_role("button", name="Sign out")).to_be_visible(timeout=15000)
+            if wait_for_home:  # let the first view finish loading before a test navigates elsewhere
+                expect(self.page.get_by_role("heading", name="My requests")).to_be_visible(timeout=15000)
 
     def go(self, hash_):
         self.page.evaluate("h => { window.location.hash = h; }", hash_)
@@ -273,6 +275,26 @@ def navigation_by_role(browser, t):
                 expect(page).to_have_url(re.compile(r"#/mine$")), expect(page.get_by_role("heading", name="My requests")).to_be_visible()))
         check(f"{who.title()}: no JavaScript errors", not s.errors, s.errors[:3])
         s.close()
+
+
+@scenario()
+def quick_navigation_lands_on_the_last_click(browser, t):
+    """A slow 'My requests' response must not paint over the view someone has already moved to."""
+    s = Session(browser, t, "manager", wait_for_home=False)
+    page = s.page
+
+    def slow_list(route):
+        time.sleep(2.5)
+        route.continue_()
+    page.route(re.compile(r".*/requests(\?.*)?$"), lambda r: slow_list(r) if r.request.method == "GET" else r.continue_())
+    page.reload()
+    s.go("#/inbox")
+    page.wait_for_timeout(4000)
+    verify("Clicking Approvals while My requests is still loading ends on Approvals", page, lambda: (
+        expect(page.get_by_role("heading", name="Approvals waiting for you")).to_be_visible(),
+        expect(page.get_by_role("heading", name="My requests")).to_have_count(0)))
+    page.unroute(re.compile(r".*/requests(\?.*)?$"))
+    s.close()
 
 
 @scenario()
