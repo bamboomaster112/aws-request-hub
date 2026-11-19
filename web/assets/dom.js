@@ -36,7 +36,11 @@ function append(el, children) {
   }
 }
 
+// Counts whole-page paints so the router can tell whether a late view painted anything.
+export const paints = { count: 0 };
+
 export function mount(...nodes) {
+  paints.count += 1;
   document.getElementById('app').replaceChildren(...nodes.flat().filter((n) => n !== null && n !== undefined && n !== false));
 }
 

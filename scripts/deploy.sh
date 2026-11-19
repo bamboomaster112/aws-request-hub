@@ -161,6 +161,6 @@ cat <<'EOF'
 
 Next:
   ./scripts/create-user.sh you@yourdomain.com admins   # your own admin login for the web app
-  python3 scripts/seed-users.py      # requester -> approver -> admin test users with MFA, for the smoke test
+  python3 scripts/seed-users.py      # requester -> approver -> two admins, with MFA, for the smoke and UI tests
   python3 scripts/smoke-test.py      # end-to-end checks through API Gateway, workflow and fulfilment
 EOF

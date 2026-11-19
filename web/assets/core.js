@@ -7,7 +7,7 @@ import { formField, adornedInput } from './ui-controls.js';
 import { select } from './ui-select.js';
 import { datePicker, parseIso } from './ui-datepicker.js';
 
-export { h, svg, mount, uid } from './dom.js';
+export { h, svg, mount, paints, uid } from './dom.js';
 export { icon, brandMark, MODULE_ICON } from './icons.js';
 export {
   button, linkButton, iconButton, busy, formField, textInput, adornedInput, searchInput, choiceCard, checkbox, switchToggle,

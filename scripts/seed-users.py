@@ -1,11 +1,22 @@
 #!/usr/bin/env python3
-"""Creates three test users (requester, approver, admin), sets strong random
+"""Creates the test users (requester, approver and two admins), sets strong random
 passwords, enrols each one in TOTP MFA, and stores the credentials in a
-private file in the CloudShell home directory for the smoke test.
+private file in the CloudShell home directory for the smoke and UI tests.
+
+The second admin exists because one person never approves two levels of the same
+request: a Change request at risk 8 goes to the line manager, then the Change
+advisory board (admins stand in while it has no members), then admins, and that
+needs two different admins after the manager.
 
 Nobody types a password: they are generated here and never printed. Safe to re-run: the test users are recreated from scratch,
-because an existing TOTP enrolment cannot be reset through the admin API.
+because an existing TOTP enrolment cannot be reset through the admin API. With --missing-only, users that
+already exist are kept and only the missing ones are created.
+
+  python3 scripts/seed-users.py                  # recreate every test user
+  python3 scripts/seed-users.py --missing-only   # add any test user that is missing, keep the rest
 """
+import argparse
+import json
 import secrets as pysecrets
 import string
 import sys
@@ -15,9 +26,10 @@ from botocore.exceptions import ClientError
 import hubkit
 
 SYMBOLS = "!@#%^*-_=+"
-# A small reporting line for the smoke test: requester -> approver -> admin.
+# A small reporting line for the smoke test: requester -> approver -> admin, plus a second admin.
 TEST_USERS = [
     ("admin", "admin@example.com", ["admins"], None),
+    ("admin2", "admin2@example.com", ["admins"], None),
     ("approver", "approver@example.com", ["approvers"], "admin"),
     ("requester", "requester@example.com", ["requesters"], "approver"),
 ]
@@ -78,11 +90,29 @@ def enrol_mfa(out, email, password):
     return secret
 
 
+def stored_users():
+    try:
+        with open(hubkit.USERS_FILE) as fh:
+            return json.load(fh)
+    except FileNotFoundError:
+        return {}
+
+
 def main():
+    parser = argparse.ArgumentParser(description="Create the test users with MFA enrolled.")
+    parser.add_argument("--missing-only", action="store_true",
+                        help="keep test users that already exist and only create the missing ones")
+    args = parser.parse_args()
     out = hubkit.outputs()
+    stored = stored_users() if args.missing_only else {}
     users = {}
     print(f"Seeding test users in {out['UserPoolId']}")
     for role, email, groups, manager in TEST_USERS:
+        kept = stored.get(role)
+        if kept and kept.get("userId") and kept.get("username") == email and hubkit.user_id_for(out, email) == kept["userId"]:
+            users[role] = kept
+            print(f"  {role}: kept {email}")
+            continue
         manager_id = users[manager]["userId"] if manager else None
         password, user_id = recreate_user(out, email, groups, manager_id)
         users[role] = {"username": email, "password": password, "groups": groups, "userId": user_id,

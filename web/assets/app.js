@@ -5,7 +5,7 @@ import {
   clearPageTimers, fmtTime, fmtNumber, fmtMoney, fmtField, shortValue, timeAgo, badge, field, note, api, ApiError,
   ensureMe, role, isAdmin, isReviewer, renderField, newKey, displayName, avatar, moduleLabel, moduleTile, countdown,
   button, linkButton, iconButton, busy, formField, textInput, select, choiceCard, searchInput, parseIso,
-  emptyState, skeleton, pageHead, card, menu, fileDrop, segmented, MODULE_ICON, nav, StaleRoute,
+  emptyState, skeleton, pageHead, card, menu, fileDrop, segmented, MODULE_ICON, nav, StaleRoute, paints,
 } from './core.js';
 import { adminRoute } from './admin.js';
 
@@ -705,10 +705,13 @@ function paintChrome() {
 
 // Views load their data asynchronously. If someone navigates while a view is still loading,
 // the older view must not paint over the newer one. Each route has a sequence number: reads made
-// for an older route are dropped when they return (see api() in core.js), and as a second guard a
-// route that finishes after a newer one has painted re-runs the router for the current URL.
+// for an older route are dropped when they return (see api() in core.js). As a second guard, a
+// route that finishes after a newer one has painted re-runs the router for the current URL, but
+// only if a page was painted since then. When the late route painted nothing, re-running would
+// wipe whatever the person has already started on the newer page (a chosen module, typed text).
 let routeSeq = 0;
 let paintedSeq = 0;
+let paintsAtFinish = 0;
 
 async function route() {
   const seq = ++routeSeq;
@@ -717,8 +720,12 @@ async function route() {
   try {
     await renderRoute();
   } finally {
-    if (paintedSeq > seq) route();
-    else paintedSeq = seq;
+    if (paintedSeq > seq) {
+      if (paints.count !== paintsAtFinish) route();
+    } else {
+      paintedSeq = seq;
+      paintsAtFinish = paints.count;
+    }
   }
 }
 

@@ -121,7 +121,7 @@ cd aws-request-hub
 ./scripts/preflight.sh                 # read-only permission probe, about 20 seconds
 python3 scripts/permissions-check.py   # IAM policy simulator over every action the stacks need
 ./scripts/deploy.sh                    # core stack + default forms, workflows, groups + web app + CI/CD
-python3 scripts/seed-users.py          # requester -> approver -> admin test users with MFA enrolled
+python3 scripts/seed-users.py          # requester -> approver -> admin, plus a second admin, with MFA enrolled
 python3 scripts/smoke-test.py          # end-to-end checks
 ```
 
@@ -197,6 +197,7 @@ pip install playwright "moto[dynamodb,cognitoidp,events,ssm,s3,secretsmanager]"
 python -m playwright install --only-shell chromium     # Ubuntu: add --with-deps. Amazon Linux 2023 (CloudShell, CodeBuild): see pipeline/buildspec-test.yml for the dnf packages
 python3 tests/ui/run_ui_tests.py                        # local: no AWS account, about 2 minutes
 python3 scripts/seed-users.py && python3 tests/ui/run_ui_tests.py --live   # the deployed stack, from CloudShell
+python3 scripts/seed-users.py --missing-only            # add a missing test user (such as the second admin) and keep the rest
 ```
 
 * **Local** serves `web/` from `tests/ui/local_backend.py`, which routes `/api/...` to the real Lambda handlers with the same resources as API Gateway, plays the Cognito authorizer, and uses moto for AWS and the state machine interpreter from `local_e2e.py` for Step Functions. It runs in the pipeline's Test stage.

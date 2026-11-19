@@ -187,8 +187,13 @@ class LiveTarget:
         self.base_url = self.out["AppUrl"].rstrip("/") + "/"
         self.api = self.out["ApiBaseUrl"]
         users = hubkit.load_users()
-        # The scripted test users: requester -> approver (manager) -> admin. The admin also sits in Finance for the run.
-        self.users = {"requester": users["requester"], "manager": users["approver"], "admin": users["admin"], "finance": users["admin"]}
+        if "admin2" not in users:
+            sys.exit("The UI tests need the second test admin (a three-level Change chain needs two admins after the "
+                     "manager). Add it without touching the others: python3 scripts/seed-users.py --missing-only")
+        # The scripted test users: requester -> approver (manager) -> admin, plus a second admin.
+        # The admin also sits in Finance for the run.
+        self.users = {"requester": users["requester"], "manager": users["approver"], "admin": users["admin"],
+                      "admin2": users["admin2"], "finance": users["admin"]}
         self.ids = {k: v["userId"] for k, v in self.users.items()}
         self._tokens = {}
         self.names = {}
@@ -420,6 +425,23 @@ def quick_navigation_lands_on_the_last_click(browser, t):
     verify("A page that fails quickly is not painted over by a slow page from before", page, lambda: (
         expect(page.get_by_role("heading", name="Not found")).to_be_visible(),
         expect(page.get_by_role("heading", name="My requests")).to_have_count(0)))
+    page.unroute(re.compile(r".*/requests(\?.*)?$"))
+    # Hold the My requests response until the next page is painted and someone has started typing.
+    held = []
+    page.route(re.compile(r".*/requests(\?.*)?$"), lambda r: held.append(r) if r.request.method == "GET" else r.continue_())
+    s.go("#/mine")
+    page.reload()
+    expect(page.get_by_role("heading", name="My requests")).to_be_visible()
+    s.go("#/new")
+    page.locator("label.choice", has_text="Purchasing").click()
+    page.get_by_label("Title").fill("Started before My requests finished loading")
+    for r in held:
+        r.continue_()
+    page.wait_for_timeout(1500)
+    check("The My requests response was held until the form was in use", bool(held), "nothing was held")
+    verify("A slow page from before does not reload the form someone has started", page, lambda: (
+        expect(page.locator("label.choice", has_text="Purchasing").locator("input")).to_be_checked(),
+        expect(page.get_by_label("Title")).to_have_value("Started before My requests finished loading")))
     page.unroute(re.compile(r".*/requests(\?.*)?$"))
     s.close()
 
@@ -894,8 +916,10 @@ def every_module_end_to_end(browser, t):
         page.get_by_role("button", name="Submit request").click()
         expect(page).to_have_url(re.compile(r"#/requests/[0-9a-f-]{36}$"), timeout=15000)
         rid = page.url.rsplit("/", 1)[-1]
-        opened.append(rid)
-        wait_for_status(page, ["PENDING_APPROVAL"])
+        status = wait_for_status(page, ["PENDING_APPROVAL", "UNROUTABLE"])  # stop early when it cannot route
+        check(f"{label}: the request routes to approvers", status == "PENDING APPROVAL", status)
+        if status == "PENDING APPROVAL":
+            opened.append(rid)  # an unroutable request is in nobody's inbox, so there is nothing to close
         steps = slip(page)
         verify(f"{label}: the chain has the expected levels ({' -> '.join(levels)})", page, lambda: (
             expect(steps).to_have_count(len(levels)),
@@ -1741,6 +1765,7 @@ def main():
                         help="live only: before each scenario, wait while any Lambda function has this many calls in the "
                              "last hour (the playground deletes one at 300). 0 turns pacing off. Default 220")
     args = parser.parse_args()
+    sys.stdout.reconfigure(line_buffering=True)  # progress shows up in a redirected log as it happens
     if args.list:
         for name, _, local_only in SCENARIOS:
             print(f"{name}{'  (local only)' if local_only else ''}")
