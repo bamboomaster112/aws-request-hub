@@ -75,7 +75,7 @@ def main():
         ids[key] = ensure_user(out, email, role)
         body = {"role": role, "name": name, "department": department, "jobTitle": title,
                 "modules": hubkit.ALL_MODULES, "managerId": ids[manager] if manager else None}
-        must(call("PUT", f"/admin/users/{ids[key]}", body), f"Updating {email}")
+        must(call("PATCH", f"/admin/users/{ids[key]}", body), f"Updating {email}")
 
     print("Approver groups and workflows")
     config = must(call("GET", "/admin/config"), "Reading the configuration")
