@@ -630,6 +630,9 @@ def mobile_layout(browser, t):
             page.locator("label.choice", has_text="Purchasing").click()
         overflow = page.evaluate("() => document.documentElement.scrollWidth - window.innerWidth")
         check(f"Phone width: {heading} has no sideways scrolling", overflow <= 1, f"{overflow}px too wide")
+        clipped = page.evaluate("""() => [...document.querySelectorAll('#app .badge, #app button, #app a.btn')].filter((e) => {
+            const r = e.getBoundingClientRect(); return e.offsetParent && (r.right > window.innerWidth + 1 || r.left < -1); }).map((e) => e.textContent.trim())""")
+        check(f"Phone width: every status badge and button on {heading} is fully on screen", not clipped, clipped[:5])
     s.close()
 
 
@@ -845,7 +848,7 @@ def header_and_page_buttons(browser, t):
     expect(page.get_by_role("heading", name="Approvals waiting for you")).to_be_visible()
     page.locator(".section-head").get_by_role("button", name="Refresh").click()
     verify("Approvals: Refresh reloads the inbox", page, lambda: expect(page.get_by_role("heading", name="Approvals waiting for you")).to_be_visible())
-    header.get_by_role("link", name="Request Hub home").click()
+    header.get_by_role("link", name="Request Hub", exact=True).click()
     verify("Header: the logo goes home to My requests", page, lambda: expect(page.get_by_role("heading", name="My requests")).to_be_visible())
     s.close()
 

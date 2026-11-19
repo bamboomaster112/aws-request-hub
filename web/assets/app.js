@@ -140,7 +140,8 @@ async function viewMine() {
     return;
   }
   const rows = items.map((it) => h('tr', { class: 'clickable', onclick: () => { window.location.hash = `#/requests/${it.requestId}`; } },
-    h('td', {}, h('div', { class: 'title' }, it.title), h('div', { class: 'muted small mono' }, it.requestId)),
+    h('td', {}, h('div', { class: 'title' }, it.title),
+      h('div', { class: 'muted small mobile-only-block' }, [moduleLabel(it.type), valueText(it)].filter(Boolean).join(' · '))),
     h('td', {}, moduleLabel(it.type)),
     h('td', { class: 'small' }, valueText(it)),
     h('td', {}, badge(it.status),
@@ -148,7 +149,7 @@ async function viewMine() {
         ? h('div', { class: 'muted small' }, `Level ${it.currentLevel} of ${it.levelCount}`) : null),
     h('td', { class: 'muted small' }, fmtTime(it.createdAt))));
   mount(header, h('div', { class: 'card flush' },
-    h('table', { class: 'table' },
+    h('table', { class: 'table mine' },
       h('thead', {}, h('tr', {}, h('th', {}, 'Request'), h('th', {}, 'Module'), h('th', {}, 'Value'), h('th', {}, 'Status'), h('th', {}, 'Created'))),
       h('tbody', {}, rows))));
 }
@@ -435,7 +436,9 @@ function attachmentsPanel(it) {
     : h('p', { class: 'muted small' }, 'No attachments.');
 
   const panel = h('div', { class: 'card' }, h('h3', {}, 'Attachments'), list);
-  if (it.isOwner) {
+  const closed = ['REJECTED', 'EXPIRED', 'FULFILLED', 'UNROUTABLE', 'FAILED'].includes(it.status);
+  if (it.isOwner && closed) panel.append(h('p', { class: 'muted small' }, 'This request is closed, so no more files can be added.'));
+  if (it.isOwner && !closed) {
     const input = h('input', { type: 'file', accept: '.pdf,.png,.jpg,.jpeg,.txt,.csv,.docx,.xlsx', 'aria-label': 'Choose a file to attach' });
     const button = h('button', { class: 'btn' }, 'Upload');
     button.addEventListener('click', async () => {

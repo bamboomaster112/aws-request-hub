@@ -6,7 +6,7 @@
   --line: #e3e6ee;
   --brand: #5b4ee6;
   --brand-ink: #ffffff;
-  --ok: #1f8a5b;
+  --ok: #17734b;
   --ok-bg: #e5f5ed;
   --warn: #9a6200;
   --warn-bg: #fff3dc;
@@ -180,6 +180,7 @@ h4 { margin: 1rem 0 .5rem; font-size: .8rem; text-transform: uppercase; letter-s
 .chips .chip, .chip { white-space: nowrap; }
 .chip.strong { background: var(--brand); color: var(--brand-ink); }
 .table.users td { vertical-align: middle; }
+.mobile-only-block { display: none; }
 .table td.empty { text-align: center; color: var(--muted); padding: 2rem 1rem; }
 tr.dim td { opacity: .6; }
 .badge.role-admins { background: var(--brand); color: var(--brand-ink); }
@@ -326,6 +327,9 @@ label.choice input { width: auto; margin-top: .2rem; accent-color: var(--brand);
   .grid2 { grid-template-columns: 1fr; }
   .who { margin-left: 0; }
   .table th:nth-child(5), .table td:nth-child(5) { display: none; }
+  .table.mine th:nth-child(2), .table.mine td:nth-child(2),
+  .table.mine th:nth-child(3), .table.mine td:nth-child(3) { display: none; }
+  .mobile-only-block { display: block; }
   .mobile-only { display: inline-block; }
   .person-text { overflow-wrap: anywhere; }
   .table.users th:nth-child(2), .table.users td:nth-child(2),
