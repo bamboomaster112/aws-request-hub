@@ -210,7 +210,7 @@ def list_users():
         "disabled": sum(1 for u in users if u["status"] == "DISABLED"),
         "invitesPending": sum(1 for u in users if u["cognitoStatus"] == "FORCE_CHANGE_PASSWORD"),
         "admins": sum(1 for u in users if u["role"] == "admins" and u["status"] == "ACTIVE"),
-        "noManager": sum(1 for u in users if u["status"] == "ACTIVE" and not u["managerId"]),
+        "noManager": sum(1 for u in users if u["status"] == "ACTIVE" and not u["managerId"] and u.get("role") != "admins"),
     }
     return common.response(200, {"items": users, "summary": summary, **catalogue()})
 
@@ -382,7 +382,7 @@ def update_user(user_id, body, actor):
 
     changes = []
     if role != current.get("role"):
-        changes.append(f"role {ROLES.get(current.get('role'), current.get('role'))} -> {ROLES[role]}")
+        changes.append(f"role changed from {ROLES.get(current.get('role'), current.get('role'))} to {ROLES[role]}")
     old_modules = sorted(current.get("modules") or [])
     if modules != old_modules:
         added, removed = sorted(set(modules) - set(old_modules)), sorted(set(old_modules) - set(modules))

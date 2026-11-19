@@ -209,7 +209,7 @@ def save_workflow(module, body, actor):
     item = {"PK": common.CONFIG_PK, "SK": f"WORKFLOW#{module}", "entity": "WORKFLOW", **workflow, "version": version,
             "updatedAt": ts, "updatedBy": actor["userId"], "updatedByEmail": actor.get("email", "")}
     field_label = next((f["label"] for f in (form or {}).get("fields", []) if f["key"] == (form or {}).get("approvalField")), None)
-    chain = " -> ".join(describe_level(l, groups_by_id, field_label) for l in workflow["levels"])
+    chain = ", then ".join(describe_level(l, groups_by_id, field_label) for l in workflow["levels"])
     summary = f"{MODULES[module]} workflow version {version}: {chain}"
     common.transact([
         common.versioned_put(item, (current or {}).get("version"), create=current is None),

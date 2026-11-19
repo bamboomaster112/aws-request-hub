@@ -3,40 +3,58 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' https://*.amazoncognito.com https://*.amazonaws.com; base-uri 'self'; form-action 'self' https://*.amazoncognito.com; object-src 'none'">
+  <meta name="color-scheme" content="light dark">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self' data:; connect-src 'self' https://*.amazoncognito.com https://*.amazonaws.com; base-uri 'self'; form-action 'self' https://*.amazoncognito.com; object-src 'none'">
   <title>Request Hub</title>
-  <link rel="icon" href="data:,">
-  <link rel="stylesheet" href="assets/styles.css">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='1' y='1' width='30' height='30' rx='8' fill='%232d46c8'/%3E%3Cpath d='M10 9h12M10 13.5h8' stroke='%23fff' stroke-width='2' stroke-linecap='round'/%3E%3Ccircle cx='20' cy='21' r='5.5' fill='none' stroke='%23fff' stroke-width='1.75'/%3E%3Cpath d='M17.6 21.2l1.7 1.7 3.2-3.6' fill='none' stroke='%23fff' stroke-width='1.75' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="assets/fonts.css">
+  <link rel="stylesheet" href="assets/tokens.css">
+  <link rel="stylesheet" href="assets/base.css">
+  <link rel="stylesheet" href="assets/components.css">
+  <link rel="stylesheet" href="assets/views.css">
   <script type="module" src="assets/app.js"></script>
 </head>
 <body>
+  <a class="skip-link" href="#app">Skip to content</a>
   <header class="topbar">
-    <a class="brand" href="#/mine">
-      <span class="logo" aria-hidden="true">RH</span>
-      <span>Request Hub</span>
-    </a>
-    <nav id="nav" class="tabs" hidden>
-      <a href="#/mine" data-view="mine">My requests</a>
-      <a href="#/new" data-view="new">New request</a>
-      <a href="#/inbox" data-view="inbox" id="inboxTab" hidden>Approvals</a>
-      <a href="#/admin/users" data-view="admin" id="adminTab" hidden>Admin</a>
-    </nav>
-    <div class="who" id="who"></div>
+    <div class="topbar-inner">
+      <a class="brand" href="#/mine">
+        <svg class="mark" viewBox="0 0 32 32" width="28" height="28" aria-hidden="true" focusable="false">
+          <rect class="mark-bg" x="1" y="1" width="30" height="30" rx="8"/>
+          <path class="mark-line" d="M10 9h12M10 13.5h8"/>
+          <circle class="mark-stamp" cx="20" cy="21" r="5.5"/>
+          <path class="mark-tick" d="M17.6 21.2l1.7 1.7 3.2-3.6"/>
+        </svg>
+        <span>Request Hub</span>
+      </a>
+      <nav id="nav" class="nav" aria-label="Main" hidden>
+        <a href="#/mine" data-view="mine">My requests</a>
+        <a href="#/new" data-view="new">New request</a>
+        <a href="#/inbox" data-view="inbox" id="inboxTab" hidden>Approvals</a>
+        <a href="#/admin/users" data-view="admin" id="adminTab" hidden>Admin</a>
+      </nav>
+      <div class="who" id="who"></div>
+    </div>
   </header>
 
-  <main id="app" aria-live="polite">
+  <main id="app" tabindex="-1">
     <p class="muted">Loading...</p>
   </main>
 
-  <div id="toast" class="toast" role="status" hidden></div>
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
 
-  <dialog id="confirm" class="dialog" aria-labelledby="confirmTitle">
+  <dialog id="confirm" class="dialog" aria-labelledby="confirmTitle" aria-describedby="confirmBody">
     <form method="dialog">
-      <h3 id="confirmTitle"></h3>
-      <p id="confirmBody" class="muted"></p>
+      <div class="dialog-top">
+        <span id="confirmIcon" class="dialog-icon" aria-hidden="true"></span>
+        <div>
+          <h2 id="confirmTitle"></h2>
+          <p id="confirmBody"></p>
+        </div>
+      </div>
       <label id="confirmTypeWrap" class="confirm-type" hidden>
-        <span id="confirmTypeLabel" class="small"></span>
-        <input id="confirmType" autocomplete="off">
+        <span id="confirmTypeLabel" class="field-label"></span>
+        <input id="confirmType" type="text" autocomplete="off">
       </label>
       <div class="row end">
         <button class="btn" value="cancel">Cancel</button>
@@ -44,9 +62,5 @@
       </div>
     </form>
   </dialog>
-
-  <footer class="footer">
-    Serverless on AWS: API Gateway, Cognito, DynamoDB, EventBridge, Step Functions, SQS, SNS, Firehose, KMS
-  </footer>
 </body>
 </html>

@@ -9,6 +9,8 @@ phases:
       - dnf install -y -q libatomic nss nspr atk at-spi2-atk cups-libs libdrm libxkbcommon libXcomposite libXdamage libXrandr libXext libXfixes mesa-libgbm pango cairo alsa-lib
       - pip install --quiet --upgrade boto3 cfn-lint bandit playwright "moto[dynamodb,cognitoidp,events,ssm,s3,secretsmanager]"
       - python -m playwright install --only-shell chromium
+      # axe-core for the accessibility audit scenario (it is skipped if this download fails)
+      - mkdir -p /tmp/axe && (npm pack axe-core@4 --silent --pack-destination /tmp && tar -xzf /tmp/axe-core-*.tgz -C /tmp/axe) || echo "axe-core not available"
   build:
     commands:
       - echo "Unit tests"
@@ -19,6 +21,6 @@ phases:
       - bandit -r src -ll
       - echo "JavaScript syntax check (ES modules)"
       - for f in web/assets/*.js; do cp "$f" "/tmp/$(basename "$f" .js).mjs" && node --check "/tmp/$(basename "$f" .js).mjs" || exit 1; done
-      - echo "Browser tests of the web app against the real handlers (local backend, moto)"
+      - echo "Browser tests of the web app against the real handlers (local backend, moto), with an axe-core audit"
       - python tests/ui/run_ui_tests.py --shots ui-test-results
 

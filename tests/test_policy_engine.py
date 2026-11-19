@@ -61,7 +61,7 @@ class AutoApprovalTests(unittest.TestCase):
     def test_over_the_limit_goes_to_approval(self):
         result = plan(501, rule=self.rule)
         self.assertFalse(result["autoApprove"])
-        self.assertIn("above the requester's auto-approval limit", result["reasons"][0])
+        self.assertIn("above the auto-approval limit of 500", result["reasons"][0])
 
     def test_expired_rule_goes_to_approval(self):
         result = plan(10, rule={**self.rule, "expiresAt": NOW - 1})
@@ -108,11 +108,21 @@ class ChainTests(unittest.TestCase):
         self.assertEqual(result["levels"][0]["approverIds"], ["priya", "vikram"])
         self.assertTrue(result["levels"][0]["fallback"])
 
+    def test_reasons_are_written_for_people(self):
+        profiles = org()
+        request = {"requestId": "r1", "type": "PURCHASE", "amount": 4200, "requesterId": "rahul", "approvalField": "Total cost"}
+        result = engine.build_plan(request, profiles["rahul"], PURCHASE, profiles, GROUPS, None, NOW, TIMERS)
+        text = " ".join(result["reasons"])
+        self.assertIn("nobody has auto-approval for Purchasing requests", text)
+        self.assertIn("Admins only approve from 10,000, and the total cost is 4,200, so this level is skipped.", text)
+        self.assertIn("Approval order: Line manager: Ana, then Finance.", text)
+        self.assertNotIn("->", text)
+
     def test_nobody_eligible_is_unroutable(self):
         profiles = {"solo": person("solo", "admins")}
         result = plan(50, requester="solo", profiles=profiles, workflow={"levels": [{"kind": "MANAGER", "minAmount": 0}]})
         self.assertFalse(result["routable"])
-        self.assertIn("Nobody is eligible", result["reasons"][-1])
+        self.assertIn("Nobody can approve level", result["reasons"][-1])
 
     def test_plan_json_and_dynamodb_shapes(self):
         result = plan(1000)

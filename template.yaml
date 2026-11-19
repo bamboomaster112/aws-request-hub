@@ -37,6 +37,11 @@ Parameters:
     NoEcho: true
     MinLength: 20
     Description: Credential for the simulated downstream system. deploy.sh generates one (the playground denies secretsmanager:GetRandomPassword).
+  LoginStyle:
+    Type: String
+    AllowedValues: ['custom', 'default', 'classic']
+    Default: 'custom'
+    Description: Sign-in page. custom = managed login with the app's logo and colours; default = managed login with Cognito's standard style; classic = the older hosted UI.
   EnableWaf:
     Type: String
     AllowedValues: ['true', 'false']
@@ -46,6 +51,8 @@ Parameters:
 Conditions:
   HasEmail: !Not [!Equals [!Ref NotificationEmail, '']]
   UseWaf: !Equals [!Ref EnableWaf, 'true']
+  ManagedLogin: !Not [!Equals [!Ref LoginStyle, 'classic']]
+  CustomLoginStyle: !Equals [!Ref LoginStyle, 'custom']
   UsePipes: !Equals [!Ref UseEventBridgePipes, 'true']
   UseLambdaPublisher: !Equals [!Ref UseEventBridgePipes, 'false']
   ApiLogging: !Equals [!Ref EnableApiGatewayAccountLogging, 'true']
@@ -395,7 +402,7 @@ Resources:
         - '${AWS::StackName}-${AWS::AccountId}-${Suffix}'
         - Suffix: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]
       UserPoolId: !Ref UserPool
-      ManagedLoginVersion: 1
+      ManagedLoginVersion: !If [ManagedLogin, 2, 1]
 
   WebClient:
     Type: AWS::Cognito::UserPoolClient
@@ -424,6 +431,340 @@ Resources:
         AccessToken: minutes
         IdToken: minutes
         RefreshToken: days
+
+  # Managed login (version 2) with the app's own look: logo, ink-blue buttons, the ledger-grey page,
+  # and light or dark following the browser. LoginStyle=default uses Cognito's standard style instead,
+  # and LoginStyle=classic keeps the older hosted UI.
+  ManagedLoginStyle:
+    Type: AWS::Cognito::ManagedLoginBranding
+    Condition: ManagedLogin
+    DependsOn: UserPoolDomain
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientId: !Ref WebClient
+      UseCognitoProvidedValues: !If [CustomLoginStyle, false, true]
+      Assets: !If
+        - CustomLoginStyle
+        - - Category: FORM_LOGO
+            ColorMode: LIGHT
+            Extension: SVG
+            Bytes: PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyMzIiIGhlaWdodD0iNDAiIHZpZXdCb3g9IjAgMCAyMzIgNDAiPgo8ZyB0cmFuc2Zvcm09InRyYW5zbGF0ZSgyIDIpIHNjYWxlKDEuMikgdHJhbnNsYXRlKC0xIC0xKSI+CjxyZWN0IHg9IjEiIHk9IjEiIHdpZHRoPSIzMCIgaGVpZ2h0PSIzMCIgcng9IjgiIGZpbGw9IiMyZDQ2YzgiLz4KPHBhdGggZD0iTTEwIDloMTJNMTAgMTMuNWg4IiBzdHJva2U9IiNmZmZmZmYiIHN0cm9rZS13aWR0aD0iMiIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIiBmaWxsPSJub25lIi8+CjxjaXJjbGUgY3g9IjIwIiBjeT0iMjEiIHI9IjUuNSIgZmlsbD0ibm9uZSIgc3Ryb2tlPSIjZmZmZmZmIiBzdHJva2Utd2lkdGg9IjEuNzUiLz4KPHBhdGggZD0iTTE3LjYgMjEuMmwxLjcgMS43IDMuMi0zLjYiIGZpbGw9Im5vbmUiIHN0cm9rZT0iI2ZmZmZmZiIgc3Ryb2tlLXdpZHRoPSIxLjc1IiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiLz4KPC9nPgo8dGV4dCB4PSI1MCIgeT0iMjciIGZvbnQtZmFtaWx5PSJJQk0gUGxleCBTYW5zLCBTZWdvZSBVSSwgSGVsdmV0aWNhIE5ldWUsIEFyaWFsLCBzYW5zLXNlcmlmIiBmb250LXNpemU9IjIxIiBmb250LXdlaWdodD0iNjAwIiBmaWxsPSIjMTcyMDMzIj5SZXF1ZXN0IEh1YjwvdGV4dD4KPC9zdmc+
+          - Category: FORM_LOGO
+            ColorMode: DARK
+            Extension: SVG
+            Bytes: PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyMzIiIGhlaWdodD0iNDAiIHZpZXdCb3g9IjAgMCAyMzIgNDAiPgo8ZyB0cmFuc2Zvcm09InRyYW5zbGF0ZSgyIDIpIHNjYWxlKDEuMikgdHJhbnNsYXRlKC0xIC0xKSI+CjxyZWN0IHg9IjEiIHk9IjEiIHdpZHRoPSIzMCIgaGVpZ2h0PSIzMCIgcng9IjgiIGZpbGw9IiM5M2E1ZmYiLz4KPHBhdGggZD0iTTEwIDloMTJNMTAgMTMuNWg4IiBzdHJva2U9IiMwZTEzMjAiIHN0cm9rZS13aWR0aD0iMiIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIiBmaWxsPSJub25lIi8+CjxjaXJjbGUgY3g9IjIwIiBjeT0iMjEiIHI9IjUuNSIgZmlsbD0ibm9uZSIgc3Ryb2tlPSIjMGUxMzIwIiBzdHJva2Utd2lkdGg9IjEuNzUiLz4KPHBhdGggZD0iTTE3LjYgMjEuMmwxLjcgMS43IDMuMi0zLjYiIGZpbGw9Im5vbmUiIHN0cm9rZT0iIzBlMTMyMCIgc3Ryb2tlLXdpZHRoPSIxLjc1IiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiLz4KPC9nPgo8dGV4dCB4PSI1MCIgeT0iMjciIGZvbnQtZmFtaWx5PSJJQk0gUGxleCBTYW5zLCBTZWdvZSBVSSwgSGVsdmV0aWNhIE5ldWUsIEFyaWFsLCBzYW5zLXNlcmlmIiBmb250LXNpemU9IjIxIiBmb250LXdlaWdodD0iNjAwIiBmaWxsPSIjZTVlOWYyIj5SZXF1ZXN0IEh1YjwvdGV4dD4KPC9zdmc+
+        - !Ref AWS::NoValue
+      Settings: !If
+        - CustomLoginStyle
+        -
+          categories:
+            auth:
+              authMethodOrder:
+              - - display: BUTTON
+                  type: FEDERATED
+                - display: INPUT
+                  type: USERNAME_PASSWORD
+              federation:
+                interfaceStyle: BUTTON_LIST
+                order: []
+            form:
+              displayGraphics: true
+              instructions:
+                enabled: false
+              languageSelector:
+                enabled: false
+              location:
+                horizontal: CENTER
+                vertical: CENTER
+              sessionTimerDisplay: NONE
+            global:
+              colorSchemeMode: DYNAMIC
+              pageFooter:
+                enabled: false
+              pageHeader:
+                enabled: false
+              spacingDensity: REGULAR
+            signUp:
+              acceptanceElements:
+              - enforcement: NONE
+                textKey: en
+          componentClasses:
+            buttons:
+              borderRadius: 8.0
+            divider:
+              darkMode:
+                borderColor: 283043ff
+              lightMode:
+                borderColor: d9dee7ff
+            dropDown:
+              borderRadius: 8.0
+              darkMode:
+                defaults:
+                  itemBackgroundColor: 161c2aff
+                hover:
+                  itemBackgroundColor: 0e1320ff
+                  itemBorderColor: 66718aff
+                  itemTextColor: e5e9f2ff
+                match:
+                  itemBackgroundColor: 222c4fff
+                  itemTextColor: 93a5ffff
+              lightMode:
+                defaults:
+                  itemBackgroundColor: ffffffff
+                hover:
+                  itemBackgroundColor: f2f4f7ff
+                  itemBorderColor: 7f899cff
+                  itemTextColor: 172033ff
+                match:
+                  itemBackgroundColor: e8ecfbff
+                  itemTextColor: 2d46c8ff
+            focusState:
+              darkMode:
+                borderColor: 93a5ffff
+              lightMode:
+                borderColor: 2d46c8ff
+            idpButtons:
+              icons:
+                enabled: true
+            input:
+              borderRadius: 8.0
+              darkMode:
+                defaults:
+                  backgroundColor: 161c2aff
+                  borderColor: 66718aff
+                placeholderColor: 9aa3b7ff
+              lightMode:
+                defaults:
+                  backgroundColor: ffffffff
+                  borderColor: 7f899cff
+                placeholderColor: 566176ff
+            inputDescription:
+              darkMode:
+                textColor: 9aa3b7ff
+              lightMode:
+                textColor: 566176ff
+            inputLabel:
+              darkMode:
+                textColor: e5e9f2ff
+              lightMode:
+                textColor: 172033ff
+            link:
+              darkMode:
+                defaults:
+                  textColor: 93a5ffff
+                hover:
+                  textColor: b0bdffff
+              lightMode:
+                defaults:
+                  textColor: 2d46c8ff
+                hover:
+                  textColor: 2338a8ff
+            optionControls:
+              darkMode:
+                defaults:
+                  backgroundColor: 161c2aff
+                  borderColor: 66718aff
+                selected:
+                  backgroundColor: 93a5ffff
+                  foregroundColor: 0e1320ff
+              lightMode:
+                defaults:
+                  backgroundColor: ffffffff
+                  borderColor: 7f899cff
+                selected:
+                  backgroundColor: 2d46c8ff
+                  foregroundColor: ffffffff
+            statusIndicator:
+              darkMode:
+                error:
+                  backgroundColor: 3a1b19ff
+                  borderColor: ff8c82ff
+                  indicatorColor: ff8c82ff
+                pending:
+                  indicatorColor: AAAAAAAA
+                success:
+                  backgroundColor: 15301fff
+                  borderColor: 62cf97ff
+                  indicatorColor: 62cf97ff
+                warning:
+                  backgroundColor: 33270fff
+                  borderColor: f0b65aff
+                  indicatorColor: f0b65aff
+              lightMode:
+                error:
+                  backgroundColor: fce8e6ff
+                  borderColor: b42318ff
+                  indicatorColor: b42318ff
+                pending:
+                  indicatorColor: AAAAAAAA
+                success:
+                  backgroundColor: e2f2e9ff
+                  borderColor: 1b6e44ff
+                  indicatorColor: 1b6e44ff
+                warning:
+                  backgroundColor: fcefd6ff
+                  borderColor: 8a5300ff
+                  indicatorColor: 8a5300ff
+          components:
+            alert:
+              borderRadius: 12.0
+              darkMode:
+                error:
+                  backgroundColor: 3a1b19ff
+                  borderColor: ff8c82ff
+              lightMode:
+                error:
+                  backgroundColor: fce8e6ff
+                  borderColor: b42318ff
+            favicon:
+              enabledTypes:
+              - ICO
+              - SVG
+            form:
+              backgroundImage:
+                enabled: false
+              borderRadius: 12.0
+              darkMode:
+                backgroundColor: 161c2aff
+                borderColor: 283043ff
+              lightMode:
+                backgroundColor: ffffffff
+                borderColor: d9dee7ff
+              logo:
+                enabled: true
+                formInclusion: IN
+                location: CENTER
+                position: TOP
+            idpButton:
+              custom: {}
+              standard:
+                darkMode:
+                  active:
+                    backgroundColor: 222c4fff
+                    borderColor: 7b8ff0ff
+                    textColor: 7b8ff0ff
+                  defaults:
+                    backgroundColor: 161c2aff
+                    borderColor: 66718aff
+                    textColor: e5e9f2ff
+                  hover:
+                    backgroundColor: 0e1320ff
+                    borderColor: 93a5ffff
+                    textColor: 93a5ffff
+                lightMode:
+                  active:
+                    backgroundColor: e8ecfbff
+                    borderColor: 1c2d8aff
+                    textColor: 1c2d8aff
+                  defaults:
+                    backgroundColor: ffffffff
+                    borderColor: 7f899cff
+                    textColor: 172033ff
+                  hover:
+                    backgroundColor: f2f4f7ff
+                    borderColor: 2d46c8ff
+                    textColor: 2d46c8ff
+            pageBackground:
+              darkMode:
+                color: 0e1320ff
+              image:
+                enabled: false
+              lightMode:
+                color: f2f4f7ff
+            pageFooter:
+              backgroundImage:
+                enabled: false
+              darkMode:
+                background:
+                  color: 161c2aff
+                borderColor: 283043ff
+              lightMode:
+                background:
+                  color: ffffffff
+                borderColor: d9dee7ff
+              logo:
+                enabled: false
+                location: START
+            pageHeader:
+              backgroundImage:
+                enabled: false
+              darkMode:
+                background:
+                  color: 161c2aff
+                borderColor: 283043ff
+              lightMode:
+                background:
+                  color: ffffffff
+                borderColor: d9dee7ff
+              logo:
+                enabled: false
+                location: START
+            pageText:
+              darkMode:
+                bodyColor: e5e9f2ff
+                descriptionColor: 9aa3b7ff
+                headingColor: e5e9f2ff
+              lightMode:
+                bodyColor: 172033ff
+                descriptionColor: 566176ff
+                headingColor: 172033ff
+            phoneNumberSelector:
+              displayType: TEXT
+            primaryButton:
+              darkMode:
+                active:
+                  backgroundColor: 7b8ff0ff
+                  textColor: 0e1320ff
+                defaults:
+                  backgroundColor: 93a5ffff
+                  textColor: 0e1320ff
+                disabled:
+                  backgroundColor: 161c2aff
+                  borderColor: 283043ff
+                hover:
+                  backgroundColor: b0bdffff
+                  textColor: 0e1320ff
+              lightMode:
+                active:
+                  backgroundColor: 1c2d8aff
+                  textColor: ffffffff
+                defaults:
+                  backgroundColor: 2d46c8ff
+                  textColor: ffffffff
+                disabled:
+                  backgroundColor: ffffffff
+                  borderColor: d9dee7ff
+                hover:
+                  backgroundColor: 2338a8ff
+                  textColor: ffffffff
+            secondaryButton:
+              darkMode:
+                active:
+                  backgroundColor: 222c4fff
+                  borderColor: 7b8ff0ff
+                  textColor: 7b8ff0ff
+                defaults:
+                  backgroundColor: 161c2aff
+                  borderColor: 93a5ffff
+                  textColor: 93a5ffff
+                hover:
+                  backgroundColor: 222c4fff
+                  borderColor: b0bdffff
+                  textColor: b0bdffff
+              lightMode:
+                active:
+                  backgroundColor: e8ecfbff
+                  borderColor: 1c2d8aff
+                  textColor: 1c2d8aff
+                defaults:
+                  backgroundColor: ffffffff
+                  borderColor: 2d46c8ff
+                  textColor: 2d46c8ff
+                hover:
+                  backgroundColor: e8ecfbff
+                  borderColor: 2338a8ff
+                  textColor: 2338a8ff
+        - !Ref AWS::NoValue
 
   # ---------------------------------------------------------------------------
   # Events: custom bus, archive, queues and topics

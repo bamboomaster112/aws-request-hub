@@ -67,11 +67,14 @@ USAGE_JS = r"""
     .replace(/\s+/g, ' ').replace(/\d+/g, 'N').trim().slice(0, 48);
   window.__uiDescribe = (e) => {
     let view = viewOf();
-    if (e.closest('header.topbar')) view = 'header';
-    else if (e.closest('nav.subnav')) view = 'admin menu';
+    if (e.closest('header.topbar') || e.matches('.skip-link')) view = 'header';
+    else if (e.closest('nav.rail')) view = 'admin menu';
     else if (e.closest('dialog')) view = 'confirm dialog';
+    else if (e.closest('#toast')) view = 'toast';
     let control;
-    if (e.matches('a.card.tile')) control = 'request card';
+    if (e.matches('a.card.ticket')) control = 'request card';
+    else if (e.matches('.menu-trigger')) control = 'account menu';
+    else if (e.matches('tr a.title')) control = 'table row';
     else if (e.matches('a.org-card')) control = 'person card';
     else if (e.matches('tr.clickable')) control = 'table row';
     else if (e.closest('ul.files') && e.tagName === 'A') control = 'attachment download';
@@ -234,9 +237,9 @@ class LiveTarget:
 class Session:
     """One person in their own browser context, signed in through session storage."""
 
-    def __init__(self, browser, target, who, viewport=None, wait_for_home=True):
+    def __init__(self, browser, target, who, viewport=None, wait_for_home=True, color_scheme="light", bypass_csp=False):
         self.who, self.target = who, target
-        self.context = browser.new_context(viewport=viewport or {"width": 1280, "height": 900})
+        self.context = browser.new_context(viewport=viewport or {"width": 1280, "height": 900}, color_scheme=color_scheme, bypass_csp=bypass_csp)
         self.context.expose_binding("__uiUsed", lambda _source, d: USED.add((d["view"], d["control"])))
         self.context.add_init_script(USAGE_JS)
         target.route_uploads(self.context)
@@ -248,7 +251,7 @@ class Session:
         if who:
             self.page.evaluate("t => sessionStorage.setItem('id_token', t)", target.token(who))
             self.page.reload()
-            expect(self.page.get_by_role("button", name="Sign out")).to_be_visible(timeout=15000)
+            expect(self.page.get_by_role("button", name="Account menu")).to_be_visible(timeout=15000)
             if wait_for_home:  # let the first view finish loading before a test navigates elsewhere
                 expect(self.page.get_by_role("heading", name="My requests")).to_be_visible(timeout=15000)
 
@@ -260,30 +263,54 @@ class Session:
 
 
 def badge(page):
-    return page.locator(".section-head .badge").first
+    return page.locator(".section-head .badge[data-status]").first
 
 
 def wait_for_status(page, statuses, tries=10, pause=2.5):
-    """Re-reads the request (the Refresh button) until its status is one of statuses."""
-    wanted = {s.replace("_", " ") for s in statuses}
+    """Re-reads the request (the Refresh button) until its status is one of statuses.
+    Returns the status code with spaces for underscores ("PENDING APPROVAL")."""
+    wanted = set(statuses)
     for _ in range(tries):
         try:
-            text = badge(page).inner_text(timeout=5000).strip().upper()
+            code = badge(page).get_attribute("data-status", timeout=5000) or ""
         except PlaywrightError:
-            text = ""
-        if text in wanted:
-            return text
+            code = ""
+        if code in wanted:
+            return code.replace("_", " ")
         time.sleep(pause)
         page.locator(".section-head").get_by_role("button", name="Refresh").click()
         page.wait_for_load_state("networkidle")
-    return badge(page).inner_text().strip().upper()
+    return (badge(page).get_attribute("data-status") or "").replace("_", " ")
+
+
+def choose(trigger, value):
+    """Picks an option in the app's select (a combobox button that opens a listbox) by its value."""
+    trigger.click()
+    listbox = trigger.page.locator(f"#{trigger.get_attribute('aria-controls')}")
+    listbox.locator(f'[role=option][data-value="{value}"]').click()
+    expect(trigger).to_have_attribute("data-value", str(value))
+
+
+def option_values(trigger):
+    """The values a select offers (it opens the list, reads it and closes it again)."""
+    trigger.click()
+    listbox = trigger.page.locator(f"#{trigger.get_attribute('aria-controls')}")
+    expect(listbox).to_be_visible()
+    values = listbox.locator("[role=option]").evaluate_all("els => els.map(e => e.dataset.value)")
+    trigger.page.keyboard.press("Escape")
+    return values
+
+
+def slip(page):
+    """The approval levels on a request's routing slip."""
+    return page.locator("#slip li.slip-step")
 
 
 def fill_purchase(page, title, amount, item="Laptop stand"):
     page.locator("label.choice", has_text="Purchasing").click()
     page.get_by_label("Title").fill(title)
     page.get_by_label("What are you buying?").fill(item)
-    page.get_by_label("Category").select_option("Hardware")
+    choose(page.get_by_label("Category"), "Hardware")
     page.get_by_label("Total cost").fill(str(amount))
     page.get_by_label("Business justification").fill("Needed for the UI test run.")
 
@@ -301,8 +328,8 @@ def submit_purchase(session, title, amount):
 def open_from_inbox(session, title):
     page = session.page
     session.go("#/inbox")
-    expect(page.get_by_role("heading", name="Approvals waiting for you")).to_be_visible()
-    card = page.locator("a.card.tile", has_text=title)
+    expect(page.get_by_role("heading", name="Approvals", exact=True)).to_be_visible()
+    card = page.locator("a.card.ticket", has_text=title)
     expect(card).to_be_visible(timeout=10000)
     card.click()
     expect(page.get_by_role("heading", name=title)).to_be_visible()
@@ -361,7 +388,13 @@ def quick_navigation_lands_on_the_last_click(browser, t):
     s.go("#/inbox")
     page.wait_for_timeout(4000)
     verify("Clicking Approvals while My requests is still loading ends on Approvals", page, lambda: (
-        expect(page.get_by_role("heading", name="Approvals waiting for you")).to_be_visible(),
+        expect(page.get_by_role("heading", name="Approvals", exact=True)).to_be_visible(),
+        expect(page.get_by_role("heading", name="My requests")).to_have_count(0)))
+    page.reload()
+    s.go("#/requests/00000000-0000-4000-8000-000000000000")
+    page.wait_for_timeout(4000)
+    verify("A page that fails quickly is not painted over by a slow page from before", page, lambda: (
+        expect(page.get_by_role("heading", name="Not found")).to_be_visible(),
         expect(page.get_by_role("heading", name="My requests")).to_have_count(0)))
     page.unroute(re.compile(r".*/requests(\?.*)?$"))
     s.close()
@@ -385,9 +418,9 @@ def dynamic_form_and_validation(browser, t):
         expect(page.get_by_label("Total cost")).to_have_count(0)))
     page.locator("label.choice", has_text="Purchasing").click()
     page.get_by_label("Total cost").fill("500")
-    verify("Route preview: 500 skips Finance", page, lambda: expect(page.locator("ol.route li", has_text="Finance")).to_have_class(re.compile("skipped")))
+    verify("Route preview: 500 skips Finance", page, lambda: expect(page.locator(".route-preview li.slip-step", has_text="Finance")).to_have_class(re.compile("skipped")))
     page.get_by_label("Total cost").fill("1500")
-    verify("Route preview: 1,500 adds Finance", page, lambda: expect(page.locator("ol.route li", has_text="Finance")).to_have_class(re.compile("applies")))
+    verify("Route preview: 1,500 adds Finance", page, lambda: expect(page.locator(".route-preview li.slip-step", has_text="Finance")).to_have_class(re.compile("applies")))
     unlabeled = page.evaluate("""() => [...document.querySelectorAll('form.card input, form.card select, form.card textarea')]
         .filter(el => el.type !== 'hidden' && !(el.labels && el.labels.length) && !el.getAttribute('aria-label')).map(el => el.name || el.outerHTML.slice(0, 60))""")
     check("Every control on the request form has a label (screen readers, get_by_label)", not unlabeled, unlabeled)
@@ -406,7 +439,7 @@ def dynamic_form_and_validation(browser, t):
     check("The first problem field gets focus below the sticky top bar, not under it", not covered)
     page.get_by_label("Title").fill("Monitor arm")
     page.get_by_label("What are you buying?").fill("Monitor arm")
-    page.get_by_label("Category").select_option("Hardware")
+    choose(page.get_by_label("Category"), "Hardware")
     page.get_by_label("Total cost").fill("2000000")
     page.get_by_label("Business justification").fill("Neck strain.")
     page.get_by_role("button", name="Submit request").click()
@@ -426,40 +459,42 @@ def two_level_chain(browser, t):
     status = wait_for_status(page, ["PENDING_APPROVAL"])
     check("Requester: the new request is pending at level 1", status == "PENDING APPROVAL", status)
     verify("Requester: the chain shows the line manager now and Finance next", page, lambda: (
-        expect(page.locator("ol.chain li.step").nth(0)).to_have_class(re.compile("active")),
-        expect(page.locator("ol.chain li.step").nth(0)).to_contain_text("Line manager"),
-        expect(page.locator("ol.chain li.step").nth(1)).to_contain_text("Finance")))
+        expect(slip(page).nth(0)).to_have_class(re.compile("active")),
+        expect(slip(page).nth(0)).to_contain_text("Line manager"),
+        expect(slip(page).nth(1)).to_contain_text("Finance")))
     verify("Requester: no decision buttons on their own request", page, lambda: expect(page.get_by_role("button", name="Approve")).to_have_count(0))
 
     mgr = Session(browser, t, "manager")
     open_from_inbox(mgr, title)
     mp = mgr.page
-    verify("Manager: decision panel says level 1 of 2", mp, lambda: expect(mp.get_by_role("heading", name="Your decision (level 1 of 2)")).to_be_visible())
+    verify("Manager: decision panel says level 1 of 2", mp, lambda: (
+        expect(mp.get_by_role("heading", name="Your decision")).to_be_visible(),
+        expect(mp.locator(".decision")).to_contain_text("Level 1 of 2")))
     mp.get_by_label("Decision note").fill("Agreed, the old ones are failing.")
     mp.get_by_role("button", name="Approve").click()
-    verify("Manager: approval recorded", mp, lambda: expect(mp.locator("#toast")).to_contain_text("Recorded: approved"))
+    verify("Manager: approval recorded", mp, lambda: expect(mp.locator("#toast")).to_contain_text("Approved. The workflow"))
     mgr.go("#/inbox")
     verify("Manager: it leaves their inbox (they cannot approve level 2 as well)", mp, lambda: (
-        expect(mp.get_by_role("heading", name="Approvals waiting for you")).to_be_visible(),
-        expect(mp.locator("a.card.tile", has_text=title)).to_have_count(0, timeout=10000)))
+        expect(mp.get_by_role("heading", name="Approvals", exact=True)).to_be_visible(),
+        expect(mp.locator("a.card.ticket", has_text=title)).to_have_count(0, timeout=10000)))
 
     fin = Session(browser, t, "finance")
     open_from_inbox(fin, title)
     fp = fin.page
     verify("Finance: level 2 of 2, the last level", fp, lambda: (
-        expect(fp.get_by_role("heading", name="Your decision (level 2 of 2)")).to_be_visible(),
+        expect(fp.locator(".decision")).to_contain_text("Level 2 of 2"),
         expect(fp.get_by_text("This is the last level")).to_be_visible()))
     fp.get_by_role("button", name="Approve").click()
-    verify("Finance: approval recorded", fp, lambda: expect(fp.locator("#toast")).to_contain_text("Recorded: approved"))
+    verify("Finance: approval recorded", fp, lambda: expect(fp.locator("#toast")).to_contain_text("Approved. The workflow"))
 
     req.go(f"#/requests/{rid}")
     status = wait_for_status(page, ["FULFILLED"], tries=12)
     check("Requester: approved at both levels and fulfilled", status == "FULFILLED", status)
     verify("Requester: both decisions and the PO reference are shown", page, lambda: (
-        expect(page.locator("ol.chain li.step.done")).to_have_count(2),
+        expect(page.locator("#slip li.slip-step.done")).to_have_count(2),
         expect(page.locator(".field", has_text="Fulfilment reference")).to_contain_text("PO-")))
     req.go("#/mine")
-    verify("Requester: My requests lists it as FULFILLED", page, lambda: expect(page.locator("tr", has_text=title)).to_contain_text("FULFILLED"))
+    verify("Requester: My requests lists it as Fulfilled", page, lambda: expect(page.locator("tr", has_text=title).locator("[data-status]")).to_have_attribute("data-status", "FULFILLED"))
     for s in (req, mgr, fin):
         check(f"{s.who.title()}: no JavaScript errors in the approval flow", not s.errors, s.errors[:3])
         s.close()
@@ -474,13 +509,17 @@ def rejection_needs_a_note(browser, t):
     mgr = Session(browser, t, "manager")
     open_from_inbox(mgr, title)
     mp = mgr.page
+    posts = []
+    mp.on("request", lambda r: posts.append(r.url) if r.method == "POST" and r.url.endswith("/decision") else None)
     mp.get_by_role("button", name="Reject").click()
-    verify("Rejecting without a note is refused with a message", mp, lambda: (
-        expect(mp.locator("#toast")).to_have_class(re.compile("danger")),
+    verify("Rejecting without a note asks for one next to the note box, and sends nothing", mp, lambda: (
+        expect(mp.locator(".dyn-field.has-error", has_text="Decision note")).to_contain_text("Add a note"),
+        expect(mp.get_by_label("Decision note")).to_be_focused(),
         expect(mp.get_by_role("button", name="Reject")).to_be_enabled()))
+    check("No decision was sent without a note", not posts, posts)
     mp.get_by_label("Decision note").fill("No budget this quarter.")
     mp.get_by_role("button", name="Reject").click()
-    verify("Rejection with a note is recorded", mp, lambda: expect(mp.locator("#toast")).to_contain_text("Recorded: rejected"))
+    verify("Rejection with a note is recorded", mp, lambda: expect(mp.locator("#toast")).to_contain_text("Rejected. The workflow"))
     req.go(f"#/requests/{rid}")
     status = wait_for_status(req.page, ["REJECTED"])
     check("Requester sees REJECTED", status == "REJECTED", status)
@@ -495,8 +534,8 @@ def auto_approval_granted_in_admin(browser, t):
     ap = adm.page
     adm.go("#/admin/auto-approval")
     expect(ap.get_by_role("heading", name="Auto-approval", exact=True)).to_be_visible()
-    ap.get_by_label("Person").select_option(t.ids["requester"])
-    ap.get_by_label("Module").select_option("PURCHASE")
+    choose(ap.get_by_label("Person"), t.ids["requester"])
+    choose(ap.get_by_label("Module"), "PURCHASE")
     ap.get_by_label("Up to (approval value)").fill("500")
     ap.get_by_label("Until").fill((datetime.date.today() + datetime.timedelta(days=60)).isoformat())
     ap.get_by_label("Note").fill("UI test grant")
@@ -512,11 +551,11 @@ def auto_approval_granted_in_admin(browser, t):
     page.get_by_label("Total cost").fill("300")
     verify("Requester: the form says 300 will be approved automatically", page, lambda: expect(page.locator(".note.ok")).to_contain_text("approved automatically"))
     page.get_by_label("Total cost").fill("600")
-    verify("Requester: 600 is over the limit and follows the route", page, lambda: expect(page.locator(".route-box .note")).to_contain_text("This value is higher"))
+    verify("Requester: 600 is over the limit and follows the route", page, lambda: expect(page.locator(".route-preview .note")).to_contain_text("This value is higher"))
     rid = submit_purchase(req, f"UI test auto {stamp()}", 300)
     status = wait_for_status(page, ["AUTO_APPROVED", "FULFILLED"], tries=12)
     check("Requester: within the limit it is auto-approved", status in ("AUTO APPROVED", "FULFILLED"), status)
-    verify("Requester: the chain explains the auto-approval", page, lambda: expect(page.get_by_text("Approved automatically under an auto-approval rule")).to_be_visible())
+    verify("Requester: the routing slip explains the auto-approval", page, lambda: expect(slip(page).first).to_contain_text("Approved automatically"))
     verify("Requester: the reason names the module as people know it", page, lambda: expect(page.locator(".reasons")).to_contain_text("self-approve Purchasing requests"))
 
     adm.go("#/admin/auto-approval")
@@ -543,13 +582,12 @@ def admin_screens(browser, t):
     adm.go(f"#/admin/users/{t.ids['requester']}")
     verify("User detail: access, reporting line, auto-approval and history", ap, lambda: (
         expect(ap.get_by_role("heading", name="Access and reporting line")).to_be_visible(),
-        expect(ap.get_by_role("heading", name="Auto-approval")).to_be_visible(),
+        expect(ap.get_by_role("heading", name="Auto-approval", exact=True)).to_be_visible(),
         expect(ap.get_by_role("heading", name="Access history")).to_be_visible(),
-        expect(ap.get_by_label("Manager (level 1 approver)")).to_have_value(t.ids["manager"])))
+        expect(ap.get_by_label("Manager (level 1 approver)")).to_have_attribute("data-value", t.ids["manager"])))
     adm.go(f"#/admin/users/{t.ids['admin']}")
     expect(ap.get_by_text("You cannot change your own role")).to_be_visible()  # the admin's own page has rendered
-    options = ap.get_by_label("Manager (level 1 approver)").locator("option")
-    values = options.evaluate_all("els => els.map(e => e.value)")
+    values = option_values(ap.get_by_label("Manager (level 1 approver)"))
     check("Manager picker never offers yourself or someone below you (no loops)",
           t.ids["admin"] not in values and t.ids["manager"] not in values and t.ids["requester"] not in values, values)
     adm.go("#/admin/org")
@@ -560,7 +598,7 @@ def admin_screens(browser, t):
     adm.go("#/admin/workflows/PURCHASE")
     verify("Workflows: Purchasing has its levels and a plain-English summary", ap, lambda: (
         expect(ap.locator(".level-row")).to_have_count(3),
-        expect(ap.locator("p.note").first).to_contain_text("Every Purchasing request needs")))
+        expect(ap.locator(".note", has_text="Every Purchasing request needs")).to_be_visible()))
     adm.go("#/admin/forms/PURCHASE")
     verify("Forms: the builder lists fields and previews them", ap, lambda: (
         expect(ap.locator(".builder-field")).not_to_have_count(0),
@@ -594,7 +632,7 @@ def attachments(browser, t):
     page.unroute(re.compile(r".*/requests/[0-9a-f-]{36}$"))
     page.get_by_role("button", name="Upload").click()
     verify("Upload goes straight to S3 and the file is listed with a download link", page, lambda: (
-        expect(page.locator("#toast")).to_contain_text("Uploaded"),
+        expect(page.locator("#toast")).to_contain_text("quote.txt uploaded"),
         expect(page.locator("ul.files a", has_text="quote.txt")).to_be_visible(timeout=15000)))
     link = page.locator("ul.files a", has_text="quote.txt")
     check("The download link is a short-lived presigned HTTPS URL", (link.get_attribute("href") or "").startswith("https://")
@@ -615,7 +653,7 @@ def close_request(browser, t, request_id):
     mgr.go(f"#/requests/{request_id}")
     mgr.page.get_by_label("Decision note").fill("Closing a UI test request.")
     mgr.page.get_by_role("button", name="Reject").click()
-    verify("Test request closed so nothing is left in an inbox", mgr.page, lambda: expect(mgr.page.locator("#toast")).to_contain_text("Recorded: rejected"))
+    verify("Test request closed so nothing is left in an inbox", mgr.page, lambda: expect(mgr.page.locator("#toast")).to_contain_text("Rejected. The workflow"))
     mgr.close()
 
 
@@ -623,9 +661,18 @@ def close_request(browser, t, request_id):
 def mobile_layout(browser, t):
     s = Session(browser, t, "requester", viewport={"width": 390, "height": 844})
     page = s.page
-    for hash_, heading in (("#/mine", "My requests"), ("#/new", "New request")):
+    rid = submit_purchase(s, f"UI test phone {stamp()}", 90)
+    wait_for_status(page, ["PENDING_APPROVAL"])
+    for hash_, heading in (("#/mine", "My requests"), ("#/new", "New request"), (f"#/requests/{rid}", None)):
         s.go(hash_)
-        expect(page.get_by_role("heading", name=heading)).to_be_visible()
+        if heading:
+            expect(page.get_by_role("heading", name=heading)).to_be_visible()
+        else:
+            expect(page.locator("#slip")).to_be_visible()
+            heading = "the request page"
+            first = page.evaluate("""() => { const slip = document.querySelector('#slip').getBoundingClientRect().top;
+                const answers = document.querySelector('.answers-card').getBoundingClientRect().top; return slip < answers; }""")
+            check("Phone width: the routing slip comes before the answers", first)
         if hash_ == "#/new":
             page.locator("label.choice", has_text="Purchasing").click()
         overflow = page.evaluate("() => document.documentElement.scrollWidth - window.innerWidth")
@@ -633,7 +680,10 @@ def mobile_layout(browser, t):
         clipped = page.evaluate("""() => [...document.querySelectorAll('#app .badge, #app button, #app a.btn')].filter((e) => {
             const r = e.getBoundingClientRect(); return e.offsetParent && (r.right > window.innerWidth + 1 || r.left < -1); }).map((e) => e.textContent.trim())""")
         check(f"Phone width: every status badge and button on {heading} is fully on screen", not clipped, clipped[:5])
+    rows = page.evaluate("() => Math.round(document.querySelector('header.topbar').getBoundingClientRect().height)")
+    check("Phone width: the header is two rows at most (logo and account, then the menu)", rows <= 110, f"{rows}px")
     s.close()
+    close_request(browser, t, rid)
 
 
 @scenario()
@@ -642,7 +692,11 @@ def sign_out(browser, t):
     page = s.page
     visited = []
     page.on("request", lambda r: visited.append(r.url) if r.is_navigation_request() else None)
-    page.get_by_role("button", name="Sign out").click()
+    page.get_by_role("button", name="Account menu").click()
+    verify("The account menu shows who is signed in and their role", page, lambda: (
+        expect(page.get_by_role("menu")).to_contain_text(t.names["requester"]),
+        expect(page.get_by_role("menu")).to_contain_text("Requester")))
+    page.get_by_role("menuitem", name="Sign out").click()
     verify("Sign out clears the session and returns to the landing page", page, lambda: (
         expect(page.get_by_role("button", name="Sign in")).to_be_visible(timeout=15000),
         expect(page.locator("#nav")).to_be_hidden()))
@@ -687,7 +741,7 @@ def sign_in_callback_guards(browser, t):
     page = s.page
     page.goto(t.base_url + "?code=forged-code&state=forged-state")
     verify("A sign-in response with the wrong state is refused", page, lambda: (
-        expect(page.locator("#toast")).to_contain_text("state mismatch"),
+        expect(page.locator("#toast")).to_contain_text("could not be verified"),
         expect(page.get_by_role("button", name="Sign in")).to_be_visible()))
     check("...and the code is removed from the address bar", "code=" not in page.url, page.url)
     page.evaluate("() => { sessionStorage.setItem('oauth_state', 'state-ok-1234567890'); sessionStorage.setItem('pkce_verifier', 'v'.repeat(43)); }")
@@ -708,15 +762,15 @@ def approver_raises_own_request(browser, t):
     page = mgr.page
     wait_for_status(page, ["PENDING_APPROVAL"])
     verify("Manager: their own request goes to their own manager", page, lambda: (
-        expect(page.locator("ol.chain li.step").nth(0)).to_contain_text("Line manager"),
-        expect(page.locator("ol.chain li.step").nth(0)).to_contain_text(t.names["admin"])))
+        expect(slip(page).nth(0)).to_contain_text("Line manager"),
+        expect(slip(page).nth(0)).to_contain_text(t.names["admin"])))
     verify("Manager: no decision buttons on their own request", page, lambda: expect(page.get_by_role("button", name="Approve")).to_have_count(0))
     adm = Session(browser, t, "admin")
     open_from_inbox(adm, title)
     verify("Admin (their manager): decision panel at level 1 of 1", adm.page, lambda: expect(
-        adm.page.get_by_role("heading", name="Your decision (level 1 of 1)")).to_be_visible())
+        adm.page.locator(".decision")).to_contain_text("Level 1 of 1"))
     adm.page.get_by_role("button", name="Approve").click()
-    verify("Admin: approval recorded", adm.page, lambda: expect(adm.page.locator("#toast")).to_contain_text("Recorded: approved"))
+    verify("Admin: approval recorded", adm.page, lambda: expect(adm.page.locator("#toast")).to_contain_text("Approved. The workflow"))
     mgr.go(f"#/requests/{rid}")
     status = wait_for_status(page, ["FULFILLED"], tries=12)
     check("Manager: their request is approved by their manager and fulfilled", status == "FULFILLED", status)
@@ -735,13 +789,13 @@ def admin_sees_everything_but_cannot_jump_the_chain(browser, t):
     adm.go(f"#/requests/{rid}")
     verify("Admin: can open anyone's request", adm.page, lambda: expect(adm.page.get_by_role("heading", name=title)).to_be_visible())
     verify("Admin: no decision buttons while it waits for the line manager", adm.page, lambda: (
-        expect(adm.page.locator("ol.chain li.step.active")).to_contain_text("Line manager"),
+        expect(adm.page.locator("#slip li.slip-step.active")).to_contain_text("Line manager"),
         expect(adm.page.get_by_role("button", name="Approve")).to_have_count(0)))
     mgr = Session(browser, t, "manager")
     open_from_inbox(mgr, title)
     mgr.page.get_by_label("Decision note").fill("Closing the UI test request.")
     mgr.page.get_by_role("button", name="Reject").click()
-    verify("Manager: closes it (rejected with a note)", mgr.page, lambda: expect(mgr.page.locator("#toast")).to_contain_text("Recorded: rejected"))
+    verify("Manager: closes it (rejected with a note)", mgr.page, lambda: expect(mgr.page.locator("#toast")).to_contain_text("Rejected. The workflow"))
     for s in (req, adm, mgr):
         s.close()
 
@@ -756,7 +810,10 @@ def requester_cannot_open_other_peoples_requests(browser, t):
     req.go(f"#/requests/{other}")
     verify("Requester: someone else's request is not found (its existence is not revealed)", req.page, lambda: (
         expect(req.page.locator("#toast")).to_contain_text("Request not found"),
+        expect(req.page.get_by_role("heading", name="Not found")).to_be_visible(),
         expect(req.page.get_by_role("heading", name=re.compile("UI test approver's own"))).to_have_count(0)))
+    req.page.get_by_role("button", name="Try again").click()
+    verify("Requester: Try again asks once more and gets the same answer", req.page, lambda: expect(req.page.get_by_role("heading", name="Not found")).to_be_visible())
     req.go("#/inbox")
     verify("Requester: the approvals inbox is not available", req.page, lambda: expect(req.page).to_have_url(re.compile(r"#/mine$")))
     req.close()
@@ -768,7 +825,7 @@ MODULE_CASES = {  # module: (label on the picker, answers by field label, approv
     "PURCHASE": ("Purchasing", {"What are you buying?": "Docking stations", "Vendor": "Dell", "Category": "Hardware",
                                 "Total cost": "1500", "Needed by": "2026-12-15", "Business justification": "Hot desks need them."},
                  ["Line manager", "Finance"]),
-    "ACCESS": ("Access management", {"System": "GitHub", "Access level": "Read only", "For how many days?": "30",
+    "ACCESS": ("Access management", {"System": "GitHub", "Access level": "Read only", "Duration (days)": "30",
                                      "Why do you need it?": "Reviewing the platform repos."}, ["Line manager", "IT security"]),
     "LEAVE": ("Leave", {"Leave type": "Annual", "First day": "2026-12-21", "Last day": "2027-01-08", "Working days": "15",
                         "Handover notes": "Mia covers on-call."}, ["Line manager", "HR"]),
@@ -782,11 +839,11 @@ MODULE_CASES = {  # module: (label on the picker, answers by field label, approv
 def fill_answers(page, answers):
     for label, value in answers.items():
         control = page.get_by_label(re.compile(rf"^{re.escape(label)}( \*)?$"))
-        tag = control.evaluate("e => e.tagName + ':' + (e.type || '')")
+        kind = control.evaluate("e => e.getAttribute('role') || e.tagName")
         if value is True:
             control.check()
-        elif tag.startswith("SELECT"):
-            control.select_option(value)
+        elif kind == "combobox":
+            choose(control, value)
         else:
             control.fill(value)
 
@@ -804,18 +861,18 @@ def every_module_end_to_end(browser, t):
         title = f"UI test {label.lower()} {stamp()}"
         page.get_by_label("Title").fill(title)
         if module == "PURCHASE":
-            page.get_by_label("Currency").select_option("EUR")
+            choose(page.get_by_label("Currency"), "EUR")
         fill_answers(page, answers)
         page.get_by_role("button", name="Submit request").click()
         expect(page).to_have_url(re.compile(r"#/requests/[0-9a-f-]{36}$"), timeout=15000)
         rid = page.url.rsplit("/", 1)[-1]
         opened.append(rid)
         wait_for_status(page, ["PENDING_APPROVAL"])
-        steps = page.locator("ol.chain li.step")
+        steps = slip(page)
         verify(f"{label}: the chain has the expected levels ({' -> '.join(levels)})", page, lambda: (
             expect(steps).to_have_count(len(levels)),
             *[expect(steps.nth(i)).to_contain_text(name) for i, name in enumerate(levels)]))
-        facts = page.locator(".facts").first
+        facts = page.locator(".answers")
         shown = []
         for field_label, value in answers.items():
             if value is True:
@@ -824,13 +881,13 @@ def every_module_end_to_end(browser, t):
                 shown.append(value[:4])  # dates are shown in the reader's locale; the year is always there
             elif field_label == "Total cost":
                 shown.append("€1,500.00")
-            elif field_label in ("Working days", "For how many days?", "Risk score (1 to 10)", "Value (if any)"):
+            elif field_label in ("Working days", "Duration (days)", "Risk score (1 to 10)", "Value (if any)"):
                 shown.append(value)
             else:
                 shown.append(value)
         verify(f"{label}: every answer is shown on the request, formatted for its type", page, lambda: [
             expect(facts).to_contain_text(text) for text in shown])
-        verify(f"{label}: the form version is recorded", page, lambda: expect(page.get_by_text(re.compile(r"Form version \d+"))).to_be_visible())
+        verify(f"{label}: the form version is recorded", page, lambda: expect(page.locator(".field", has_text="Form version")).to_contain_text(re.compile(r"\d+")))
     req.close()
     for rid in opened:
         close_request(browser, t, rid)
@@ -841,13 +898,13 @@ def header_and_page_buttons(browser, t):
     s = Session(browser, t, "admin")
     page = s.page
     header = page.locator("header.topbar")
-    for link, heading in (("New request", "New request"), ("Approvals", "Approvals waiting for you"), ("Admin", "Users"), ("My requests", "My requests")):
+    for link, heading in (("New request", "New request"), ("Approvals", "Approvals"), ("Admin", "Users"), ("My requests", "My requests")):
         header.get_by_role("link", name=link, exact=True).click()
         verify(f"Header: {link} opens {heading}", page, lambda: expect(page.get_by_role("heading", name=heading, exact=True)).to_be_visible())
     s.go("#/inbox")
-    expect(page.get_by_role("heading", name="Approvals waiting for you")).to_be_visible()
+    expect(page.get_by_role("heading", name="Approvals", exact=True)).to_be_visible()
     page.locator(".section-head").get_by_role("button", name="Refresh").click()
-    verify("Approvals: Refresh reloads the inbox", page, lambda: expect(page.get_by_role("heading", name="Approvals waiting for you")).to_be_visible())
+    verify("Approvals: Refresh reloads the inbox", page, lambda: expect(page.get_by_role("heading", name="Approvals", exact=True)).to_be_visible())
     header.get_by_role("link", name="Request Hub", exact=True).click()
     verify("Header: the logo goes home to My requests", page, lambda: expect(page.get_by_role("heading", name="My requests")).to_be_visible())
     s.close()
@@ -864,8 +921,8 @@ def header_and_page_buttons(browser, t):
     title = page.locator("tbody tr .title").first.inner_text()
     page.locator("tbody tr").first.click()
     verify("My requests: clicking a row opens the request", page, lambda: expect(page.get_by_role("heading", name=title)).to_be_visible())
-    page.get_by_role("link", name="Back to my requests").click()
-    verify("Request: Back to my requests returns to the list", page, lambda: expect(page.get_by_role("heading", name="My requests")).to_be_visible())
+    page.locator(".back-link", has_text="My requests").click()
+    verify("Request: the back link returns to My requests", page, lambda: expect(page.get_by_role("heading", name="My requests")).to_be_visible())
     req.close()
 
 
@@ -875,7 +932,7 @@ def admin_lists_menus_and_filters(browser, t):
     page = s.page
     s.go("#/admin/users")
     expect(page.get_by_role("heading", name="Users", exact=True)).to_be_visible()
-    menu = page.locator("nav.subnav")
+    menu = page.locator("nav.rail")
     for link, heading in (("Org chart", "Org chart"), ("Approver groups", "Approver groups"), ("Workflows", "Approval workflows"),
                           ("Forms", "Request forms"), ("Auto-approval", "Auto-approval"), ("Users", "Users")):
         menu.get_by_role("link", name=link, exact=True).click()
@@ -885,13 +942,14 @@ def admin_lists_menus_and_filters(browser, t):
     verify("Users: search narrows the list as you type", page, lambda: (
         expect(page.locator("tbody tr.clickable")).to_have_count(1), expect(page.get_by_text(f"1 of {total} users")).to_be_visible()))
     page.get_by_label("Search users").fill("")
-    page.get_by_label("Filter by role").select_option("approvers")
+    choose(page.get_by_label("Filter by role"), "approvers")
     verify("Users: the role filter shows only that role", page, lambda: expect(page.locator("tbody tr.clickable", has_text="Requester")).to_have_count(0))
-    page.get_by_label("Filter by role").select_option("")
-    page.get_by_label("Filter by status").select_option("NO_MANAGER")
-    verify("Users: the status filter finds people without a manager", page, lambda: expect(
-        page.locator("tbody tr.clickable", has_text=t.names["requester"])).to_have_count(0))
-    page.get_by_label("Filter by status").select_option("")
+    choose(page.get_by_label("Filter by role"), "")
+    choose(page.get_by_label("Filter by status"), "NO_MANAGER")
+    verify("Users: the No manager filter leaves out people with one, and admins (who never have one)", page, lambda: (
+        expect(page.locator("tbody tr.clickable", has_text=t.names["requester"])).to_have_count(0),
+        expect(page.locator("tbody tr.clickable", has_text="Admin")).to_have_count(0)))
+    choose(page.get_by_label("Filter by status"), "")
     page.locator(".section-head").get_by_role("button", name="Refresh").click()
     verify("Users: Refresh reloads the directory", page, lambda: expect(page.locator("tbody tr.clickable")).to_have_count(total))
     page.locator("tbody tr.clickable").filter(has=page.locator(".title", has_text=t.names["requester"])).click()
@@ -907,6 +965,10 @@ def admin_lists_menus_and_filters(browser, t):
     page.get_by_role("link", name="Cancel").click()
     verify("Invite: Cancel returns to Users without creating anyone", page, lambda: expect(page.locator("tbody tr.clickable")).to_have_count(total))
     s.go("#/admin/org")
+    expect(page.get_by_role("heading", name="Org chart")).to_be_visible()
+    page.locator(".section-head").get_by_role("button", name="Refresh").click()
+    page.wait_for_load_state("networkidle")
+    verify("Org chart: Refresh redraws the chart", page, lambda: expect(page.locator("a.org-card").first).to_be_visible())
     page.locator("a.org-card", has_text=t.names["finance"]).first.click()
     verify("Org chart: clicking a person opens their page", page, lambda: expect(page.get_by_role("heading", name="Access and reporting line")).to_be_visible())
     for module in ("Access management", "Leave", "Change management", "General requests", "Purchasing"):
@@ -940,14 +1002,14 @@ def invite_user(browser, t):
     adm = Session(browser, t, "admin")
     ap = adm.page
     adm.go("#/admin/users/new")
-    ap.get_by_label("Email", exact=True).fill("new.joiner@example.com")
+    ap.get_by_label(re.compile(r"^Email( \*)?$")).fill("new.joiner@example.com")
     ap.get_by_label("Full name").fill("New Joiner")
-    ap.get_by_label("Manager (level 1 approver)").select_option(t.ids["manager"])
+    choose(ap.get_by_label("Manager (level 1 approver)"), t.ids["manager"])
     ap.get_by_label("Department").fill("Engineering")
     ap.get_by_role("button", name="Invite user").click()
     verify("Invite: lands on the new person's page with the manager set", ap, lambda: (
         expect(ap).to_have_url(re.compile(r"#/admin/users/[0-9a-f-]{36}$"), timeout=10000),
-        expect(ap.get_by_label("Manager (level 1 approver)")).to_have_value(t.ids["manager"])))
+        expect(ap.get_by_label("Manager (level 1 approver)")).to_have_attribute("data-value", t.ids["manager"])))
     adm.go("#/admin/users")
     verify("Invite: listed as Invite pending", ap, lambda: expect(ap.locator("tr", has_text="new.joiner@example.com")).to_contain_text("Invite pending"))
     adm.close()
@@ -982,17 +1044,17 @@ def workflow_editor(browser, t):
     adm.go("#/admin/workflows/GENERAL")
     expect(ap.locator(".level-row")).to_have_count(2)
     ap.get_by_role("button", name="Add level").click()
-    ap.get_by_label("Level 3 approver").select_option("GROUP")
-    ap.get_by_label("Level 3 group").select_option("finance")
+    choose(ap.get_by_label("Level 3 approver"), "GROUP")
+    choose(ap.get_by_label("Level 3 group"), "finance")
     ap.get_by_label("Level 3 threshold").fill("2500")
-    verify("Workflow editor: the summary updates before saving", ap, lambda: expect(ap.locator("p.note").first).to_contain_text("any member of Finance when"))
+    verify("Workflow editor: the summary updates before saving", ap, lambda: expect(ap.locator(".note", has_text="Every General requests request needs")).to_contain_text("any member of Finance when"))
     ap.get_by_role("button", name="Save workflow").click()
     verify("Workflow editor: saved", ap, lambda: expect(ap.locator("#toast")).to_contain_text("General requests workflow version"))
     req = Session(browser, t, "requester")
     rp = req.page
     req.go("#/new")
     rp.locator("label.choice", has_text="General").click()
-    verify("Requester: the General route preview now includes Finance", rp, lambda: expect(rp.locator("ol.route li", has_text="Finance")).to_be_visible())
+    verify("Requester: the General route preview now includes Finance", rp, lambda: expect(rp.locator(".route-preview li.slip-step", has_text="Finance")).to_be_visible())
     adm.close()
     req.close()
 
@@ -1008,7 +1070,9 @@ def escalation_to_admins(browser, t):
     req.go(f"#/requests/{rid}")
     status = wait_for_status(req.page, ["ESCALATED"])
     check("A missed SLA escalates the level", status == "ESCALATED", status)
-    verify("Requester: the chain says it was escalated to admins", req.page, lambda: expect(req.page.get_by_text("SLA missed, escalated to admins")).to_be_visible())
+    verify("Requester: the routing slip says it went to admins after the deadline", req.page, lambda: (
+        expect(req.page.locator("#slip li.slip-step.escalated")).to_contain_text("Missed its deadline, so it went to admins"),
+        expect(req.page.locator("#slip li.slip-step.escalated .countdown")).to_contain_text("Expires")))
     adm = Session(browser, t, "admin2")
     open_from_inbox(adm, title)
     verify("Admin: the decision panel says it was escalated to them", adm.page, lambda: expect(adm.page.get_by_role("heading", name="Escalated to you: decision needed")).to_be_visible())
@@ -1032,7 +1096,7 @@ def disable_and_enable(browser, t):
     ap.get_by_role("button", name="Enable account").click()
     verify("Admin: enabled again", ap, lambda: expect(ap.get_by_role("button", name="Disable account")).to_be_visible(timeout=10000))
     req.page.get_by_role("button", name="Check again").click()
-    verify("Requester: back in after Check again", req.page, lambda: expect(req.page.get_by_role("link", name="New request")).to_be_visible(timeout=10000))
+    verify("Requester: back in after Check again", req.page, lambda: expect(req.page.locator("#nav").get_by_role("link", name="New request")).to_be_visible(timeout=10000))
     adm.close()
     req.close()
 
@@ -1043,7 +1107,7 @@ def invite_user_every_option(browser, t):
     adm = Session(browser, t, "admin")
     page = adm.page
     adm.go("#/admin/users/new")
-    page.get_by_label("Email", exact=True).fill("temp.contractor@example.com")
+    page.get_by_label(re.compile(r"^Email( \*)?$")).fill("temp.contractor@example.com")
     page.get_by_label("Full name").fill("Temp Contractor")
     page.get_by_label("Department").fill("Platform")
     page.get_by_label("Job title").fill("Contractor")
@@ -1078,7 +1142,7 @@ def invite_user_every_option(browser, t):
     page.get_by_role("link", name="Back to users").click()
     verify("Invite: Back to users leaves the form", page, lambda: expect(page.get_by_role("heading", name="Users", exact=True)).to_be_visible())
     adm.go("#/admin/users/new")
-    page.get_by_label("Email", exact=True).fill("second.admin@example.com")
+    page.get_by_label(re.compile(r"^Email( \*)?$")).fill("second.admin@example.com")
     page.locator("label.choice", has_text="Admin").first.locator("input").check()
     verify("Invite: choosing Admin hides module choices (admins hold every module)", page, lambda: expect(page.get_by_role("button", name="Select all")).to_be_hidden())
     page.get_by_role("button", name="Invite user").click()
@@ -1098,7 +1162,7 @@ def user_page_every_button(browser, t):
     adm.go(f"#/admin/users/{uid}")
     expect(page.get_by_role("heading", name="Access and reporting line")).to_be_visible()
     page.get_by_label("Full name").fill("Temp Contractor-Smith")
-    page.get_by_label("Manager (level 1 approver)").select_option(t.ids["manager"])
+    choose(page.get_by_label("Manager (level 1 approver)"), t.ids["manager"])
     page.get_by_label("Department").fill("Platform Ops")
     page.get_by_label("Job title").fill("Senior contractor")
     page.locator("label.choice", has_text="Requester").first.locator("input").check()
@@ -1122,16 +1186,21 @@ def user_page_every_button(browser, t):
     adm.go(f"#/admin/users/{uid}")
     verify("Cancelled: they are still an Approver", page, lambda: expect(
         page.locator("label.choice", has_text="Approver").first.locator("input")).to_be_checked())
-    card = page.locator(".card", has=page.get_by_role("heading", name="Auto-approval"))
-    card.get_by_label("Module").select_option("PURCHASE")
+    card = page.locator(".card", has=page.get_by_role("heading", name="Auto-approval", exact=True))
+    choose(card.get_by_label("Module"), "PURCHASE")
     card.get_by_label("Up to (approval value)").fill("250")
-    card.get_by_label("Until").fill((datetime.date.today() + datetime.timedelta(days=30)).isoformat())
+    card.get_by_label("Until").fill((datetime.date.today() + datetime.timedelta(days=31)).isoformat())
+    card.get_by_role("button", name="Choose date").click()
+    page.keyboard.press("ArrowLeft")
+    page.keyboard.press("Enter")
+    verify("User page: picking the day before in the calendar sets the end date", page, lambda: expect(card.get_by_label("Until")).to_have_value(
+        (datetime.date.today() + datetime.timedelta(days=30)).isoformat()))
     card.get_by_label("Note").fill("Small consumables")
     card.get_by_role("button", name="Grant auto-approval").click()
     page.locator("#confirmOk").click()
     verify("User page: auto-approval granted and listed with its note", page, lambda: expect(
-        page.locator(".card", has=page.get_by_role("heading", name="Auto-approval")).locator("tr", has_text="Purchasing")).to_contain_text("Small consumables"))
-    page.locator(".card", has=page.get_by_role("heading", name="Auto-approval")).get_by_role("button", name="Revoke").click()
+        page.locator(".card", has=page.get_by_role("heading", name="Auto-approval", exact=True)).locator("tr", has_text="Purchasing")).to_contain_text("Small consumables"))
+    page.locator(".card", has=page.get_by_role("heading", name="Auto-approval", exact=True)).get_by_role("button", name="Revoke").click()
     page.locator("#confirmOk").click()
     verify("User page: auto-approval revoked", page, lambda: expect(page.get_by_text("None. Every request this person raises goes through")).to_be_visible())
     for button, expected in (("Resend invitation", "invitation"), ("Sign out everywhere", "signed out")):
@@ -1185,6 +1254,12 @@ def approver_groups_create_edit_delete(browser, t):
     adm = Session(browser, t, "admin")
     page = adm.page
     adm.go("#/admin/groups")
+    page.locator(".section-head").get_by_role("button", name="Refresh").click()
+    page.wait_for_load_state("networkidle")
+    verify("Approver groups: Refresh reloads the groups", page, lambda: expect(page.get_by_role("heading", name="Finance", exact=True)).to_be_visible())
+    page.get_by_role("button", name="New group").click()
+    page.locator(".card", has_text="New approver group").get_by_role("button", name="Cancel").click()
+    verify("New group: Cancel closes the form", page, lambda: expect(page.locator(".card", has_text="New approver group")).to_have_count(0))
     page.get_by_role("button", name="New group").click()
     form = page.locator(".card", has_text="New approver group")
     form.get_by_label("Name").fill("Security champions")
@@ -1224,13 +1299,13 @@ def workflow_editor_every_control(browser, t):
     page.locator(".level-row").first.get_by_role("button", name="Move down").click()
     page.locator(".level-row").nth(1).get_by_role("button", name="Move up").click()
     page.get_by_role("button", name="Add level").click()
-    page.get_by_label("Level 3 approver").select_option("ADMINS")
+    choose(page.get_by_label("Level 3 approver"), "ADMINS")
     page.get_by_label("Level 3 threshold").fill("90")
-    page.get_by_label("Level 2 group").select_option("finance")
+    choose(page.get_by_label("Level 2 group"), "finance")
     page.get_by_label("Level 2 threshold").fill("5")
     page.get_by_label("Minutes per level before escalating to admins").fill("45")
     page.get_by_label("Minutes admins have before the request expires").fill("120")
-    page.get_by_label("Level 1 approver").select_option("MANAGER")
+    choose(page.get_by_label("Level 1 approver"), "MANAGER")
     page.get_by_role("button", name="Save workflow").click()
     verify("Saved: levels, groups, thresholds and timers", page, lambda: expect(page.locator("#toast")).to_contain_text("Access management workflow version"))
     adm.go("#/admin/users")
@@ -1238,7 +1313,7 @@ def workflow_editor_every_control(browser, t):
     verify("After reload: three levels and the new timers are kept", page, lambda: (
         expect(page.locator(".level-row")).to_have_count(3),
         expect(page.get_by_label("Minutes per level before escalating to admins")).to_have_value("45"),
-        expect(page.get_by_label("Level 2 group")).to_have_value("finance")))
+        expect(page.get_by_label("Level 2 group")).to_have_attribute("data-value", "finance")))
     page.locator(".level-row").nth(2).get_by_role("button", name="Remove level").click()
     verify("Remove level takes it out of the summary", page, lambda: expect(page.locator(".level-row")).to_have_count(2))
     adm.close()
@@ -1253,15 +1328,15 @@ def form_builder_every_control(browser, t):
     page.get_by_role("button", name="Add field").click()
     f = page.locator(".builder-field").last
     f.get_by_label("Label").fill("Cost centre")
-    f.get_by_label("Type").select_option("select")
-    f.get_by_label("Options").fill("CC-100\nCC-200\nCC-300")
+    choose(f.get_by_label("Type"), "select")
+    f.get_by_label("Options", exact=True).fill("CC-100\nCC-200\nCC-300")
     f.get_by_label("Help text").fill("Ask Finance if unsure.")
     f.get_by_label("Required").check()
     f.get_by_label("Key").fill("costCentre")
     page.get_by_role("button", name="Add field").click()
     g = page.locator(".builder-field").last
     g.get_by_label("Label").fill("Attendees")
-    g.get_by_label("Type").select_option("number")
+    choose(g.get_by_label("Type"), "number")
     g.get_by_label("Minimum").fill("1")
     g.get_by_label("Maximum").fill("200")
     page.get_by_role("button", name="Add field").click()
@@ -1274,18 +1349,22 @@ def form_builder_every_control(browser, t):
     verify("Preview shows the new dropdown with its help text", page, lambda: (
         expect(page.locator(".preview").get_by_text("Cost centre")).to_be_visible(),
         expect(page.locator(".preview").get_by_text("Ask Finance if unsure")).to_be_visible()))
-    page.get_by_label("Approval value (drives workflow thresholds and auto-approval limits)").select_option("amount")
-    page.once("dialog", lambda d: d.dismiss())
+    choose(page.get_by_label("Approval value (drives workflow thresholds and auto-approval limits)"), "amount")
     page.locator(".pills").get_by_role("link", name="Leave").click()
-    verify("Unsaved changes: switching modules asks first, and Cancel stays put", page, lambda: expect(
-        page.get_by_role("heading", name="General requests fields")).to_be_visible())
+    verify("Unsaved changes: switching modules asks first", page, lambda: expect(page.locator("#confirm")).to_contain_text("Discard unsaved changes?"))
+    page.locator("#confirm").get_by_role("button", name="Cancel").click()
+    verify("...and Cancel stays on the form with the changes", page, lambda: (
+        expect(page.get_by_role("heading", name="General requests fields")).to_be_visible(),
+        expect(page.locator(".builder-field", has_text="Cost centre")).to_have_count(1)))
     page.get_by_role("button", name="Save new version").click()
     verify("Saved as a new version", page, lambda: expect(page.locator("#toast")).to_contain_text("form saved as version"))
     req = Session(browser, t, "requester")
     rp = req.page
     req.go("#/new?module=GENERAL")
-    verify("Requester: the new dropdown has its options and help, the number its range", rp, lambda: (
-        expect(rp.get_by_label("Cost centre")).to_contain_text("CC-200"),
+    expect(rp.get_by_label("Cost centre")).to_be_visible()
+    offered = option_values(rp.get_by_label("Cost centre"))
+    check("Requester: the new dropdown offers the options the admin typed", offered == ["CC-100", "CC-200", "CC-300"], offered)
+    verify("Requester: the new dropdown has its help, the number its range", rp, lambda: (
         expect(rp.get_by_text("Ask Finance if unsure")).to_be_visible(),
         expect(rp.locator(".dyn-field", has_text="Attendees")).to_contain_text("Between 1 and 200")))
     rp.get_by_label("Title").fill("Team offsite")
@@ -1295,6 +1374,293 @@ def form_builder_every_control(browser, t):
     verify("Requester: the required dropdown is enforced", rp, lambda: expect(rp.locator(".dyn-field.has-error", has_text="Cost centre")).to_be_visible())
     req.close()
     adm.close()
+
+
+# ------------------------------------------------------------------ the new UI: lists, re-raising, deadlines, components
+@scenario()
+def my_requests_search_filter_and_times(browser, t):
+    req = Session(browser, t, "requester")
+    page = req.page
+    title = f"UI test findable {stamp()}"
+    rid = submit_purchase(req, title, 250)
+    wait_for_status(page, ["PENDING_APPROVAL"])
+    req.go("#/mine")
+    expect(page.locator("tbody tr.clickable").first).to_be_visible()
+    total = page.locator("tbody tr.clickable").count()
+    page.get_by_label("Search my requests").fill(title)
+    verify("My requests: search narrows the list to the matching request", page, lambda: (
+        expect(page.locator("tbody tr.clickable")).to_have_count(1),
+        expect(page.locator("tbody tr.clickable")).to_contain_text(title),
+        expect(page.locator(".toolbar .count")).to_have_text(f"1 of {total}")))
+    page.get_by_label("Search my requests").fill("laptop stand")
+    verify("My requests: search also matches the answers, not just the title", page, lambda: expect(page.locator("tbody tr.clickable", has_text=title)).to_have_count(1))
+    page.get_by_label("Search my requests").fill("zz-nothing-matches-zz")
+    verify("My requests: no match says so and how to get out of it", page, lambda: expect(page.locator("td.empty")).to_contain_text("No requests match"))
+    page.get_by_label("Search my requests").fill("")
+    for name, statuses in (("In progress", {"SUBMITTED", "PENDING_APPROVAL", "ESCALATED"}),
+                           ("Approved", {"APPROVED", "AUTO_APPROVED", "FULFILLED"}),
+                           ("Not approved", {"REJECTED", "EXPIRED", "UNROUTABLE", "FAILED"})):
+        button = page.locator(".segmented").get_by_role("button", name=re.compile(rf"^{name} \(\d+\)$"))
+        button.click()
+        shown = set(page.locator("tbody tr.clickable [data-status]").evaluate_all("els => els.map(e => e.dataset.status)"))
+        check(f"My requests: the {name} filter shows only those statuses", shown <= statuses, shown)
+        verify(f"My requests: {name} is marked as the chosen filter", page, lambda: expect(button).to_have_attribute("aria-pressed", "true"))
+    page.locator(".segmented").get_by_role("button", name=re.compile(r"^All \(\d+\)$")).click()
+    verify("My requests: All shows everything again", page, lambda: expect(page.locator("tbody tr.clickable")).to_have_count(total))
+    when = page.locator("tbody tr", has_text=title).locator("time.when")
+    verify("My requests: times read like 'Just now' or '5 min ago', with the full date and time on hover", page, lambda: (
+        expect(when).to_have_text(re.compile(r"^(Just now|\d+ min ago|\d+ h ago|Yesterday|\d+ days ago|.*\d{4}.*|[A-Z][a-z]{2} \d+|\d+ [A-Z][a-z]{2})$")),
+        expect(when).to_have_attribute("title", re.compile(r"\d{4}")),
+        expect(when).to_have_attribute("datetime", re.compile(r"^\d{4}-\d{2}-\d{2}T"))))
+    req.close()
+    close_request(browser, t, rid)
+
+
+@scenario()
+def raise_again_from_a_rejected_request(browser, t):
+    title = f"UI test raise again {stamp()}"
+    req = Session(browser, t, "requester")
+    page = req.page
+    rid = submit_purchase(req, title, 320)
+    wait_for_status(page, ["PENDING_APPROVAL"])
+    verify("A request in progress does not offer Raise again", page, lambda: expect(page.get_by_role("link", name="Raise again")).to_have_count(0))
+    close_request(browser, t, rid)
+    req.go(f"#/mine")
+    req.go(f"#/requests/{rid}")
+    status = wait_for_status(page, ["REJECTED"])
+    check("The request was rejected", status == "REJECTED", status)
+    page.get_by_role("link", name="Raise again").click()
+    verify("Raise again opens New request with the same module and answers filled in", page, lambda: (
+        expect(page.get_by_role("heading", name="New request")).to_be_visible(),
+        expect(page.locator("label.choice", has_text="Purchasing").locator("input")).to_be_checked(),
+        expect(page.get_by_label("Title")).to_have_value(title),
+        expect(page.get_by_label("Total cost")).to_have_value("320"),
+        expect(page.get_by_label("Category")).to_have_attribute("data-value", "Hardware"),
+        expect(page.locator("form .note")).to_contain_text(f'Copied from "{title}"')))
+    page.get_by_label("Title").fill(f"{title} (second try)")
+    page.get_by_label("Business justification").fill("Cheaper model this time.")
+    page.get_by_role("button", name="Submit request").click()
+    expect(page).to_have_url(re.compile(r"#/requests/[0-9a-f-]{36}$"), timeout=15000)
+    again = page.url.rsplit("/", 1)[-1]
+    verify("The new request is separate from the rejected one", page, lambda: (
+        expect(page.get_by_role("heading", name=f"{title} (second try)")).to_be_visible(),
+        expect(page.locator(".toast")).to_contain_text("Submitted")))
+    check("A new request ID was issued", again != rid, again)
+    wait_for_status(page, ["PENDING_APPROVAL"])
+    req.close()
+    close_request(browser, t, again)
+
+
+@scenario()
+def approvers_see_their_deadline(browser, t):
+    title = f"UI test deadline {stamp()}"
+    req = Session(browser, t, "requester")
+    rid = submit_purchase(req, title, 180)
+    wait_for_status(req.page, ["PENDING_APPROVAL"])
+    verify("Requester: the waiting level says when it moves on", req.page, lambda: expect(
+        req.page.locator("#slip li.slip-step.active .countdown")).to_contain_text(re.compile(r"Escalates in (\d+ min|\d+ h|under a minute)")))
+    req.close()
+    mgr = Session(browser, t, "manager")
+    mp = mgr.page
+    mgr.go("#/inbox")
+    ticket = mp.locator("a.card.ticket", has_text=title)
+    verify("Approvals: the card says how long is left before it escalates", mp, lambda: (
+        expect(ticket.locator(".countdown")).to_contain_text(re.compile(r"Escalates in (\d+ min|\d+ h|under a minute)")),
+        expect(ticket.locator(".countdown")).to_have_attribute("title", re.compile(r"^Escalates at "))))
+    ticket.click()
+    verify("Decision panel: the same deadline next to the level", mp, lambda: (
+        expect(mp.locator(".decision .countdown")).to_contain_text("Escalates in"),
+        expect(mp.locator(".decision")).to_contain_text("Level 1 of 1")))
+    mp.locator(".back-link", has_text="Approvals").click()
+    verify("Request: the back link returns an approver to Approvals", mp, lambda: expect(mp.get_by_role("heading", name="Approvals", exact=True)).to_be_visible())
+    mgr.close()
+    close_request(browser, t, rid)
+
+
+@scenario()
+def why_this_route_and_messages(browser, t):
+    req = Session(browser, t, "requester")
+    page = req.page
+    rid = submit_purchase(req, f"UI test why {stamp()}", 4200)
+    wait_for_status(page, ["PENDING_APPROVAL"])
+    reasons = page.locator("details.reasons")
+    verify("Request: the reasons are folded away behind Why this route?", page, lambda: (
+        expect(reasons.locator("summary")).to_have_text("Why this route?"),
+        expect(reasons.locator("ul")).to_be_hidden()))
+    reasons.locator("summary").click()
+    verify("Why this route? opens plain-language reasons", page, lambda: (
+        expect(reasons.locator("ul")).to_be_visible(),
+        expect(reasons).to_contain_text("Approval order: Line manager"),
+        expect(reasons).to_contain_text("Admins only approve from 10,000"),
+        expect(reasons).not_to_contain_text("->")))
+    reasons.locator("summary").click()
+    verify("...and folds away again", page, lambda: expect(reasons.locator("ul")).to_be_hidden())
+    page.get_by_role("button", name="Upload").click()
+    toast = page.locator("#toast")
+    verify("A message appears when there is no file to upload", page, lambda: expect(toast).to_contain_text("Choose a file first"))
+    toast.get_by_role("button", name="Dismiss message").click()
+    verify("The message can be dismissed", page, lambda: expect(toast).to_be_hidden())
+    page.get_by_role("button", name="Upload").click()
+    expect(toast).to_be_visible()
+    req.go("#/mine")
+    verify("A page's message does not follow you to the next page", page, lambda: (
+        expect(page.get_by_role("heading", name="My requests")).to_be_visible(), expect(toast).to_be_hidden()))
+    check("No JavaScript errors on the request page", not req.errors, req.errors[:3])
+    req.close()
+    close_request(browser, t, rid)
+
+
+@scenario()
+def select_and_calendar_with_the_keyboard(browser, t):
+    req = Session(browser, t, "requester")
+    page = req.page
+    req.go("#/new?module=PURCHASE")
+    category = page.get_by_label("Category")
+    expect(category).to_be_visible()
+    listbox = page.locator(f"#{category.get_attribute('aria-controls')}")
+    category.focus()
+    page.keyboard.press("ArrowDown")
+    verify("Select: the arrow key opens the list and says so", page, lambda: (
+        expect(listbox).to_be_visible(), expect(category).to_have_attribute("aria-expanded", "true")))
+    page.keyboard.press("ArrowDown")
+    page.keyboard.press("Enter")
+    verify("Select: arrows move, Enter picks, and focus returns to the field", page, lambda: (
+        expect(category).to_have_attribute("data-value", "Software"), expect(listbox).to_be_hidden(), expect(category).to_be_focused()))
+    page.keyboard.press("Enter")
+    page.keyboard.type("tr")
+    page.keyboard.press("Enter")
+    verify("Select: typing jumps to the option that starts with the letters", page, lambda: expect(category).to_have_attribute("data-value", "Travel"))
+    page.keyboard.press("Space")
+    page.keyboard.press("End")
+    page.keyboard.press("Escape")
+    verify("Select: Escape closes without changing the choice", page, lambda: (
+        expect(listbox).to_be_hidden(), expect(category).to_have_attribute("data-value", "Travel")))
+    category.click()
+    page.get_by_role("heading", name="New request").click()
+    verify("Select: clicking elsewhere closes the list", page, lambda: expect(listbox).to_be_hidden())
+    currency = page.get_by_label("Currency")
+    choose(currency, "INR")
+    verify("Currency: the amount box shows the chosen currency", page, lambda: expect(page.locator(".adorned .adorn")).to_have_text("INR"))
+
+    needed = page.get_by_label("Needed by")
+    toggle = page.locator(".date", has=needed).get_by_role("button", name="Choose date")
+    toggle.click()
+    calendar = page.get_by_role("dialog", name="Choose a date")
+    verify("Calendar: opens on today, marked as today", page, lambda: (
+        expect(calendar).to_be_visible(),
+        expect(calendar.locator("[aria-current=date]")).to_be_focused()))
+    page.keyboard.press("ArrowRight")
+    page.keyboard.press("Enter")
+    tomorrow = datetime.date.today() + datetime.timedelta(days=1)
+    verify("Calendar: arrows move by day and Enter picks the date", page, lambda: (
+        expect(needed).to_have_value(tomorrow.isoformat()), expect(calendar).to_be_hidden(), expect(needed).to_be_focused()))
+    verify("Calendar: the date is spelled out under the field", page, lambda: expect(page.locator(".date", has=needed).locator(".date-friendly")).to_contain_text(str(tomorrow.year)))
+    toggle.click()
+    title_before = calendar.locator(".cal-title").inner_text()
+    page.keyboard.press("PageDown")
+    verify("Calendar: Page Down goes to the next month", page, lambda: expect(calendar.locator(".cal-title")).not_to_have_text(title_before))
+    calendar.get_by_role("button", name="Previous month").click()
+    calendar.get_by_role("button", name="Next month").click()
+    calendar.get_by_role("button", name="Today").click()
+    verify("Calendar: Today picks today", page, lambda: expect(needed).to_have_value(datetime.date.today().isoformat()))
+    toggle.click()
+    calendar.get_by_role("button", name="Clear").click()
+    verify("Calendar: Clear empties the field", page, lambda: expect(needed).to_have_value(""))
+    toggle.click()
+    page.keyboard.press("Escape")
+    verify("Calendar: Escape closes it", page, lambda: expect(calendar).to_be_hidden())
+    needed.fill("2026-13-45")
+    verify("Calendar: a typed date that does not exist is pointed out straight away", page, lambda: expect(
+        page.locator(".date", has=needed).locator(".date-friendly")).to_contain_text("Use the format YYYY-MM-DD"))
+    page.get_by_role("button", name="Submit request").click()
+    verify("...and stops the form with a message next to the field", page, lambda: expect(
+        page.locator(".dyn-field.has-error", has_text="Needed by")).to_contain_text("YYYY-MM-DD"))
+    req.close()
+
+    if not t.live:
+        adm = Session(browser, t, "admin")
+        ap = adm.page
+        adm.go("#/admin/auto-approval")
+        until = ap.get_by_label("Until")
+        expect(until).to_be_visible()
+        ap.locator(".date", has=until).get_by_role("button", name="Choose date").click()
+        cal = ap.get_by_role("dialog", name="Choose a date")
+        cal.locator(".cal-day[aria-pressed=true]").focus()
+        for _ in range(4):
+            ap.keyboard.press("PageUp")
+        today = cal.locator(f'.cal-day[data-date="{datetime.date.today().isoformat()}"]')
+        verify("Calendar with limits: today is before the earliest allowed date, so it cannot be picked", ap, lambda: expect(today).to_be_disabled())
+        ap.keyboard.press("Escape")
+        adm.close()
+
+
+@scenario()
+def account_menu_and_skip_link(browser, t):
+    s = Session(browser, t, "manager")
+    page = s.page
+    trigger = page.get_by_role("button", name="Account menu")
+    trigger.focus()
+    page.keyboard.press("Enter")
+    menu = page.get_by_role("menu")
+    verify("Account menu: opens from the keyboard with the first action focused", page, lambda: (
+        expect(menu).to_be_visible(), expect(trigger).to_have_attribute("aria-expanded", "true"),
+        expect(page.get_by_role("menuitem", name="Sign out")).to_be_focused(),
+        expect(menu).to_contain_text("Approver")))
+    page.keyboard.press("ArrowDown")
+    verify("Account menu: arrows keep focus inside the menu", page, lambda: expect(page.get_by_role("menuitem", name="Sign out")).to_be_focused())
+    page.keyboard.press("Escape")
+    verify("Account menu: Escape closes it and returns focus", page, lambda: (expect(menu).to_be_hidden(), expect(trigger).to_be_focused()))
+    trigger.click()
+    page.get_by_role("heading", name="My requests").click()
+    verify("Account menu: clicking elsewhere closes it", page, lambda: expect(menu).to_be_hidden())
+    page.reload()
+    expect(page.get_by_role("heading", name="My requests")).to_be_visible()
+    page.keyboard.press("Tab")
+    skip = page.get_by_role("link", name="Skip to content")
+    verify("Keyboard: the first Tab shows a Skip to content link", page, lambda: (expect(skip).to_be_focused(), expect(skip).to_be_in_viewport()))
+    page.keyboard.press("Enter")
+    verify("Skip to content moves focus to the page content and leaves the address alone", page, lambda: (
+        expect(page.locator("#app")).to_be_focused(), expect(page).not_to_have_url(re.compile(r"#app$"))))
+    s.close()
+
+
+AXE = pathlib.Path(__import__("os").environ.get("AXE_JS", "/tmp/axe/package/axe.min.js"))
+
+
+@scenario()
+def accessibility_audit(browser, t):
+    """axe-core on every screen, light and dark. Skipped when axe-core is not available (set AXE_JS)."""
+    if not AXE.exists():
+        print(f"  (skipped: axe-core not found at {AXE}; npm pack axe-core and set AXE_JS to run it)")
+        return
+    source = AXE.read_text()
+    req = Session(browser, t, "requester")
+    rid = submit_purchase(req, f"UI test audit {stamp()}", 2500)
+    wait_for_status(req.page, ["PENDING_APPROVAL"])
+    req.close()
+    screens = {
+        None: [""],
+        "requester": ["#/mine", "#/new?module=PURCHASE", f"#/requests/{rid}"],
+        "manager": [f"#/requests/{rid}"],
+        "admin": ["#/inbox", "#/admin/users", f"#/admin/users/{t.ids['requester']}", "#/admin/users/new", "#/admin/org", "#/admin/groups",
+                  "#/admin/workflows/PURCHASE", "#/admin/forms/PURCHASE", "#/admin/auto-approval"],
+    }
+    for scheme in ("light", "dark"):
+        problems = []
+        for who, hashes in screens.items():
+            s = Session(browser, t, who, color_scheme=scheme, bypass_csp=True, wait_for_home=bool(who))
+            for hash_ in hashes:
+                if hash_:
+                    s.go(hash_)
+                s.page.wait_for_load_state("networkidle")
+                s.page.wait_for_timeout(400)
+                s.page.add_script_tag(content=source)
+                found = s.page.evaluate("""async () => (await axe.run(document, { resultTypes: ['violations'] })).violations
+                    .filter(v => ['critical', 'serious'].includes(v.impact)).map(v => `${v.id}: ${v.nodes.length}`)""")
+                problems += [f"{who or 'signed out'} {hash_ or 'landing'}: {p}" for p in found]
+            s.close()
+        check(f"axe-core ({scheme} theme): no critical or serious accessibility issues on any screen", not problems, problems[:8])
+    close_request(browser, t, rid)
 
 
 @scenario(local_only=True)

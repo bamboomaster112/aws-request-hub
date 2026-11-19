@@ -62,7 +62,7 @@ DEFAULT_FORMS = {
         "fields": [
             _f("system", "System", "select", True, options=["AWS console", "GitHub", "Jira", "Production database", "VPN", "Other"]),
             _f("accessLevel", "Access level", "select", True, options=["Read only", "Read and write", "Administrator"]),
-            _f("durationDays", "For how many days?", "number", True, min=1, max=365, help="Access is removed automatically after this."),
+            _f("durationDays", "Duration (days)", "number", True, min=1, max=365, help="Access is removed automatically after this."),
             _f("justification", "Why do you need it?", "textarea", True, maxLength=2000),
         ],
     },

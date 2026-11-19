@@ -5,6 +5,7 @@
 #   NOTIFICATION_EMAIL=you@example.com ./scripts/deploy.sh
 #   USE_PIPES=false ./scripts/deploy.sh                  # Lambda CDC publisher instead of EventBridge Pipes
 #   WITH_GOVERNANCE=true ./scripts/deploy.sh             # also CloudTrail + AWS Config rules
+#   LOGIN_STYLE=default ./scripts/deploy.sh              # sign-in page: custom (app look), default (Cognito's) or classic
 #
 set -euo pipefail
 
@@ -17,6 +18,7 @@ API_LOGGING="${API_LOGGING:-true}"
 SLA_SECONDS="${SLA_SECONDS:-180}"
 WITH_PIPELINE="${WITH_PIPELINE:-true}"
 WITH_GOVERNANCE="${WITH_GOVERNANCE:-false}"
+LOGIN_STYLE="${LOGIN_STYLE:-custom}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
@@ -38,6 +40,11 @@ if [[ "$ENABLE_WAF" == "auto" ]]; then
     ENABLE_WAF=true
   fi
 fi
+# A made-up pool and style ID: an allowed caller gets "not found", a blocked one gets AccessDenied.
+if [[ "$LOGIN_STYLE" != "classic" ]] && denied aws cognito-idp describe-managed-login-branding \
+    --user-pool-id "${REGION}_AAAAAAAAA" --managed-login-branding-id 00000000-0000-0000-0000-000000000000; then
+  LOGIN_STYLE=classic; echo "Managed login branding is blocked in this account: keeping the classic hosted sign-in page."
+fi
 if [[ "$USE_PIPES" == "true" ]] && denied aws pipes list-pipes --limit 1; then
   USE_PIPES=false; echo "EventBridge Pipes is blocked in this account: using the Lambda CDC publisher instead."
 fi
@@ -56,6 +63,7 @@ PARAMS=(
   "DownstreamApiKey=$DOWNSTREAM_API_KEY"
   "UseEventBridgePipes=$USE_PIPES"
   "EnableWaf=$ENABLE_WAF"
+  "LoginStyle=$LOGIN_STYLE"
   "EnableApiGatewayAccountLogging=$API_LOGGING"
   "ApprovalSlaSeconds=$SLA_SECONDS"
   "EscalationSlaSeconds=$SLA_SECONDS"

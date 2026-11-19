@@ -135,6 +135,7 @@ Options for `deploy.sh`:
 | `SLA_SECONDS` | `180` | Approval and escalation timers (short for demos) |
 | `WITH_PIPELINE` | `true` | Deploys the CodePipeline/CodeBuild stack |
 | `WITH_GOVERNANCE` | `false` | Deploys CloudTrail and AWS Config rules |
+| `LOGIN_STYLE` | `custom` | Sign-in page: `custom` is Cognito managed login with the app's logo and colours (light or dark with the browser), `default` is managed login in Cognito's own style, `classic` is the older hosted UI (chosen automatically when managed login branding is blocked) |
 
 `deploy.sh` runs `scripts/seed-config.py`, which writes starting forms, workflows and approver groups only where none exist, so it never overwrites an admin's changes. To use the web app yourself, bootstrap the first admin from CloudShell and follow the emailed temporary password. After that, invite everyone else, set their managers and add approver group members from the **Admin** area:
 
@@ -167,6 +168,26 @@ Set up first, as an admin: give a requester a manager (an Approver), put someone
 
 `python3 scripts/smoke-test.py --escalation --dlq --audit` runs most of these automatically.
 
+## The web app
+
+The interface is plain ES modules with no build step and no framework, under a strict Content Security Policy (no inline scripts or styles). It is split into a small component library and the screens that use it:
+
+| File | What it holds |
+| --- | --- |
+| `tokens.css` | Colours, type scale, spacing and radii for the light and dark themes. Every text colour meets WCAG AA in both. |
+| `base.css`, `components.css`, `views.css` | The page frame (header, admin side rail), one block per component, then screen layouts |
+| `fonts.css` | IBM Plex Sans 400/500/600 (SIL Open Font License), embedded because the asset route serves text files only |
+| `dom.js`, `icons.js` | DOM helpers and an original 24 px icon set, including the routing-slip logo |
+| `ui-controls.js` | Buttons (primary, secondary, ghost, danger, success, icon, with a busy state), labelled fields with inline errors, inputs with a currency prefix, search, choice cards, checkboxes and switches |
+| `ui-select.js` | A select that can show a second line and an icon per option, with a filter box for long lists and full keyboard support (arrows, Home/End, Page Up/Down, type-ahead, Escape) |
+| `ui-datepicker.js` | A date field you can type into (YYYY-MM-DD) or pick from a calendar, with the date spelled out under it, min/max limits, and keyboard navigation by day, week, month and year |
+| `ui-feedback.js` | Messages you can dismiss (they clear when you change page), the confirmation dialog, status badges in plain words, empty states and loading placeholders |
+| `ui-layout.js` | Page headers with one h1, panels, the account menu, a drag-and-drop file zone and segmented filters |
+| `core.js` | State, the API client (with a short cache for admin data), formatting, deadlines and the dynamic form field; re-exports the components |
+| `app.js`, `admin.js` | The requester and approver screens, and the admin area |
+
+The signature element is the **routing slip** on every request: each approval level has a stamp (green and rubber-stamped when approved, amber and dashed while waiting, red when rejected), the waiting level says how long is left before it escalates, and **Why this route?** explains the decision in plain words. The same slip previews the route as you fill in a new request, and approvers see the deadline on every card in **Approvals**. A rejected or expired request can be **raised again** with its answers filled in.
+
 ## Browser tests
 
 `tests/ui/run_ui_tests.py` drives the real web app in headless Chromium (Playwright). It has two targets that run the same scenarios:
@@ -174,7 +195,7 @@ Set up first, as an admin: give a requester a manager (an Approver), put someone
 ```bash
 pip install playwright "moto[dynamodb,cognitoidp,events,ssm,s3,secretsmanager]"
 python -m playwright install --only-shell chromium     # Ubuntu: add --with-deps. Amazon Linux 2023 (CloudShell, CodeBuild): see pipeline/buildspec-test.yml for the dnf packages
-python3 tests/ui/run_ui_tests.py                        # local: no AWS account, about 20 seconds
+python3 tests/ui/run_ui_tests.py                        # local: no AWS account, about 2 minutes
 python3 scripts/seed-users.py && python3 tests/ui/run_ui_tests.py --live   # the deployed stack, from CloudShell
 ```
 
@@ -184,12 +205,14 @@ python3 scripts/seed-users.py && python3 tests/ui/run_ui_tests.py --live   # the
 * Sign-in in the browser: the **Sign in** button sends you to the hosted UI with this app's client, its own return URL, a PKCE S256 challenge and a random state (and live, the hosted page loads with no error); a response with the wrong state or a made-up code is refused and leaves no token; sign-out goes through the logout endpoint and back.
 * Roles: navigation and route guards per role, an approver's own request going to their manager, admins seeing every request without jumping the chain, requesters not seeing other people's requests (not found, so existence is not revealed), and an account with no access profile. A test also delays the My requests response to prove a quick click elsewhere is not painted over.
 * Every control: each module end to end (every field type, currency, `?module=` preselection, the expected chain, answers shown formatted), every header, page and admin-menu button and link, user search and filters (and opening a row with Enter), attachment download, and locally the invite form with every option and both confirmations, every user-page button (save, make-admin cancel, per-user auto-approval, resend, sign out everywhere, reset password and authenticator, disable then cancel, type-to-confirm delete), CSV import, approver groups create/edit/delete, and every workflow editor and form builder control.
-* **Coverage gate:** every page records each control a test clicks, types into or changes. The last scenario visits all 13 screens as each role and fails if any of the 130 buttons, links and fields has not been used by a test, or if any field has no label. New buttons therefore cannot ship untested.
+* The interface itself: My requests search, status filters and relative times; Raise again from a rejected request; the escalation countdown on the slip, the Approvals card and the decision panel; Why this route?; dismissing a message and messages clearing on navigation; the select and the calendar from the keyboard (including limits and a typed date that does not exist); the account menu and the Skip to content link; and the phone layout (no sideways scrolling, every badge and button on screen, the routing slip before the answers, a two-row header).
+* **Accessibility:** an axe-core audit of every screen in the light and dark themes fails on any critical or serious issue. It runs when axe-core is available (the pipeline downloads it; locally, `npm pack axe-core` and set `AXE_JS`).
+* **Coverage gate:** every page records each control a test clicks, types into or changes. The last scenario visits all 13 screens as each role and fails if any of the 142 buttons, links and fields has not been used by a test, or if any field has no label. New buttons therefore cannot ship untested.
 * A failed check saves a full-page screenshot in `ui-test-results/`.
 
 `scripts/auth-check.py` covers sign-in from the other side, against Cognito and API Gateway: MFA required with an authenticator app, the password policy, no self sign-up, threat protection, a public code-flow-only client that can only return to the app; the hosted UI accepting the app's request and refusing a foreign return URL; a throwaway user's whole first sign-in (temporary password, weak new password refused, authenticator enrolment before any token, a TOTP code at every later sign-in, wrong codes and passwords refused, unknown emails answered like wrong passwords, global sign-out revoking the refresh token, a disabled account refused); and the authorizer refusing no token, garbage, a tampered token and an access token before the app sees them. No email is sent and no password is printed. Other options: `--headed`, `--slow-mo 300`, `--only two_level_chain`, `--list`.
 
-A UX review of the live instance (screens at desktop and phone width, light and dark, an axe-core audit and live timings), with what was fixed and what is recommended next, is in [docs/UX-REVIEW.md](docs/UX-REVIEW.md).
+A UX review of the live instance (screens at desktop and phone width, light and dark, an axe-core audit and live timings), what was fixed then, and how each recommendation was then carried out in the redesign, is in [docs/UX-REVIEW.md](docs/UX-REVIEW.md).
 
 ## Verified in the playground
 
@@ -205,6 +228,7 @@ Live KodeKloud AWS Playground session, 18 Nov 2026 (us-east-1, WAF and Pipes blo
 * `python3 scripts/smoke-test.py --escalation --dlq --audit`: **45 of 45 checks passed in 534 seconds** (the WAF check is skipped when WAF is blocked). Covered: setup through the admin API, schema and per-field form validation, no auto-approval without a grant, an admin-granted limit (within it auto-approved and fulfilled, above it back to the chain), the two-level chain (line manager, then Finance) with the requester, an admin jumping the chain and the manager approving twice all refused (403), the approver's own request going to their manager, hierarchy guardrails (loops, a Requester as manager, demoting someone with reports), immediate module revocation and disablement on a still-valid token, access history, presigned S3 attachments, SLA escalation, the fulfilment DLQ and the audit lake.
 * Browser tests (`tests/ui/run_ui_tests.py --live`, headless Chromium in CloudShell): **62 of 62** on that stack, then **63 of 63 in 96 seconds** on a clean deploy into a fresh playground the same afternoon. Sign-in and role checks added after that also pass live: `auth-check.py` **32 of 32** and the new browser scenarios **24 of 24** (which found and now guard a navigation race). Locally the browser suite passes **210 of 210** in under a minute, using all 130 controls on 13 screens. The live-safe control scenarios (every module end to end, header and page buttons, admin menus and filters, attachments with download) also pass live; they found a second real bug, a chosen file being cleared by the page's automatic re-check right after submitting, now fixed and guarded by a test. Live runs found the one bug the local backend could not: API Gateway's request model rejected incomplete forms with a generic message before the Lambda's field-level checks ran (fixed by validating in the browser first).
 * Before that session the same code was covered by 88 unit tests, cfn-lint, `python3 tests/local_e2e.py` (**32 of 32** checks with moto and a small state machine interpreter) and the screens driven in headless Chrome against a mock API.
+* The UI redesign (component library, routing slip, branded sign-in and every UX recommendation): locally **284 of 284** browser checks including the axe-core audit in both themes and all 142 controls, 89 unit tests and 32 local end-to-end checks. Live verification follows the next deploy.
 
 ## CI/CD
 
@@ -218,7 +242,8 @@ statemachine/approval-workflow.asl.json
 src/<function>/app.py              request_intake, policy_engine, query_api, decision_handler,
                                    attachment_presigner, fulfilment_worker, stream_publisher
 src/user_admin/                    admin API: app (routes), users, config_admin, common, defaults
-web/assets/                        app.js (requester screens), admin.js (admin area), core.js (shared)
+web/assets/                        app.js (requester screens), admin.js (admin area), core.js (shared),
+                                   ui-*.js components, tokens/base/components/views.css (see "The web app")
 pipeline/                          cicd.yaml + buildspecs
 governance/governance.yaml         CloudTrail + AWS Config rules
 scripts/                           preflight, deploy, seed-config, publish-web, seed-users, smoke-test,

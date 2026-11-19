@@ -1,0 +1,87 @@
+/* Design tokens. The palette is a routing slip on a grey ledger: ink blue for anything you can act on,
+   and three stamp colours (green approved, amber waiting, red rejected) for where a request stands.
+   Every text colour below meets WCAG AA (4.5:1) on page, surface and sunken backgrounds in both themes. */
+:root {
+  color-scheme: light dark;
+
+  --page: #f2f4f7;          /* ledger grey */
+  --surface: #ffffff;
+  --sunken: #eaedf3;        /* table heads, insets, the slip's margin */
+  --line: #d9dee7;
+  --line-strong: #7f899c;   /* control borders: 3:1 against the surface */
+  --text: #172033;          /* ink text */
+  --muted: #566176;
+
+  --ink: #2d46c8;           /* ink blue: actions, links, focus */
+  --ink-hover: #2338a8;
+  --ink-soft: #e8ecfb;
+  --on-ink: #ffffff;
+
+  --ok: #1b6e44;            /* approved stamp */
+  --ok-soft: #e2f2e9;
+  --warn: #8a5300;          /* waiting stamp */
+  --warn-mark: #c98a0b;
+  --warn-soft: #fcefd6;
+  --danger: #b42318;        /* rejected stamp */
+  --danger-soft: #fce8e6;
+  --on-solid: #ffffff;
+
+  --font: 'IBM Plex Sans', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Arial, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+  /* Type scale (1.2 ratio from a 15 px body). */
+  --t-xs: .75rem;
+  --t-sm: .8125rem;
+  --t-body: .9375rem;
+  --t-md: 1.0625rem;
+  --t-lg: 1.25rem;
+  --t-xl: 1.75rem;
+  --t-2xl: 2.25rem;
+
+  /* Radius hierarchy: panels are softer than the controls inside them; pills are round. */
+  --r-panel: 12px;
+  --r-pop: 10px;
+  --r-control: 8px;
+  --r-pill: 999px;
+
+  --space-1: .25rem;
+  --space-2: .5rem;
+  --space-3: .75rem;
+  --space-4: 1rem;
+  --space-5: 1.5rem;
+  --space-6: 2rem;
+
+  --control-h: 2.5rem;
+  --header-h: 3.75rem;
+  --focus: 0 0 0 3px color-mix(in srgb, var(--ink) 32%, transparent);
+  --lift: 0 12px 32px rgba(18, 26, 48, .16), 0 2px 6px rgba(18, 26, 48, .08);
+  --ease: cubic-bezier(.2, .7, .2, 1);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --page: #0e1320;
+    --surface: #161c2a;
+    --sunken: #1b2233;
+    --line: #283043;
+    --line-strong: #66718a;
+    --text: #e5e9f2;
+    --muted: #9aa3b7;
+
+    --ink: #93a5ff;
+    --ink-hover: #b0bdff;
+    --ink-soft: #222c4f;
+    --on-ink: #0e1320;
+
+    --ok: #62cf97;
+    --ok-soft: #15301f;
+    --warn: #f0b65a;
+    --warn-mark: #f0b65a;
+    --warn-soft: #33270f;
+    --danger: #ff8c82;
+    --danger-soft: #3a1b19;
+    --on-solid: #0e1320;
+
+    --lift: 0 12px 32px rgba(0, 0, 0, .5), 0 2px 6px rgba(0, 0, 0, .35);
+  }
+}

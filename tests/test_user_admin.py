@@ -98,6 +98,8 @@ class DirectoryTests(Harness):
         self.assertEqual(by_id[BOB]["managerId"], ADMIN)
         self.assertEqual(by_id[CAROL]["status"], "NO_PROFILE")
         self.assertEqual(body["summary"]["invitesPending"], 1)
+        # Admins never have a manager, so only Alice (an active requester) counts as missing one.
+        self.assertEqual(body["summary"]["noManager"], 1)
 
 
 class CreateTests(Harness):
@@ -273,7 +275,7 @@ class WorkflowTests(Harness):
                   {"kind": "ADMINS", "minAmount": 10000}]
         status, body = self.call("workflows/PURCHASE", "PUT", {"levels": levels, "slaSeconds": 300, "escalationSeconds": 600})
         self.assertEqual(status, 200, body)
-        self.assertIn("Line manager -> Finance when Total is 1,000 or more -> Admins when Total is 10,000 or more", body["message"])
+        self.assertIn("Line manager, then Finance when Total is 1,000 or more, then Admins when Total is 10,000 or more", body["message"])
 
     def test_rules(self):
         bad = [

@@ -85,8 +85,8 @@ def auto_approval(rule, requester, amount, now_ms):
         return None
     if amount > _num(rule.get("maxAmount"), -1):
         return None
-    return (f"Auto-approved: an admin allowed {requester.get('email')} to self-approve {MODULE_LABELS.get(rule.get('module'), rule.get('module'))} requests "
-            f"up to {_fmt(rule.get('maxAmount'))} until {rule.get('expiresOn')}; this one is {_fmt(amount)}")
+    return (f"Approved automatically. An admin lets {who(requester)} self-approve {MODULE_LABELS.get(rule.get('module'), rule.get('module'))} requests "
+            f"up to {_fmt(rule.get('maxAmount'))} until {rule.get('expiresOn')}, and this one is {_fmt(amount)}.")
 
 
 def build_plan(request, requester, workflow, profiles, groups, rule, now_ms, timers):
@@ -94,6 +94,8 @@ def build_plan(request, requester, workflow, profiles, groups, rule, now_ms, tim
     amount = _num(request.get("amount"))
     requester_id = request.get("requesterId")
     module = request.get("type")
+    module_label = MODULE_LABELS.get(module, module)
+    value_label = str(request.get("approvalField") or "value").rstrip("?").strip().lower()
     reasons, levels = [], []
     sla = max(MIN_TIMER_SECONDS, int(_num(workflow.get("slaSeconds"), timers.get("slaSeconds", 180))))
     escalation = max(MIN_TIMER_SECONDS, int(_num(workflow.get("escalationSeconds"), timers.get("escalationSeconds", 180))))
@@ -105,11 +107,11 @@ def build_plan(request, requester, workflow, profiles, groups, rule, now_ms, tim
         return {**base, "autoApprove": True, "routable": True, "riskTier": "LOW", "reasons": [auto_reason],
                 "levels": [], "levelCount": 0, "lastIndex": 0, "escalateTo": [], "escalateToDdb": [], "planJson": "{}"}
     if rule and int(_num(rule.get("expiresAt"))) <= now_ms:
-        reasons.append(f"The requester's auto-approval for {module} expired on {rule.get('expiresOn')}")
+        reasons.append(f"The requester's auto-approval for {module_label} expired on {rule.get('expiresOn')}, so it needs approval.")
     elif rule:
-        reasons.append(f"{_fmt(amount)} is above the requester's auto-approval limit of {_fmt(rule.get('maxAmount'))}")
+        reasons.append(f"The {value_label} of {_fmt(amount)} is above the auto-approval limit of {_fmt(rule.get('maxAmount'))}, so it needs approval.")
     else:
-        reasons.append("No auto-approval rule applies, so the request follows its approval chain")
+        reasons.append(f"It needs approval: nobody has auto-approval for {module_label} requests from this person.")
 
     admins = sorted(uid for uid, p in profiles.items() if p.get("role") == "admins" and p.get("status") == "ACTIVE")
     certain = set()  # people who will certainly decide an earlier level
@@ -127,7 +129,8 @@ def build_plan(request, requester, workflow, profiles, groups, rule, now_ms, tim
         else:
             label = "Admins"
         if amount < minimum:
-            reasons.append(f"{label} not needed: {_fmt(amount)} is below {_fmt(minimum)}")
+            verb = "approve" if kind == "ADMINS" else "approves"
+            reasons.append(f"{label} only {verb} from {_fmt(minimum)}, and the {value_label} is {_fmt(amount)}, so this level is skipped.")
             continue
 
         if kind == "MANAGER":
@@ -136,16 +139,16 @@ def build_plan(request, requester, workflow, profiles, groups, rule, now_ms, tim
             if ids:
                 label = f"Line manager: {who(profiles[ids[0]])}"
             elif not manager_id:
-                reasons.append("The requester has no manager set, so admins approve the first level")
+                reasons.append("The requester has no manager set, so admins approve the first level.")
             else:
                 reasons.append(f"The requester's manager ({who(profiles.get(manager_id))}) cannot approve "
-                               f"(disabled, not an approver, or already approving), so admins step in")
+                               f"(disabled, not an approver, or already approving), so admins stand in.")
         elif kind == "GROUP":
             ids = eligible(group.get("members") or [])
             if not group:
-                reasons.append(f"Approver group '{config.get('groupId')}' no longer exists, so admins step in")
+                reasons.append(f"The approver group '{config.get('groupId')}' no longer exists, so admins stand in.")
             elif not ids:
-                reasons.append(f"{label} has no eligible member for this request, so admins step in")
+                reasons.append(f"Nobody in {label} can approve this request, so admins stand in.")
         else:
             ids = eligible(admins)
 
@@ -157,7 +160,7 @@ def build_plan(request, requester, workflow, profiles, groups, rule, now_ms, tim
                 label = f"{label} (admins standing in)"
         if not ids:
             return {**base, "autoApprove": False, "routable": False, "riskTier": "HIGH",
-                    "reasons": reasons + [f"Nobody is eligible to approve level {len(levels) + 1} ({label}). "
+                    "reasons": reasons + [f"Nobody can approve level {len(levels) + 1} ({label}). "
                                           "An admin needs to set a manager, add group members or add another admin."],
                     "levels": [], "levelCount": 0, "lastIndex": 0, "escalateTo": [], "escalateToDdb": [], "planJson": "{}"}
         if len(ids) == 1:
@@ -176,7 +179,7 @@ def build_plan(request, requester, workflow, profiles, groups, rule, now_ms, tim
 
     escalate_to = [a for a in admins if a != requester_id]
     tier = "MEDIUM" if len(levels) == 1 else "HIGH"
-    reasons.append(f"Approval chain: {' -> '.join(l['label'] for l in levels)}")
+    reasons.append(f"Approval order: {', then '.join(l['label'] for l in levels)}.")
     plan = {
         "levels": [{k: l[k] for k in ("index", "kind", "label", "fallback", "approverIds", "approverNames", "minAmount")}
                    for l in levels],
