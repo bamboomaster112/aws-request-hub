@@ -647,14 +647,18 @@ def attachments(browser, t):
     close_request(browser, t, rid)
 
 
-def close_request(browser, t, request_id):
-    """Rejects a test request at level 1 so live runs never leave work in anyone's inbox."""
-    mgr = Session(browser, t, "manager")
+def close_request(browser, t, request_id, mgr=None):
+    """Rejects a test request at level 1 so live runs never leave work in anyone's inbox.
+    Pass a manager Session to close several requests with one sign-in (fewer API calls live)."""
+    own = mgr is None
+    mgr = mgr or Session(browser, t, "manager")
     mgr.go(f"#/requests/{request_id}")
+    expect(mgr.page.get_by_role("button", name="Reject", exact=True)).to_be_visible(timeout=15000)
     mgr.page.get_by_label("Decision note").fill("Closing a UI test request.")
     mgr.page.get_by_role("button", name="Reject", exact=True).click()
     verify("Test request closed so nothing is left in an inbox", mgr.page, lambda: expect(mgr.page.locator("#toast")).to_contain_text("Rejected. The workflow"))
-    mgr.close()
+    if own:
+        mgr.close()
 
 
 @scenario()
@@ -889,8 +893,10 @@ def every_module_end_to_end(browser, t):
             expect(facts).to_contain_text(text) for text in shown])
         verify(f"{label}: the form version is recorded", page, lambda: expect(page.locator(".field", has_text="Form version")).to_contain_text(re.compile(r"\d+")))
     req.close()
+    mgr = Session(browser, t, "manager")
     for rid in opened:
-        close_request(browser, t, rid)
+        close_request(browser, t, rid, mgr=mgr)
+    mgr.close()
 
 
 @scenario()
@@ -937,6 +943,7 @@ def admin_lists_menus_and_filters(browser, t):
                           ("Forms", "Request forms"), ("Auto-approval", "Auto-approval"), ("Users", "Users")):
         menu.get_by_role("link", name=link, exact=True).click()
         verify(f"Admin menu: {link} opens {heading}", page, lambda: expect(page.get_by_role("heading", name=heading, exact=True)).to_be_visible())
+    expect(page.locator("tbody tr.clickable").first).to_be_visible()  # the list loads after the page heading
     total = page.locator("tbody tr.clickable").count()
     page.get_by_label("Search users").fill(t.names["requester"])
     verify("Users: search narrows the list as you type", page, lambda: (
