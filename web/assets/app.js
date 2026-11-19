@@ -424,7 +424,7 @@ function attachmentsPanel(it) {
 
   const panel = h('div', { class: 'card' }, h('h3', {}, 'Attachments'), list);
   if (it.isOwner) {
-    const input = h('input', { type: 'file', accept: '.pdf,.png,.jpg,.jpeg,.txt,.csv,.docx,.xlsx' });
+    const input = h('input', { type: 'file', accept: '.pdf,.png,.jpg,.jpeg,.txt,.csv,.docx,.xlsx', 'aria-label': 'Choose a file to attach' });
     const button = h('button', { class: 'btn' }, 'Upload');
     button.addEventListener('click', async () => {
       const file = input.files && input.files[0];

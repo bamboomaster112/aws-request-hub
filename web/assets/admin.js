@@ -474,8 +474,8 @@ function parseCsv(text) {
 }
 
 function importPanel() {
-  const area = h('textarea', { rows: '6', placeholder: 'email,managerEmail,department,jobTitle\nana@company.com,priya@company.com,Finance,Finance lead' });
-  const file = h('input', { type: 'file', accept: '.csv,text/csv' });
+  const area = h('textarea', { rows: '6', 'aria-label': 'CSV rows', placeholder: 'email,managerEmail,department,jobTitle\nana@company.com,priya@company.com,Finance,Finance lead' });
+  const file = h('input', { type: 'file', accept: '.csv,text/csv', 'aria-label': 'Choose a CSV file' });
   const results = h('div');
   const check = h('button', { class: 'btn', type: 'button' }, 'Check');
   const apply = h('button', { class: 'btn primary', type: 'button', disabled: true }, 'Apply');
@@ -709,7 +709,7 @@ async function viewForms(moduleId) {
 
   const markDirty = () => { dirty = true; status.textContent = 'Unsaved changes'; status.className = 'warn-text small'; };
   const paintPreview = () => {
-    preview.replaceChildren(h('div', { class: 'dyn-field' }, h('label', {}, 'Title', h('span', { class: 'req' }, ' *')), h('input', { tabindex: '-1', placeholder: 'Always asked' })),
+    preview.replaceChildren(h('div', { class: 'dyn-field' }, h('label', {}, 'Title', h('span', { class: 'req' }, ' *')), h('input', { tabindex: '-1', placeholder: 'Always asked', 'aria-label': 'Title (preview)' })),
       ...fields.filter((f) => f.label).map((f) => renderField(f, { preview: true }).node));
     const numeric = fields.filter((f) => f.type === 'number' || f.type === 'amount');
     approvalSelect.replaceChildren(h('option', { value: '' }, 'None (thresholds not used)'), ...numeric.map((f) => h('option', { value: f.key }, f.label || f.key)));

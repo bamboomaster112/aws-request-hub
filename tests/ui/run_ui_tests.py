@@ -36,6 +36,63 @@ ROOT = HERE.parent.parent
 results = []
 SHOTS = ROOT / "ui-test-results"
 SCENARIOS = []
+USED = set()  # (view, control) pairs the tests have clicked, typed into or changed
+
+# Runs in every test page: names each control the same way for "used" and for the inventory.
+USAGE_JS = r"""
+(() => {
+  const viewOf = () => {
+    const p = location.hash.replace(/^#\/?/, '').split('?')[0].split('/');
+    if (!sessionStorage.getItem('id_token')) return 'landing';
+    if (!p[0] || p[0] === 'mine') return 'my requests';
+    if (p[0] === 'new') return 'new request';
+    if (p[0] === 'inbox') return 'approvals';
+    if (p[0] === 'requests') return 'request detail';
+    if (p[0] === 'admin') {
+      const section = p[1] || 'users';
+      if (section === 'users') return p[2] === 'new' ? 'admin: invite user' : (p[2] ? 'admin: user' : 'admin: users');
+      return 'admin: ' + section;
+    }
+    return p[0];
+  };
+  const labelText = (e) => {
+    const l = e.labels && e.labels[0];
+    if (!l) return '';
+    const copy = l.cloneNode(true);
+    copy.querySelectorAll('select, input, textarea, button').forEach((x) => x.remove());
+    return copy.textContent;
+  };
+  const label = (e) => (e.getAttribute('aria-label') || labelText(e)
+    || (e.tagName === 'INPUT' || e.tagName === 'TEXTAREA' || e.tagName === 'SELECT' ? '' : e.innerText) || '')
+    .replace(/\s+/g, ' ').replace(/\d+/g, 'N').trim().slice(0, 48);
+  window.__uiDescribe = (e) => {
+    let view = viewOf();
+    if (e.closest('header.topbar')) view = 'header';
+    else if (e.closest('nav.subnav')) view = 'admin menu';
+    else if (e.closest('dialog')) view = 'confirm dialog';
+    let control;
+    if (e.matches('a.card.tile')) control = 'request card';
+    else if (e.matches('a.org-card')) control = 'person card';
+    else if (e.matches('tr.clickable')) control = 'table row';
+    else if (e.closest('ul.files') && e.tagName === 'A') control = 'attachment download';
+    else if (e.closest('.pills') && e.tagName === 'A') control = 'module tab';
+    else if (e.closest('.preview')) control = 'form preview field';
+    else {
+      const kind = e.tagName === 'INPUT' ? `input[${e.type}]` : e.tagName.toLowerCase();
+      control = `${kind}: ${label(e)}`;
+    }
+    return { view, control, unlabeled: ['INPUT', 'SELECT', 'TEXTAREA'].includes(e.tagName) && !label(e) };
+  };
+  const record = (ev) => {
+    const e = ev.target && ev.target.closest && ev.target.closest('button, a[href], input, select, textarea, tr.clickable');
+    if (!e || !window.__uiUsed) return;
+    try { window.__uiUsed(window.__uiDescribe(e)); } catch (err) { /* page navigating */ }
+  };
+  ['click', 'change', 'input', 'keydown'].forEach((t) => document.addEventListener(t, record, true));
+})();
+"""
+CONTROLS_JS = """() => [...document.querySelectorAll('button, a[href], input, select, textarea, tr.clickable')]
+  .filter((e) => e.offsetParent !== null && !e.closest('.preview')).map((e) => window.__uiDescribe(e))"""
 
 
 def scenario(local_only=False):
@@ -93,10 +150,15 @@ class LocalTarget:
     def route_uploads(self, context):
         """Presigned POSTs go to S3; locally, store the object in moto and answer like S3 does."""
         def handle(route):
+            if route.request.method == "GET":  # a presigned download: serve what was uploaded
+                key = urllib.parse.unquote(urllib.parse.urlparse(route.request.url).path.lstrip("/"))
+                content = self.hub.get_attachment(key)
+                return route.fulfill(status=200 if content is not None else 404, body=content or b"", content_type="text/plain")
             body = route.request.post_data_buffer or b""
             key = re.search(rb'name="key"\r\n\r\n([^\r]+)', body)
+            data = re.search(rb'name="file"; filename="[^"]*"\r\nContent-Type: [^\r]*\r\n\r\n(.*?)\r\n--', body, re.S)
             if key:
-                self.hub.put_attachment(key.group(1).decode(), b"local upload")
+                self.hub.put_attachment(key.group(1).decode(), data.group(1) if data else b"")
             route.fulfill(status=204, body="")
         context.route(re.compile(r"https://[^/]*amazonaws\.com/.*"), handle)
 
@@ -169,6 +231,8 @@ class Session:
     def __init__(self, browser, target, who, viewport=None, wait_for_home=True):
         self.who, self.target = who, target
         self.context = browser.new_context(viewport=viewport or {"width": 1280, "height": 900})
+        self.context.expose_binding("__uiUsed", lambda _source, d: USED.add((d["view"], d["control"])))
+        self.context.add_init_script(USAGE_JS)
         target.route_uploads(self.context)
         self.errors = []
         self.page = self.context.new_page()
@@ -428,6 +492,8 @@ def auto_approval_granted_in_admin(browser, t):
     ap.get_by_label("Person").select_option(t.ids["requester"])
     ap.get_by_label("Module").select_option("PURCHASE")
     ap.get_by_label("Up to (approval value)").fill("500")
+    ap.get_by_label("Until").fill((datetime.date.today() + datetime.timedelta(days=60)).isoformat())
+    ap.get_by_label("Note").fill("UI test grant")
     ap.get_by_role("button", name="Grant", exact=True).click()
     verify("Admin: granting asks for confirmation", ap, lambda: expect(ap.locator("#confirm")).to_be_visible())
     ap.locator("#confirmOk").click()
@@ -508,6 +574,12 @@ def attachments(browser, t):
     verify("Upload goes straight to S3 and the file is listed with a download link", page, lambda: (
         expect(page.locator("#toast")).to_contain_text("Uploaded"),
         expect(page.locator("ul.files a", has_text="quote.txt")).to_be_visible(timeout=15000)))
+    link = page.locator("ul.files a", has_text="quote.txt")
+    check("The download link is a short-lived presigned HTTPS URL", (link.get_attribute("href") or "").startswith("https://")
+          and "Expires=" in (link.get_attribute("href") or "") or "X-Amz-Expires" in (link.get_attribute("href") or ""), (link.get_attribute("href") or "")[:60])
+    link.click()
+    verify("Opening the download link returns the file that was uploaded", page, lambda: expect(page.locator("body")).to_contain_text("Quote 42"))
+    page.go_back()
     req.close()
     close_request(browser, t, rid)
 
@@ -662,6 +734,165 @@ def requester_cannot_open_other_peoples_requests(browser, t):
     req.close()
 
 
+
+# ------------------------------------------------------------------ every control, every module
+MODULE_CASES = {  # module: (label on the picker, answers by field label, approval levels expected)
+    "PURCHASE": ("Purchasing", {"What are you buying?": "Docking stations", "Vendor": "Dell", "Category": "Hardware",
+                                "Total cost": "1500", "Needed by": "2026-12-15", "Business justification": "Hot desks need them."},
+                 ["Line manager", "Finance"]),
+    "ACCESS": ("Access management", {"System": "GitHub", "Access level": "Read only", "For how many days?": "30",
+                                     "Why do you need it?": "Reviewing the platform repos."}, ["Line manager", "IT security"]),
+    "LEAVE": ("Leave", {"Leave type": "Annual", "First day": "2026-12-21", "Last day": "2027-01-08", "Working days": "15",
+                        "Handover notes": "Mia covers on-call."}, ["Line manager", "HR"]),
+    "CHANGE": ("Change management", {"System or service": "Payments API", "Environment": "Production", "Change window": "2026-12-05",
+                                     "Risk score (1 to 10)": "8", "Rollback plan": "Redeploy the previous image.", "Tested in staging": True},
+               ["Line manager", "Change advisory board", "Admins"]),
+    "GENERAL": ("General requests", {"Value (if any)": "0", "Details": "Book the large meeting room for the offsite."}, ["Line manager"]),
+}
+
+
+def fill_answers(page, answers):
+    for label, value in answers.items():
+        control = page.get_by_label(re.compile(rf"^{re.escape(label)}( \*)?$"))
+        tag = control.evaluate("e => e.tagName + ':' + (e.type || '')")
+        if value is True:
+            control.check()
+        elif tag.startswith("SELECT"):
+            control.select_option(value)
+        else:
+            control.fill(value)
+
+
+@scenario()
+def every_module_end_to_end(browser, t):
+    req = Session(browser, t, "requester")
+    page = req.page
+    opened = []
+    for module, (label, answers, levels) in MODULE_CASES.items():
+        req.go(f"#/new?module={module}")
+        verify(f"{label}: opening New request with ?module= preselects it", page, lambda: expect(
+            page.locator("label.choice", has_text=label).locator("input")).to_be_checked())
+        page.locator("label.choice", has_text=label).click()
+        title = f"UI test {label.lower()} {stamp()}"
+        page.get_by_label("Title").fill(title)
+        if module == "PURCHASE":
+            page.get_by_label("Currency").select_option("EUR")
+        fill_answers(page, answers)
+        page.get_by_role("button", name="Submit request").click()
+        expect(page).to_have_url(re.compile(r"#/requests/[0-9a-f-]{36}$"), timeout=15000)
+        rid = page.url.rsplit("/", 1)[-1]
+        opened.append(rid)
+        wait_for_status(page, ["PENDING_APPROVAL"])
+        steps = page.locator("ol.chain li.step")
+        verify(f"{label}: the chain has the expected levels ({' -> '.join(levels)})", page, lambda: (
+            expect(steps).to_have_count(len(levels)),
+            *[expect(steps.nth(i)).to_contain_text(name) for i, name in enumerate(levels)]))
+        facts = page.locator(".facts").first
+        shown = []
+        for field_label, value in answers.items():
+            if value is True:
+                shown.append("Yes")
+            elif field_label in ("Needed by", "First day", "Last day", "Change window"):
+                shown.append(value[:4])  # dates are shown in the reader's locale; the year is always there
+            elif field_label == "Total cost":
+                shown.append("€1,500.00")
+            elif field_label in ("Working days", "For how many days?", "Risk score (1 to 10)", "Value (if any)"):
+                shown.append(value)
+            else:
+                shown.append(value)
+        verify(f"{label}: every answer is shown on the request, formatted for its type", page, lambda: [
+            expect(facts).to_contain_text(text) for text in shown])
+        verify(f"{label}: the form version is recorded", page, lambda: expect(page.get_by_text(re.compile(r"Form version \d+"))).to_be_visible())
+    req.close()
+    for rid in opened:
+        close_request(browser, t, rid)
+
+
+@scenario()
+def header_and_page_buttons(browser, t):
+    s = Session(browser, t, "admin")
+    page = s.page
+    header = page.locator("header.topbar")
+    for link, heading in (("New request", "New request"), ("Approvals", "Approvals waiting for you"), ("Admin", "Users"), ("My requests", "My requests")):
+        header.get_by_role("link", name=link, exact=True).click()
+        verify(f"Header: {link} opens {heading}", page, lambda: expect(page.get_by_role("heading", name=heading, exact=True)).to_be_visible())
+    s.go("#/inbox")
+    expect(page.get_by_role("heading", name="Approvals waiting for you")).to_be_visible()
+    page.locator(".section-head").get_by_role("button", name="Refresh").click()
+    verify("Approvals: Refresh reloads the inbox", page, lambda: expect(page.get_by_role("heading", name="Approvals waiting for you")).to_be_visible())
+    header.get_by_role("link", name="Request Hub home").click()
+    verify("Header: the logo goes home to My requests", page, lambda: expect(page.get_by_role("heading", name="My requests")).to_be_visible())
+    s.close()
+
+    req = Session(browser, t, "requester")
+    page = req.page
+    page.locator(".section-head").get_by_role("button", name="Refresh").click()
+    verify("My requests: Refresh reloads the list", page, lambda: expect(page.locator("tbody tr").first).to_be_visible())
+    page.locator(".section-head").get_by_role("link", name="New request").click()
+    verify("My requests: the New request button opens the form", page, lambda: expect(page.get_by_role("heading", name="New request")).to_be_visible())
+    page.locator("label.choice", has_text="Purchasing").click()
+    page.get_by_role("link", name="Cancel").click()
+    verify("New request: Cancel goes back to My requests", page, lambda: expect(page.get_by_role("heading", name="My requests")).to_be_visible())
+    title = page.locator("tbody tr .title").first.inner_text()
+    page.locator("tbody tr").first.click()
+    verify("My requests: clicking a row opens the request", page, lambda: expect(page.get_by_role("heading", name=title)).to_be_visible())
+    page.get_by_role("link", name="Back to my requests").click()
+    verify("Request: Back to my requests returns to the list", page, lambda: expect(page.get_by_role("heading", name="My requests")).to_be_visible())
+    req.close()
+
+
+@scenario()
+def admin_lists_menus_and_filters(browser, t):
+    s = Session(browser, t, "admin")
+    page = s.page
+    s.go("#/admin/users")
+    expect(page.get_by_role("heading", name="Users", exact=True)).to_be_visible()
+    menu = page.locator("nav.subnav")
+    for link, heading in (("Org chart", "Org chart"), ("Approver groups", "Approver groups"), ("Workflows", "Approval workflows"),
+                          ("Forms", "Request forms"), ("Auto-approval", "Auto-approval"), ("Users", "Users")):
+        menu.get_by_role("link", name=link, exact=True).click()
+        verify(f"Admin menu: {link} opens {heading}", page, lambda: expect(page.get_by_role("heading", name=heading, exact=True)).to_be_visible())
+    total = page.locator("tbody tr.clickable").count()
+    page.get_by_label("Search users").fill(t.names["requester"])
+    verify("Users: search narrows the list as you type", page, lambda: (
+        expect(page.locator("tbody tr.clickable")).to_have_count(1), expect(page.get_by_text(f"1 of {total} users")).to_be_visible()))
+    page.get_by_label("Search users").fill("")
+    page.get_by_label("Filter by role").select_option("approvers")
+    verify("Users: the role filter shows only that role", page, lambda: expect(page.locator("tbody tr.clickable", has_text="Requester")).to_have_count(0))
+    page.get_by_label("Filter by role").select_option("")
+    page.get_by_label("Filter by status").select_option("NO_MANAGER")
+    verify("Users: the status filter finds people without a manager", page, lambda: expect(
+        page.locator("tbody tr.clickable", has_text=t.names["requester"])).to_have_count(0))
+    page.get_by_label("Filter by status").select_option("")
+    page.locator(".section-head").get_by_role("button", name="Refresh").click()
+    verify("Users: Refresh reloads the directory", page, lambda: expect(page.locator("tbody tr.clickable")).to_have_count(total))
+    page.locator("tbody tr.clickable").filter(has=page.locator(".title", has_text=t.names["requester"])).click()
+    verify("Users: clicking a row opens the person", page, lambda: expect(page.get_by_role("heading", name="Access and reporting line")).to_be_visible())
+    page.get_by_role("link", name="Back to users").click()
+    row = page.locator("tbody tr.clickable").filter(has=page.locator(".title", has_text=t.names["manager"]))
+    row.focus()
+    page.keyboard.press("Enter")
+    verify("Users: a row opens with the keyboard (Enter) too", page, lambda: expect(page.get_by_role("heading", name="Access and reporting line")).to_be_visible())
+    page.get_by_role("link", name="Back to users").click()
+    page.locator(".section-head").get_by_role("link", name="Invite user").click()
+    verify("Users: Invite user opens the invite form", page, lambda: expect(page.get_by_role("heading", name="Invite a user")).to_be_visible())
+    page.get_by_role("link", name="Cancel").click()
+    verify("Invite: Cancel returns to Users without creating anyone", page, lambda: expect(page.locator("tbody tr.clickable")).to_have_count(total))
+    s.go("#/admin/org")
+    page.locator("a.org-card", has_text=t.names["finance"]).first.click()
+    verify("Org chart: clicking a person opens their page", page, lambda: expect(page.get_by_role("heading", name="Access and reporting line")).to_be_visible())
+    for module in ("Access management", "Leave", "Change management", "General requests", "Purchasing"):
+        s.go("#/admin/workflows")
+        page.locator(".pills").get_by_role("link", name=module).click()
+        verify(f"Workflows: the {module} tab shows its own levels", page, lambda: expect(page.get_by_role("heading", name=f"{module} approval levels")).to_be_visible())
+    for module in ("Access management", "Leave", "Change management", "General requests", "Purchasing"):
+        s.go("#/admin/forms")
+        page.locator(".pills").get_by_role("link", name=module).click()
+        verify(f"Forms: the {module} tab shows its own fields", page, lambda: expect(page.get_by_role("heading", name=f"{module} fields")).to_be_visible())
+    check("No JavaScript errors in the admin menus and filters", not s.errors, s.errors[:3])
+    s.close()
+
+
 @scenario(local_only=True)
 def signed_in_without_access(browser, t):
     s = Session(browser, t, None)
@@ -774,6 +1005,299 @@ def disable_and_enable(browser, t):
     verify("Requester: back in after Check again", req.page, lambda: expect(req.page.get_by_role("link", name="New request")).to_be_visible(timeout=10000))
     adm.close()
     req.close()
+
+
+
+@scenario(local_only=True)
+def invite_user_every_option(browser, t):
+    adm = Session(browser, t, "admin")
+    page = adm.page
+    adm.go("#/admin/users/new")
+    page.get_by_label("Email", exact=True).fill("temp.contractor@example.com")
+    page.get_by_label("Full name").fill("Temp Contractor")
+    page.get_by_label("Department").fill("Platform")
+    page.get_by_label("Job title").fill("Contractor")
+    page.locator("label.choice", has_text="Approver").locator("input").check()
+    page.locator("label.choice", has_text="Requester").first.locator("input").check()
+    verify("Invite: role cards switch between Approver and Requester", page, lambda: expect(
+        page.locator("label.choice", has_text="Requester").first.locator("input")).to_be_checked())
+    page.locator("label.choice", has_text="Approver").locator("input").check()
+    for module in ("Purchasing", "Access management", "Leave", "Change management", "General requests"):
+        page.locator(".access-editor label.choice", has_text=module).locator("input").check()
+    verify("Invite: each module box can be ticked", page, lambda: expect(page.locator(".access-editor input[type=checkbox]:checked")).to_have_count(5))
+    page.get_by_role("button", name="Clear").click()
+    page.get_by_role("button", name="Select all").click()
+    verify("Invite: Select all ticks every module", page, lambda: expect(page.locator(".access-editor input[type=checkbox]:checked")).to_have_count(5))
+    page.get_by_role("button", name="Clear").click()
+    verify("Invite: Clear unticks them", page, lambda: expect(page.locator(".access-editor input[type=checkbox]:checked")).to_have_count(0))
+    page.locator(".access-editor label.choice", has_text="General requests").locator("input").check()
+    page.locator(".access-editor label.choice", has_text="Leave").locator("input").check()
+    page.get_by_label(re.compile("Email the invitation now")).uncheck()
+    page.get_by_role("button", name="Invite user").click()
+    verify("Invite without a manager asks first", page, lambda: expect(page.locator("#confirm")).to_contain_text("Invite without a manager?"))
+    page.locator("#confirm").get_by_role("button", name="Cancel").click()
+    verify("Cancel keeps you on the form with nothing created", page, lambda: (
+        expect(page.locator("#confirm")).to_be_hidden(), expect(page.get_by_role("heading", name="Invite a user")).to_be_visible()))
+    page.get_by_role("button", name="Invite user").click()
+    page.locator("#confirmOk").click()
+    verify("Invite anyway: created without sending the email yet", page, lambda: (
+        expect(page.locator("#toast")).to_contain_text("Send the invitation when they are ready"),
+        expect(page.get_by_role("heading", name="Temp Contractor")).to_be_visible()))
+    t.shared["temp_user"] = page.url.rsplit("/", 1)[-1]
+    adm.go("#/admin/users/new")
+    page.get_by_role("link", name="Back to users").click()
+    verify("Invite: Back to users leaves the form", page, lambda: expect(page.get_by_role("heading", name="Users", exact=True)).to_be_visible())
+    adm.go("#/admin/users/new")
+    page.get_by_label("Email", exact=True).fill("second.admin@example.com")
+    page.locator("label.choice", has_text="Admin").first.locator("input").check()
+    verify("Invite: choosing Admin hides module choices (admins hold every module)", page, lambda: expect(page.get_by_role("button", name="Select all")).to_be_hidden())
+    page.get_by_role("button", name="Invite user").click()
+    verify("Inviting an admin asks for confirmation, marked as sensitive", page, lambda: expect(page.locator("#confirm")).to_contain_text("Invite a new admin?"))
+    page.locator("#confirmOk").click()
+    verify("The new admin is created and emailed", page, lambda: expect(page.locator("#toast")).to_contain_text("Invitation emailed to second.admin@example.com"))
+    adm.close()
+
+
+@scenario(local_only=True)
+def user_page_every_button(browser, t):
+    uid = t.shared.get("temp_user")
+    if not check("A temporary user exists for the user page buttons", uid, "invite_user_every_option must run first"):
+        return
+    adm = Session(browser, t, "admin")
+    page = adm.page
+    adm.go(f"#/admin/users/{uid}")
+    expect(page.get_by_role("heading", name="Access and reporting line")).to_be_visible()
+    page.get_by_label("Full name").fill("Temp Contractor-Smith")
+    page.get_by_label("Manager (level 1 approver)").select_option(t.ids["manager"])
+    page.get_by_label("Department").fill("Platform Ops")
+    page.get_by_label("Job title").fill("Senior contractor")
+    page.locator("label.choice", has_text="Requester").first.locator("input").check()
+    page.locator("label.choice", has_text="Approver").first.locator("input").check()
+    page.get_by_role("button", name="Select all").click()
+    page.get_by_role("button", name="Clear").click()
+    for module in ("Access management", "Leave", "Change management", "General requests", "Purchasing"):
+        page.locator(".access-editor label.choice", has_text=module).locator("input").check()
+    for module in ("Access management", "Leave", "Change management", "General requests"):
+        page.locator(".access-editor label.choice", has_text=module).locator("input").uncheck()
+    page.get_by_role("button", name="Save", exact=True).click()
+    verify("Save applies name, manager, department, title and modules", page, lambda: (
+        expect(page.locator("#toast")).to_contain_text("Saved"),
+        expect(page.get_by_role("heading", name="Temp Contractor-Smith")).to_be_visible(),
+        expect(page.locator(".card", has_text="Access history")).to_contain_text("manager set to")))
+    page.locator("label.choice", has_text="Admin").first.locator("input").check()
+    page.get_by_role("button", name="Save", exact=True).click()
+    verify("Making someone an admin asks first", page, lambda: expect(page.locator("#confirm")).to_contain_text("an admin?"))
+    page.locator("#confirm").get_by_role("button", name="Cancel").click()
+    adm.go("#/admin/users")
+    adm.go(f"#/admin/users/{uid}")
+    verify("Cancelled: they are still an Approver", page, lambda: expect(
+        page.locator("label.choice", has_text="Approver").first.locator("input")).to_be_checked())
+    card = page.locator(".card", has=page.get_by_role("heading", name="Auto-approval"))
+    card.get_by_label("Module").select_option("PURCHASE")
+    card.get_by_label("Up to (approval value)").fill("250")
+    card.get_by_label("Until").fill((datetime.date.today() + datetime.timedelta(days=30)).isoformat())
+    card.get_by_label("Note").fill("Small consumables")
+    card.get_by_role("button", name="Grant auto-approval").click()
+    page.locator("#confirmOk").click()
+    verify("User page: auto-approval granted and listed with its note", page, lambda: expect(
+        page.locator(".card", has=page.get_by_role("heading", name="Auto-approval")).locator("tr", has_text="Purchasing")).to_contain_text("Small consumables"))
+    page.locator(".card", has=page.get_by_role("heading", name="Auto-approval")).get_by_role("button", name="Revoke").click()
+    page.locator("#confirmOk").click()
+    verify("User page: auto-approval revoked", page, lambda: expect(page.get_by_text("None. Every request this person raises goes through")).to_be_visible())
+    for button, expected in (("Resend invitation", "invitation"), ("Sign out everywhere", "signed out")):
+        page.get_by_role("button", name=button).click()
+        page.locator("#confirmOk").click()
+        verify(f"{button}: confirmed and done", page, lambda: expect(page.locator("#toast")).to_contain_text(re.compile(expected, re.I)))
+    page.get_by_role("button", name="Disable account").click()
+    page.locator("#confirm").get_by_role("button", name="Cancel").click()
+    verify("Disable, then Cancel: the account stays active", page, lambda: expect(page.get_by_role("button", name="Disable account")).to_be_visible())
+    page.get_by_role("button", name="Delete user").click()
+    verify("Delete needs the email typed before the button works", page, lambda: expect(page.locator("#confirmOk")).to_be_disabled())
+    page.locator("#confirmType").fill("temp.contractor@example.com")
+    page.locator("#confirmOk").click()
+    verify("Deleted: back on Users and they are gone", page, lambda: (
+        expect(page.get_by_role("heading", name="Users", exact=True)).to_be_visible(),
+        expect(page.locator("tbody tr", has_text="temp.contractor@example.com")).to_have_count(0)))
+    adm.go(f"#/admin/users/{t.ids['finance']}")
+    expect(page.get_by_role("heading", name="Access and reporting line")).to_be_visible()
+    for button, expected in (("Reset password", "reset"), ("Reset authenticator", "authenticator")):
+        page.get_by_role("button", name=button).click()
+        page.locator("#confirmOk").click()
+        verify(f"{button} (someone who has signed in before): confirmed and done", page, lambda: expect(page.locator("#toast")).to_contain_text(re.compile(expected, re.I)))
+    check("No JavaScript errors on the user page", not adm.errors, adm.errors[:3])
+    adm.close()
+
+
+@scenario(local_only=True)
+def org_chart_csv_import(browser, t):
+    adm = Session(browser, t, "admin")
+    page = adm.page
+    adm.go("#/admin/org")
+    expect(page.get_by_role("heading", name="Org chart")).to_be_visible()
+    loop = "email,managerEmail,department,jobTitle\nadmin@example.com,admin2@example.com,IT,Head\nadmin2@example.com,admin@example.com,IT,Deputy\n"
+    page.get_by_label("Choose a CSV file").set_input_files(files=[{"name": "lines.csv", "mimeType": "text/csv", "buffer": loop.encode()}])
+    verify("Choosing a CSV file loads it into the box", page, lambda: expect(page.get_by_label("CSV rows")).to_have_value(re.compile("admin2@example.com,admin@example.com")))
+    page.get_by_role("button", name="Check").click()
+    verify("Check finds the loop across rows, and Apply stays off", page, lambda: (
+        expect(page.locator(".card", has_text="Import reporting lines").locator("td.danger-text")).not_to_have_count(0),
+        expect(page.get_by_role("button", name="Apply")).to_be_disabled()))
+    page.get_by_label("CSV rows").fill("email,managerEmail,department,jobTitle\nadmin2@example.com,admin@example.com,IT,Deputy head of IT\n")
+    page.get_by_role("button", name="Check").click()
+    verify("A clean CSV passes the check and enables Apply", page, lambda: expect(page.get_by_role("button", name="Apply")).to_be_enabled())
+    page.get_by_role("button", name="Apply").click()
+    verify("Apply saves it and the chart redraws with Omar under Asha", page, lambda: expect(
+        page.locator(".org-tree li", has=page.locator("a.org-card", has_text="Asha Admin")).locator("ul a.org-card", has_text="Omar Admin").first).to_be_visible(timeout=10000))
+    adm.close()
+
+
+@scenario(local_only=True)
+def approver_groups_create_edit_delete(browser, t):
+    adm = Session(browser, t, "admin")
+    page = adm.page
+    adm.go("#/admin/groups")
+    page.get_by_role("button", name="New group").click()
+    form = page.locator(".card", has_text="New approver group")
+    form.get_by_label("Name").fill("Security champions")
+    form.get_by_label("Description").fill("Reviews risky access requests.")
+    form.locator("label.choice", has_text="Mia Manager").locator("input").check()
+    form.get_by_role("button", name="Create group").click()
+    group = page.locator(".card", has=page.get_by_role("heading", name="Security champions"))
+    verify("New group: created with its member", page, lambda: expect(group).to_contain_text("Mia Manager"))
+    group.get_by_role("button", name="Edit").click()
+    group.get_by_label("Name").fill("Security champions team")
+    group.locator("label.choice", has_text="Farah Finance").locator("input").check()
+    group.get_by_role("button", name="Save group").click()
+    renamed = page.locator(".card", has=page.get_by_role("heading", name="Security champions team"))
+    verify("Edit: renamed and a second member added", page, lambda: expect(renamed).to_contain_text("Farah Finance"))
+    renamed.get_by_role("button", name="Delete").click()
+    page.locator("#confirmOk").click()
+    verify("Delete: an unused group is removed", page, lambda: expect(page.get_by_role("heading", name="Security champions team")).to_have_count(0))
+    page.locator(".card", has=page.get_by_role("heading", name="Finance", exact=True)).get_by_role("button", name="Delete").click()
+    page.locator("#confirmOk").click()
+    verify("Delete: a group a workflow uses is refused with a reason", page, lambda: (
+        expect(page.locator("#toast")).to_have_class(re.compile("danger")),
+        expect(page.get_by_role("heading", name="Finance", exact=True)).to_be_visible()))
+    adm.close()
+
+
+@scenario(local_only=True)
+def workflow_editor_every_control(browser, t):
+    adm = Session(browser, t, "admin")
+    page = adm.page
+    adm.go("#/admin/workflows/ACCESS")
+    expect(page.locator(".level-row")).to_have_count(2)
+    page.locator(".level-row").nth(1).get_by_role("button", name="Move up").click()
+    page.get_by_role("button", name="Save workflow").click()
+    verify("Moving a group above the line manager is refused on save", page, lambda: expect(page.locator("#toast")).to_contain_text("line manager can only be level 1"))
+    adm.go("#/admin/users")
+    adm.go("#/admin/workflows/ACCESS")
+    page.locator(".level-row").first.get_by_role("button", name="Move down").click()
+    page.locator(".level-row").nth(1).get_by_role("button", name="Move up").click()
+    page.get_by_role("button", name="Add level").click()
+    page.get_by_label("Level 3 approver").select_option("ADMINS")
+    page.get_by_label("Level 3 threshold").fill("90")
+    page.get_by_label("Level 2 group").select_option("finance")
+    page.get_by_label("Level 2 threshold").fill("5")
+    page.get_by_label("Minutes per level before escalating to admins").fill("45")
+    page.get_by_label("Minutes admins have before the request expires").fill("120")
+    page.get_by_label("Level 1 approver").select_option("MANAGER")
+    page.get_by_role("button", name="Save workflow").click()
+    verify("Saved: levels, groups, thresholds and timers", page, lambda: expect(page.locator("#toast")).to_contain_text("Access management workflow version"))
+    adm.go("#/admin/users")
+    adm.go("#/admin/workflows/ACCESS")
+    verify("After reload: three levels and the new timers are kept", page, lambda: (
+        expect(page.locator(".level-row")).to_have_count(3),
+        expect(page.get_by_label("Minutes per level before escalating to admins")).to_have_value("45"),
+        expect(page.get_by_label("Level 2 group")).to_have_value("finance")))
+    page.locator(".level-row").nth(2).get_by_role("button", name="Remove level").click()
+    verify("Remove level takes it out of the summary", page, lambda: expect(page.locator(".level-row")).to_have_count(2))
+    adm.close()
+
+
+@scenario(local_only=True)
+def form_builder_every_control(browser, t):
+    adm = Session(browser, t, "admin")
+    page = adm.page
+    adm.go("#/admin/forms/GENERAL")
+    expect(page.locator(".builder-field").first).to_be_visible()
+    page.get_by_role("button", name="Add field").click()
+    f = page.locator(".builder-field").last
+    f.get_by_label("Label").fill("Cost centre")
+    f.get_by_label("Type").select_option("select")
+    f.get_by_label("Options").fill("CC-100\nCC-200\nCC-300")
+    f.get_by_label("Help text").fill("Ask Finance if unsure.")
+    f.get_by_label("Required").check()
+    f.get_by_label("Key").fill("costCentre")
+    page.get_by_role("button", name="Add field").click()
+    g = page.locator(".builder-field").last
+    g.get_by_label("Label").fill("Attendees")
+    g.get_by_label("Type").select_option("number")
+    g.get_by_label("Minimum").fill("1")
+    g.get_by_label("Maximum").fill("200")
+    page.get_by_role("button", name="Add field").click()
+    h = page.locator(".builder-field").last
+    h.get_by_label("Label").fill("Temporary")
+    h.get_by_label("Max characters").fill("40")
+    h.get_by_role("button", name="Remove field").click()
+    page.locator(".builder-field").last.get_by_role("button", name="Move up").click()
+    page.locator(".builder-field").nth(page.locator(".builder-field").count() - 2).get_by_role("button", name="Move down").click()
+    verify("Preview shows the new dropdown with its help text", page, lambda: (
+        expect(page.locator(".preview").get_by_text("Cost centre")).to_be_visible(),
+        expect(page.locator(".preview").get_by_text("Ask Finance if unsure")).to_be_visible()))
+    page.get_by_label("Approval value (drives workflow thresholds and auto-approval limits)").select_option("amount")
+    page.once("dialog", lambda d: d.dismiss())
+    page.locator(".pills").get_by_role("link", name="Leave").click()
+    verify("Unsaved changes: switching modules asks first, and Cancel stays put", page, lambda: expect(
+        page.get_by_role("heading", name="General requests fields")).to_be_visible())
+    page.get_by_role("button", name="Save new version").click()
+    verify("Saved as a new version", page, lambda: expect(page.locator("#toast")).to_contain_text("form saved as version"))
+    req = Session(browser, t, "requester")
+    rp = req.page
+    req.go("#/new?module=GENERAL")
+    verify("Requester: the new dropdown has its options and help, the number its range", rp, lambda: (
+        expect(rp.get_by_label("Cost centre")).to_contain_text("CC-200"),
+        expect(rp.get_by_text("Ask Finance if unsure")).to_be_visible(),
+        expect(rp.locator(".dyn-field", has_text="Attendees")).to_contain_text("Between 1 and 200")))
+    rp.get_by_label("Title").fill("Team offsite")
+    rp.get_by_label("Value (if any)").fill("0")
+    rp.get_by_label("Details").fill("Two days.")
+    rp.get_by_role("button", name="Submit request").click()
+    verify("Requester: the required dropdown is enforced", rp, lambda: expect(rp.locator(".dyn-field.has-error", has_text="Cost centre")).to_be_visible())
+    req.close()
+    adm.close()
+
+
+@scenario(local_only=True)
+def every_control_is_tested(browser, t):
+    """Visits every screen as each role and fails for any control no scenario has used, or any unlabelled field."""
+    rid = t.shared.get("manager_request")
+    pending = None
+    req = Session(browser, t, "requester")
+    pending = submit_purchase(req, f"UI test inventory {stamp()}", 1200)
+    req.close()
+    screens = {
+        "requester": ["#/mine", "#/new?module=PURCHASE", f"#/requests/{pending}"],
+        "manager": ["#/inbox", f"#/requests/{pending}"],
+        "admin": ["#/admin/users", "#/admin/users/new", f"#/admin/users/{t.ids['requester']}", "#/admin/org", "#/admin/groups",
+                  "#/admin/workflows/PURCHASE", "#/admin/forms/PURCHASE", "#/admin/auto-approval"],
+    }
+    present, unlabeled = {}, set()
+    for who, hashes in screens.items():
+        s = Session(browser, t, who)
+        for hash_ in hashes:
+            s.go(hash_)
+            s.page.wait_for_load_state("networkidle")
+            s.page.wait_for_timeout(300)
+            for d in s.page.evaluate(CONTROLS_JS):
+                present.setdefault((d["view"], d["control"]), hash_)
+                if d["unlabeled"]:
+                    unlabeled.add(f"{d['view']}: {d['control']}")
+        s.close()
+    missing = sorted(f"{view}: {control}" for (view, control) in present if (view, control) not in USED)
+    print(f"  ({len(present)} distinct controls on {sum(len(h) for h in screens.values())} screens; {len(present) - len(missing)} used by the tests)")
+    check("Every button, link and field on every screen is used by at least one test", not missing, missing)
+    check("Every field has a label (screen readers, voice control)", not unlabeled, sorted(unlabeled))
+    del rid
 
 
 # ------------------------------------------------------------------ main

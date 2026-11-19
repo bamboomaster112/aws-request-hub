@@ -121,6 +121,9 @@ class LocalHub:
                                              UserAttributes=[{"Name": "email", "Value": email}, {"Name": "name", "Value": name},
                                                              {"Name": "email_verified", "Value": "true"}])["User"]
             cognito.admin_add_user_to_group(UserPoolId=os.environ["USER_POOL_ID"], Username=email, GroupName=role)
+            if key == "finance":  # one person who has signed in before, so password and authenticator resets apply
+                cognito.admin_set_user_password(UserPoolId=os.environ["USER_POOL_ID"], Username=email,
+                                                Password="Local-Test-Passw0rd!", Permanent=True)
             uid = {a["Name"]: a["Value"] for a in user["Attributes"]}["sub"]
             self.ids[key], self.emails[key], self.roles[key] = uid, email, role
             item = {"PK": f"USER#{uid}", "SK": "PROFILE", "entity": "USER_PROFILE", "userId": uid, "username": email,
@@ -205,6 +208,12 @@ class LocalHub:
 
     def put_attachment(self, key, content):
         boto3.client("s3").put_object(Bucket=os.environ["ATTACHMENTS_BUCKET"], Key=key, Body=content)
+
+    def get_attachment(self, key):
+        try:
+            return boto3.client("s3").get_object(Bucket=os.environ["ATTACHMENTS_BUCKET"], Key=key)["Body"].read()
+        except Exception:  # noqa: BLE001
+            return None
 
     # ------------------------------------------------------------ the HTTP side
     def _handler_class(self):
