@@ -143,6 +143,12 @@ Options for `deploy.sh`:
 ./scripts/create-user.sh ana@yourdomain.com approvers PURCHASE,ACCESS   # optional: more users from the CLI
 ```
 
+For a ready-made demo org from one mailbox, run this after the smoke test. It creates `you+admin@`, `you+manager@`, `you+finance@` and `you+requester@` (requester reports to manager, manager and finance report to admin), makes the finance person the member of every approver group, sets 30-minute timers so there is time to switch users, and removes the `@example.com` test users so every level routes to someone you can sign in as:
+
+```bash
+python3 scripts/setup-demo-users.py you@gmail.com
+```
+
 ## Demo script
 
 Set up first, as an admin: give a requester a manager (an Approver), put someone in the Finance group, and look at **Admin > Workflows > Purchasing** (line manager, Finance from 1,000, admins from 10,000).
@@ -192,7 +198,7 @@ web/assets/                        app.js (requester screens), admin.js (admin a
 pipeline/                          cicd.yaml + buildspecs
 governance/governance.yaml         CloudTrail + AWS Config rules
 scripts/                           preflight, deploy, seed-config, publish-web, seed-users, smoke-test,
-                                   create-user, release, teardown
+                                   create-user, setup-demo-users, release, teardown
 tests/                             unit tests, plus local_e2e.py (moto + state machine interpreter)
 ```
 
