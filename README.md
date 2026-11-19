@@ -173,7 +173,7 @@ Set up first, as an admin: give a requester a manager (an Approver), put someone
 
 ```bash
 pip install playwright "moto[dynamodb,cognitoidp,events,ssm,s3,secretsmanager]"
-python -m playwright install --only-shell chromium     # add --with-deps on Ubuntu
+python -m playwright install --only-shell chromium     # Ubuntu: add --with-deps. Amazon Linux 2023 (CloudShell, CodeBuild): see pipeline/buildspec-test.yml for the dnf packages
 python3 tests/ui/run_ui_tests.py                        # local: no AWS account, about 20 seconds
 python3 scripts/seed-users.py && python3 tests/ui/run_ui_tests.py --live   # the deployed stack, from CloudShell
 ```

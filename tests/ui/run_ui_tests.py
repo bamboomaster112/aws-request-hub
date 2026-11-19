@@ -297,11 +297,23 @@ def dynamic_form_and_validation(browser, t):
         .filter(el => el.type !== 'hidden' && !(el.labels && el.labels.length) && !el.getAttribute('aria-label')).map(el => el.name || el.outerHTML.slice(0, 60))""")
     check("Every control on the request form has a label (screen readers, get_by_label)", not unlabeled, unlabeled)
     page.get_by_label("Total cost").fill("")
+    posts = []
+    page.on("request", lambda r: posts.append(r.url) if r.method == "POST" and r.url.rstrip("/").endswith("/requests") else None)
     page.get_by_role("button", name="Submit request").click()
     verify("Submitting an empty form shows errors next to each required field", page, lambda: (
-        expect(page.locator(".dyn-field.has-error")).not_to_have_count(0),
-        expect(page.locator(".dyn-field.has-error", has_text="Total cost")).to_be_visible(),
-        expect(page.locator("#toast")).to_have_class(re.compile("danger"))))
+        expect(page.locator(".dyn-field.has-error")).to_have_count(5),
+        expect(page.locator(".dyn-field.has-error", has_text="Total cost")).to_contain_text("This field is required"),
+        expect(page.locator(".dyn-field", has_text="Title").locator(".field-error")).to_contain_text("3 to 120 characters"),
+        expect(page.locator("#toast")).to_contain_text("Check the highlighted fields")))
+    check("The form is checked in the browser first: no API call for an incomplete form", not posts, posts)
+    page.get_by_label("Title").fill("Monitor arm")
+    page.get_by_label("What are you buying?").fill("Monitor arm")
+    page.get_by_label("Category").select_option("Hardware")
+    page.get_by_label("Total cost").fill("2000000")
+    page.get_by_label("Business justification").fill("Neck strain.")
+    page.get_by_role("button", name="Submit request").click()
+    verify("Out-of-range values are caught with the form's own limits", page, lambda: expect(
+        page.locator(".dyn-field.has-error", has_text="Total cost")).to_contain_text("between 0 and 1,000,000"))
     verify("Nothing was created: still on the New request page", page, lambda: expect(page).to_have_url(re.compile(r"#/new")))
     check("No JavaScript errors on the request form", not s.errors, s.errors[:3])
     s.close()

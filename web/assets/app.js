@@ -153,6 +153,36 @@ async function viewMine() {
       h('tbody', {}, rows))));
 }
 
+// Mirrors the intake Lambda's checks, so people see every problem next to its field at once.
+// In AWS, API Gateway's request model rejects some bodies (no title, say) before the Lambda runs,
+// and its generic "Invalid request body" cannot point at a field. The server stays authoritative.
+function formErrors(form, inputs, titleText) {
+  const errors = {};
+  if (titleText.length < 3 || titleText.length > 120) errors.title = 'Give the request a title of 3 to 120 characters';
+  form.fields.forEach((f) => {
+    const input = inputs.find((i) => i.key === f.key);
+    const value = input ? input.read() : undefined;
+    if (f.type === 'checkbox') {
+      if (f.required && value !== true) errors[f.key] = 'Please confirm this';
+      return;
+    }
+    if (value === undefined || (typeof value === 'string' && !value.trim())) {
+      if (f.required) errors[f.key] = 'This field is required';
+      return;
+    }
+    if (f.type === 'number' || f.type === 'amount') {
+      const low = f.min ?? 0;
+      const high = f.max ?? 1000000;
+      if (!Number.isFinite(value)) errors[f.key] = 'Enter a number';
+      else if (value < low || value > high) errors[f.key] = `Enter a value between ${fmtNumber(low)} and ${fmtNumber(high)}`;
+    } else if (f.type === 'text' || f.type === 'textarea') {
+      const limit = f.maxLength || (f.type === 'text' ? 120 : 2000);
+      if (value.trim().length > limit) errors[f.key] = `Keep this to ${limit} characters`;
+    }
+  });
+  return errors;
+}
+
 // ---------- new request: the module decides which fields appear ----------
 async function viewNew() {
   mount(h('p', { class: 'muted' }, 'Loading forms...'));
@@ -221,10 +251,27 @@ async function viewNew() {
       h('div', { class: 'row end' }, h('a', { class: 'btn', href: '#/mine' }, 'Cancel'), submit));
     paintRoute();
 
+    const showErrors = (errors) => {
+      Object.entries(errors).forEach(([k, msg]) => {
+        if (k === 'title') { titleError.textContent = msg; title.parentElement.classList.add('has-error'); }
+        const target = inputs.find((i) => i.key === k);
+        if (target) target.setError(msg);
+      });
+      const first = el.querySelector('.has-error input, .has-error select, .has-error textarea') || (errors.title ? title : null);
+      if (first) first.focus();
+    };
+
     el.addEventListener('submit', async (ev) => {
       ev.preventDefault();
       inputs.forEach((i) => i.setError(''));
       titleError.textContent = '';
+      title.parentElement.classList.remove('has-error');
+      const problems = formErrors(form, inputs, title.value.trim());
+      if (Object.keys(problems).length) {
+        showErrors(problems);
+        toast(`Check the highlighted field${Object.keys(problems).length > 1 ? 's' : ''} before submitting.`, 'warn');
+        return;
+      }
       const fields = {};
       inputs.forEach((i) => { const v = i.read(); if (v !== undefined) fields[i.key] = v; });
       const payload = { type: form.module, title: title.value.trim(), fields };
@@ -235,13 +282,9 @@ async function viewNew() {
         toast('Submitted. The workflow is routing it now.', 'ok');
         window.location.hash = `#/requests/${created.requestId}`;
       } catch (e) {
-        const errors = (e instanceof ApiError && e.data && e.data.fieldErrors) || {};
-        Object.entries(errors).forEach(([k, msg]) => {
-          if (k === 'title') titleError.textContent = msg;
-          const target = inputs.find((i) => i.key === k);
-          if (target) target.setError(msg);
-        });
-        toast(e.message, 'danger');
+        showErrors((e instanceof ApiError && e.data && e.data.fieldErrors) || {});
+        toast(e instanceof ApiError && e.status === 400 && e.message.startsWith('Invalid request body')
+          ? 'Some answers are not in the format this form expects. Check the fields and try again.' : e.message, 'danger');
         submit.disabled = false;
       }
     });

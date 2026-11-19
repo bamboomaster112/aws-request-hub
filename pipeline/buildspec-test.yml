@@ -5,9 +5,10 @@ phases:
     runtime-versions:
       python: 3.12
     commands:
+      # Amazon Linux 2023: Playwright's driver needs libatomic, headless Chromium needs the rest
+      - dnf install -y -q libatomic nss nspr atk at-spi2-atk cups-libs libdrm libxkbcommon libXcomposite libXdamage libXrandr libXext libXfixes mesa-libgbm pango cairo alsa-lib
       - pip install --quiet --upgrade boto3 cfn-lint bandit playwright "moto[dynamodb,cognitoidp,events,ssm,s3,secretsmanager]"
       - python -m playwright install --only-shell chromium
-      - dnf install -y -q nss nspr atk at-spi2-atk cups-libs libdrm libxkbcommon libXcomposite libXdamage libXrandr libXext libXfixes mesa-libgbm pango cairo alsa-lib
   build:
     commands:
       - echo "Unit tests"
