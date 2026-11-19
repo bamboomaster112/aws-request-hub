@@ -345,14 +345,26 @@ function chainPanel(it) {
     h('ol', { class: 'chain' }, steps));
 }
 
+// True while someone is in the middle of something on the page that a redraw would throw away.
+function pageBusy() {
+  return [...document.querySelectorAll('#app input[type=file]')].some((i) => i.files && i.files.length)
+    || [...document.querySelectorAll('#app textarea')].some((t) => t.value.trim());
+}
+
+let detailTimer = null;
+
 async function viewDetail(requestId, attempt = 0) {
+  clearTimeout(detailTimer);
   if (attempt === 0) mount(h('p', { class: 'muted' }, 'Loading request...'));
   const it = await api(`/requests/${encodeURIComponent(requestId)}`);
 
   // The workflow usually routes a new request within a second or two.
   // Re-check a few times, then stop (each check is a Lambda call, and the playground caps them).
+  // An automatic re-check never redraws over a chosen file or a note being typed.
   if (it.status === 'SUBMITTED' && attempt < 3) {
-    setTimeout(() => { if (window.location.hash === `#/requests/${requestId}`) viewDetail(requestId, attempt + 1).catch(showError); }, 2500);
+    detailTimer = setTimeout(() => {
+      if (window.location.hash === `#/requests/${requestId}` && !pageBusy()) viewDetail(requestId, attempt + 1).catch(showError);
+    }, 2500);
   }
 
   const reasons = Array.isArray(it.policyReasons) ? it.policyReasons : [];

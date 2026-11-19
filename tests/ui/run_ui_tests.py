@@ -572,10 +572,26 @@ def admin_screens(browser, t):
 @scenario()
 def attachments(browser, t):
     req = Session(browser, t, "requester")
-    rid = submit_purchase(req, f"UI test attachment {stamp()}", 200)
     page = req.page
-    wait_for_status(page, ["PENDING_APPROVAL"])
-    page.locator("input[type=file]").set_input_files(files=[{"name": "quote.txt", "mimeType": "text/plain", "buffer": b"Quote 42"}])
+    # Show the new request as still SUBMITTED, as on AWS while the workflow picks it up, so the page schedules
+    # its automatic re-check. Choosing a file during that window must survive the re-check.
+    first = {"done": False}
+
+    def still_submitted(route):
+        if route.request.method == "GET" and not first["done"]:
+            first["done"] = True
+            response = route.fetch()
+            body = response.json()
+            body["status"] = "SUBMITTED"
+            return route.fulfill(response=response, json=body)
+        return route.continue_()
+    page.route(re.compile(r".*/requests/[0-9a-f-]{36}$"), still_submitted)
+    rid = submit_purchase(req, f"UI test attachment {stamp()}", 200)
+    page.get_by_label("Choose a file to attach").set_input_files(files=[{"name": "quote.txt", "mimeType": "text/plain", "buffer": b"Quote 42"}])
+    page.wait_for_timeout(3500)  # longer than the 2.5 s automatic re-check
+    check("A file chosen while the new request is being routed is still selected after the automatic re-check",
+          page.evaluate("() => { const i = document.querySelector('#app input[type=file]'); return !!(i && i.files.length); }"))
+    page.unroute(re.compile(r".*/requests/[0-9a-f-]{36}$"))
     page.get_by_role("button", name="Upload").click()
     verify("Upload goes straight to S3 and the file is listed with a download link", page, lambda: (
         expect(page.locator("#toast")).to_contain_text("Uploaded"),
