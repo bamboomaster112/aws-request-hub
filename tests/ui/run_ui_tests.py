@@ -153,7 +153,9 @@ class LocalTarget:
             if route.request.method == "GET":  # a presigned download: serve what was uploaded
                 key = urllib.parse.unquote(urllib.parse.urlparse(route.request.url).path.lstrip("/"))
                 content = self.hub.get_attachment(key)
-                return route.fulfill(status=200 if content is not None else 404, body=content or b"", content_type="text/plain")
+                query = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(route.request.url).query))
+                headers = {"Content-Disposition": query["response-content-disposition"]} if "response-content-disposition" in query else {}
+                return route.fulfill(status=200 if content is not None else 404, body=content or b"", content_type="text/plain", headers=headers)
             body = route.request.post_data_buffer or b""
             key = re.search(rb'name="key"\r\n\r\n([^\r]+)', body)
             data = re.search(rb'name="file"; filename="[^"]*"\r\nContent-Type: [^\r]*\r\n\r\n(.*?)\r\n--', body, re.S)
@@ -577,9 +579,12 @@ def attachments(browser, t):
     link = page.locator("ul.files a", has_text="quote.txt")
     check("The download link is a short-lived presigned HTTPS URL", (link.get_attribute("href") or "").startswith("https://")
           and "Expires=" in (link.get_attribute("href") or "") or "X-Amz-Expires" in (link.get_attribute("href") or ""), (link.get_attribute("href") or "")[:60])
-    link.click()
-    verify("Opening the download link returns the file that was uploaded", page, lambda: expect(page.locator("body")).to_contain_text("Quote 42"))
-    page.go_back()
+    with page.expect_download(timeout=15000) as download:
+        link.click()
+    saved = download.value
+    check("Download: the link downloads the file (never opened inside the site) with its name and content",
+          saved.suggested_filename == "quote.txt" and pathlib.Path(saved.path()).read_bytes() == b"Quote 42",
+          (saved.suggested_filename, pathlib.Path(saved.path()).read_bytes()[:20]))
     req.close()
     close_request(browser, t, rid)
 
@@ -883,10 +888,12 @@ def admin_lists_menus_and_filters(browser, t):
     verify("Org chart: clicking a person opens their page", page, lambda: expect(page.get_by_role("heading", name="Access and reporting line")).to_be_visible())
     for module in ("Access management", "Leave", "Change management", "General requests", "Purchasing"):
         s.go("#/admin/workflows")
+        expect(page.get_by_role("heading", name="Approval workflows")).to_be_visible()
         page.locator(".pills").get_by_role("link", name=module).click()
         verify(f"Workflows: the {module} tab shows its own levels", page, lambda: expect(page.get_by_role("heading", name=f"{module} approval levels")).to_be_visible())
     for module in ("Access management", "Leave", "Change management", "General requests", "Purchasing"):
         s.go("#/admin/forms")
+        expect(page.get_by_role("heading", name="Request forms")).to_be_visible()
         page.locator(".pills").get_by_role("link", name=module).click()
         verify(f"Forms: the {module} tab shows its own fields", page, lambda: expect(page.get_by_role("heading", name=f"{module} fields")).to_be_visible())
     check("No JavaScript errors in the admin menus and filters", not s.errors, s.errors[:3])
