@@ -508,8 +508,18 @@ def attachments(browser, t):
     verify("Upload goes straight to S3 and the file is listed with a download link", page, lambda: (
         expect(page.locator("#toast")).to_contain_text("Uploaded"),
         expect(page.locator("ul.files a", has_text="quote.txt")).to_be_visible(timeout=15000)))
-    del rid
     req.close()
+    close_request(browser, t, rid)
+
+
+def close_request(browser, t, request_id):
+    """Rejects a test request at level 1 so live runs never leave work in anyone's inbox."""
+    mgr = Session(browser, t, "manager")
+    mgr.go(f"#/requests/{request_id}")
+    mgr.page.get_by_label("Decision note").fill("Closing a UI test request.")
+    mgr.page.get_by_role("button", name="Reject").click()
+    verify("Test request closed so nothing is left in an inbox", mgr.page, lambda: expect(mgr.page.locator("#toast")).to_contain_text("Recorded: rejected"))
+    mgr.close()
 
 
 @scenario()
