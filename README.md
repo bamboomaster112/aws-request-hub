@@ -135,7 +135,7 @@ Options for `deploy.sh`:
 | `SLA_SECONDS` | `180` | Approval and escalation timers (short for demos) |
 | `WITH_PIPELINE` | `true` | Deploys the CodePipeline/CodeBuild stack |
 | `WITH_GOVERNANCE` | `false` | Deploys CloudTrail and AWS Config rules |
-| `LOGIN_STYLE` | `custom` | Sign-in page: `custom` is Cognito managed login with the app's logo and colours (light or dark with the browser), `default` is managed login in Cognito's own style, `classic` is the older hosted UI (chosen automatically when managed login branding is blocked) |
+| `LOGIN_STYLE` | `custom` | Sign-in page: `custom` is Cognito managed login with the app's logo and colours (light or dark with the browser), `default` is managed login in Cognito's own style, `classic` is the older hosted UI, branded with the same logo and colours by `scripts/brand-sign-in.sh` (chosen automatically when managed login branding is blocked, as it is in the KodeKloud playground) |
 
 `deploy.sh` runs `scripts/seed-config.py`, which writes starting forms, workflows and approver groups only where none exist, so it never overwrites an admin's changes. To use the web app yourself, bootstrap the first admin from CloudShell and follow the emailed temporary password. After that, invite everyone else, set their managers and add approver group members from the **Admin** area:
 

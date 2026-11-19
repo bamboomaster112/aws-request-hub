@@ -6,6 +6,7 @@
 #   USE_PIPES=false ./scripts/deploy.sh                  # Lambda CDC publisher instead of EventBridge Pipes
 #   WITH_GOVERNANCE=true ./scripts/deploy.sh             # also CloudTrail + AWS Config rules
 #   LOGIN_STYLE=default ./scripts/deploy.sh              # sign-in page: custom (app look), default (Cognito's) or classic
+#                                                        # (classic is branded by scripts/brand-sign-in.sh)
 #
 set -euo pipefail
 
@@ -119,6 +120,11 @@ SLA_SECONDS="$SLA_SECONDS" python3 "$ROOT/scripts/seed-config.py"
 
 step "Publishing the web app"
 "$ROOT/scripts/publish-web.sh"
+
+if [[ "$LOGIN_STYLE" == "classic" ]]; then
+  step "Branding the sign-in page"
+  "$ROOT/scripts/brand-sign-in.sh" || echo "Could not brand the classic sign-in page; it keeps Cognito's default look."
+fi
 
 if [[ "$WITH_PIPELINE" == "true" ]]; then
   step "Deploying CI/CD stack (${STACK}-cicd)"
