@@ -1841,7 +1841,7 @@ Resources:
               responses:
                 '201': {description: Created}
                 '400': {description: Invalid fields}
-                '403': {description: No access to this module, or the account is disabled}
+                '403': {description: 'No access to this module, or the account is disabled'}
               x-amazon-apigateway-integration:
                 type: aws_proxy
                 httpMethod: POST
