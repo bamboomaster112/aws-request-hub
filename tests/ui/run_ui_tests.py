@@ -566,6 +566,11 @@ def rejection_needs_a_note(browser, t):
     mp.get_by_label("Decision note").fill("No budget this quarter.")
     mp.get_by_role("button", name="Reject", exact=True).click()
     verify("Rejection with a note is recorded", mp, lambda: expect(mp.locator("#toast")).to_contain_text("Rejected. The workflow"))
+    mgr.go("#/inbox")  # straight away, before the request page's own refresh is due
+    mp.wait_for_timeout(2500)
+    verify("Moving on right after a decision stays on the new page (the request page does not come back)", mp, lambda: (
+        expect(mp.get_by_role("heading", name="Approvals", exact=True)).to_be_visible(),
+        expect(mp.get_by_role("heading", name=title)).to_have_count(0)))
     req.go(f"#/requests/{rid}")
     status = wait_for_status(req.page, ["REJECTED"])
     check("Requester sees REJECTED", status == "REJECTED", status)
@@ -1548,6 +1553,8 @@ def why_this_route_and_messages(browser, t):
         expect(reasons).to_contain_text("Approval order: Line manager"),
         expect(reasons).to_contain_text("Admins only approve from 10,000"),
         expect(reasons).not_to_contain_text("->")))
+    page.locator(".section-head").get_by_role("button", name="Refresh").click()
+    verify("Refresh keeps Why this route? open", page, lambda: expect(reasons.locator("ul")).to_be_visible())
     reasons.locator("summary").click()
     verify("...and folds away again", page, lambda: expect(reasons.locator("ul")).to_be_hidden())
     page.get_by_role("button", name="Upload").click()
@@ -1606,7 +1613,10 @@ def select_and_calendar_with_the_keyboard(browser, t):
         expect(calendar.locator("[aria-current=date]")).to_be_focused()))
     page.keyboard.press("ArrowRight")
     page.keyboard.press("Enter")
-    tomorrow = datetime.date.today() + datetime.timedelta(days=1)
+    # "Today" is the browser's local date, which can differ from this process's date near midnight.
+    today = datetime.date.fromisoformat(page.evaluate(
+        "() => { const d = new Date(); return [d.getFullYear(), String(d.getMonth() + 1).padStart(2, '0'), String(d.getDate()).padStart(2, '0')].join('-'); }"))
+    tomorrow = today + datetime.timedelta(days=1)
     verify("Calendar: arrows move by day and Enter picks the date", page, lambda: (
         expect(needed).to_have_value(tomorrow.isoformat()), expect(calendar).to_be_hidden(), expect(needed).to_be_focused()))
     verify("Calendar: the date is spelled out under the field", page, lambda: expect(page.locator(".date", has=needed).locator(".date-friendly")).to_contain_text(str(tomorrow.year)))
@@ -1617,7 +1627,7 @@ def select_and_calendar_with_the_keyboard(browser, t):
     calendar.get_by_role("button", name="Previous month").click()
     calendar.get_by_role("button", name="Next month").click()
     calendar.get_by_role("button", name="Today").click()
-    verify("Calendar: Today picks today", page, lambda: expect(needed).to_have_value(datetime.date.today().isoformat()))
+    verify("Calendar: Today picks today", page, lambda: expect(needed).to_have_value(today.isoformat()))
     toggle.click()
     calendar.get_by_role("button", name="Clear").click()
     verify("Calendar: Clear empties the field", page, lambda: expect(needed).to_have_value(""))
@@ -1643,7 +1653,8 @@ def select_and_calendar_with_the_keyboard(browser, t):
         cal.locator(".cal-day[aria-pressed=true]").focus()
         for _ in range(4):
             ap.keyboard.press("PageUp")
-        today = cal.locator(f'.cal-day[data-date="{datetime.date.today().isoformat()}"]')
+        local_today = ap.evaluate("() => { const d = new Date(); return [d.getFullYear(), String(d.getMonth() + 1).padStart(2, '0'), String(d.getDate()).padStart(2, '0')].join('-'); }")
+        today = cal.locator(f'.cal-day[data-date="{local_today}"]')
         verify("Calendar with limits: today is before the earliest allowed date, so it cannot be picked", ap, lambda: expect(today).to_be_disabled())
         ap.keyboard.press("Escape")
         adm.close()

@@ -5,7 +5,7 @@ import {
   clearPageTimers, fmtTime, fmtNumber, fmtMoney, fmtField, shortValue, timeAgo, badge, field, note, api, ApiError,
   ensureMe, role, isAdmin, isReviewer, renderField, newKey, displayName, avatar, moduleLabel, moduleTile, countdown,
   button, linkButton, iconButton, busy, formField, textInput, select, choiceCard, searchInput, parseIso,
-  emptyState, skeleton, pageHead, card, menu, fileDrop, segmented, MODULE_ICON, nav, StaleRoute, paints,
+  emptyState, skeleton, pageHead, card, menu, fileDrop, segmented, MODULE_ICON, nav, StaleRoute,
 } from './core.js';
 import { adminRoute } from './admin.js';
 
@@ -428,15 +428,20 @@ async function viewNew() {
 }
 
 // ---------- request page ----------
+const whyOpen = new Set();  // requests whose "Why this route?" the person has opened
+
 function slipPanel(it) {
   const plan = it.approvalPlan || {};
   const levels = plan.levels || [];
   const decisions = Object.fromEntries((it.approvals || []).map((a) => [Number(a.level), a]));
   const reasons = Array.isArray(it.policyReasons) ? it.policyReasons : [];
   const why = reasons.length
-    ? h('details', { class: 'disclosure reasons' }, h('summary', {}, icon('chevronRight', { size: 14 }), 'Why this route?'),
+    ? h('details', { class: 'disclosure reasons', open: whyOpen.has(it.requestId) },
+      h('summary', {}, icon('chevronRight', { size: 14 }), 'Why this route?'),
       h('ul', {}, reasons.map((r) => h('li', {}, r))))
     : null;
+  // A refresh (the button, or the automatic re-check) keeps the reasons open if they were open.
+  if (why) why.addEventListener('toggle', () => (why.open ? whyOpen.add(it.requestId) : whyOpen.delete(it.requestId)));
   const meta = plan.slaSeconds ? `${Math.round(plan.slaSeconds / 60)} min per level` : '';
   const panel = (body) => card({ cls: 'slip', id: 'slip', title: 'Routing slip', actions: meta ? h('span', { class: 'meta' }, meta) : null, body: [...body, why] });
 
@@ -563,7 +568,10 @@ function decisionPanel(it) {
           method: 'POST', body: JSON.stringify({ decision, comment: comment.value.trim() }),
         });
         toast(`${decision === 'APPROVED' ? 'Approved' : 'Rejected'}. The workflow is moving the request on.`, 'ok');
-        setTimeout(() => viewDetail(it.requestId).catch(showError), 1500);
+        clearTimeout(detailTimer);
+        detailTimer = setTimeout(() => {  // only if they are still on this request
+          if (window.location.hash === `#/requests/${it.requestId}`) viewDetail(it.requestId).catch(showError);
+        }, 1500);
       } catch (e) {
         toast(e.message, 'danger');
         other.disabled = false;
@@ -704,29 +712,18 @@ function paintChrome() {
 }
 
 // Views load their data asynchronously. If someone navigates while a view is still loading,
-// the older view must not paint over the newer one. Each route has a sequence number: reads made
-// for an older route are dropped when they return (see api() in core.js). As a second guard, a
-// route that finishes after a newer one has painted re-runs the router for the current URL, but
-// only if a page was painted since then. When the late route painted nothing, re-running would
-// wipe whatever the person has already started on the newer page (a chosen module, typed text).
+// the older view must not paint over the newer one. Each route has a sequence number, and every
+// read a view waits on is checked against it when it returns (see api() in core.js): a read made
+// for an older route throws StaleRoute, so the older view stops before it paints. Views wait on
+// nothing else, so the router never needs to re-run itself. (It used to re-run when an older
+// route finished late, which redrew the page and wiped whatever someone had started on it.)
 let routeSeq = 0;
-let paintedSeq = 0;
-let paintsAtFinish = 0;
 
 async function route() {
-  const seq = ++routeSeq;
-  nav.seq = seq;
+  routeSeq += 1;
+  nav.seq = routeSeq;
   clearPageTimers();
-  try {
-    await renderRoute();
-  } finally {
-    if (paintedSeq > seq) {
-      if (paints.count !== paintsAtFinish) route();
-    } else {
-      paintedSeq = seq;
-      paintsAtFinish = paints.count;
-    }
-  }
+  await renderRoute();
 }
 
 async function renderRoute() {
