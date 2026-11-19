@@ -1645,7 +1645,8 @@ def accessibility_audit(browser, t):
         "admin": ["#/inbox", "#/admin/users", f"#/admin/users/{t.ids['requester']}", "#/admin/users/new", "#/admin/org", "#/admin/groups",
                   "#/admin/workflows/PURCHASE", "#/admin/forms/PURCHASE", "#/admin/auto-approval"],
     }
-    for scheme in ("light", "dark"):
+    schemes = [x.strip() for x in __import__("os").environ.get("AXE_SCHEMES", "light,dark").split(",") if x.strip()]
+    for scheme in schemes:
         problems = []
         for who, hashes in screens.items():
             s = Session(browser, t, who, color_scheme=scheme, bypass_csp=True, wait_for_home=bool(who))
