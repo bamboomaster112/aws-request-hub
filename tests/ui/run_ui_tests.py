@@ -120,7 +120,11 @@ def verify(name, page, assertion):
             page.screenshot(path=str(shot), full_page=True)
         except PlaywrightError:
             shot = "no screenshot"
-        return check(name, False, f"{str(exc).splitlines()[0][:200]} (see {shot})")
+        try:
+            toast = page.locator("#toast").inner_text(timeout=1000) if page.locator("#toast").is_visible() else ""
+        except PlaywrightError:
+            toast = ""
+        return check(name, False, f"{str(exc).splitlines()[0][:200]}{f' [page said: {toast}]' if toast else ''} (see {shot})")
 
 
 # ------------------------------------------------------------------ targets
