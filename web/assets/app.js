@@ -2,7 +2,7 @@
 // Auth: Cognito hosted UI with the authorization code flow + PKCE.
 // Every value from the API is rendered with textContent (never innerHTML).
 
-const state = { cfg: null, idToken: null, claims: null, groups: new Set() };
+const state = { cfg: null, idToken: null, claims: null, groups: new Set(), me: null, meAt: 0 };
 
 const TYPES = {
   PURCHASE: { label: 'Purchase', unit: 'Amount', money: true, hint: 'Up to 499 is auto-approved. 5,000 and above needs an admin.' },
@@ -10,6 +10,39 @@ const TYPES = {
   LEAVE: { label: 'Leave', unit: 'Days', money: false, hint: 'Up to 2 days is auto-approved. 15 days or more needs an admin.' },
   CHANGE: { label: 'Change', unit: 'Impact score', money: false, hint: 'Production changes always need an admin.' },
   GENERAL: { label: 'General', unit: 'Amount', money: true, hint: 'Up to 100 is auto-approved. 10,000 and above needs an admin.' },
+};
+
+// Modules are the request types a user may raise and (for approvers) review.
+// The server is the authority; these labels only drive the screens.
+const MODULES = {
+  PURCHASE: { label: 'Purchasing', blurb: 'Purchase requests for goods and services.' },
+  ACCESS: { label: 'Access management', blurb: 'Requests for system and data access.' },
+  LEAVE: { label: 'Leave', blurb: 'Time off and leave requests.' },
+  CHANGE: { label: 'Change management', blurb: 'Production and infrastructure changes.' },
+  GENERAL: { label: 'General requests', blurb: 'Anything that needs a yes but has no module of its own.' },
+};
+
+const ROLES = {
+  requesters: { label: 'Requester', blurb: 'Raises and tracks requests in the modules they hold.' },
+  approvers: { label: 'Approver', blurb: 'A requester who can also approve requests in the modules they hold.' },
+  admins: { label: 'Admin', blurb: 'Approves anything, handles escalations and manages users. Every module is included.' },
+};
+
+const SIGN_IN = {
+  FORCE_CHANGE_PASSWORD: ['Invite pending', 'warn'],
+  CONFIRMED: ['Signed in before', 'ok'],
+  RESET_REQUIRED: ['Password reset pending', 'warn'],
+  UNCONFIRMED: ['Unconfirmed', 'warn'],
+  MISSING: ['Missing in Cognito', 'danger'],
+};
+
+const ACCESS_TONE = { ACTIVE: 'ok', DISABLED: 'danger', NO_PROFILE: 'warn' };
+const ACCESS_LABEL = { ACTIVE: 'Active', DISABLED: 'Disabled', NO_PROFILE: 'No access set up' };
+
+const HISTORY_LABEL = {
+  CREATED: 'Invited', ACCESS_CHANGED: 'Access changed', ACCESS_SET_UP: 'Access set up', DISABLE: 'Disabled',
+  ENABLE: 'Enabled', RESET_PASSWORD: 'Password reset', RESEND_INVITE: 'Invitation re-sent',
+  RESET_MFA: 'Authenticator reset', SIGN_OUT: 'Signed out everywhere', DELETED: 'Deleted',
 };
 
 const STATUS_TONE = {
@@ -160,7 +193,18 @@ function loadSession() {
   }
 }
 
-const isReviewer = () => state.groups.has('approvers') || state.groups.has('admins');
+const role = () => (state.me && state.me.role) || null;
+const isReviewer = () => role() === 'approvers' || role() === 'admins';
+const isAdmin = () => Boolean(state.me && state.me.canManageUsers);
+const myModules = () => (state.me && state.me.modules) || [];
+
+// The live access profile decides what the screens offer (the token can be up to an hour old).
+async function ensureMe(force = false) {
+  if (!force && state.me && Date.now() - state.meAt < 60000) return state.me;
+  state.me = await api('/me');
+  state.meAt = Date.now();
+  return state.me;
+}
 
 // ---------- API ----------
 async function api(path, options = {}) {
@@ -172,6 +216,8 @@ async function api(path, options = {}) {
   try { data = await res.json(); } catch { /* empty or non-JSON body */ }
   if (res.status === 401) {
     store.del('id_token');
+    state.idToken = null;
+    state.me = null;
     throw new Error('Your session has expired. Please sign in again.');
   }
   if (res.status === 403 && data && data.message === 'Forbidden') {
@@ -224,10 +270,18 @@ async function viewMine() {
 }
 
 function viewNew() {
+  const allowed = Object.keys(TYPES).filter((key) => myModules().includes(key));
+  if (!allowed.length) {
+    mount(h('div', { class: 'section-head' }, h('h2', {}, 'New request')),
+      h('div', { class: 'card empty' },
+        h('h3', {}, 'No request modules yet'),
+        h('p', {}, 'Your account does not have access to any request module. Ask an admin to grant the modules you need.')));
+    return;
+  }
   const typeSelect = h('select', { name: 'type', required: true },
-    Object.entries(TYPES).map(([key, t]) => h('option', { value: key }, t.label)));
-  const unitLabel = h('span', {}, TYPES.PURCHASE.unit);
-  const hint = h('p', { class: 'hint' }, TYPES.PURCHASE.hint);
+    allowed.map((key) => h('option', { value: key }, TYPES[key].label)));
+  const unitLabel = h('span', {}, TYPES[allowed[0]].unit);
+  const hint = h('p', { class: 'hint' }, TYPES[allowed[0]].hint);
   const currency = h('select', { name: 'currency' }, ['USD', 'EUR', 'GBP', 'INR', 'SGD', 'AED'].map((c) => h('option', { value: c }, c)));
   const currencyField = h('label', {}, 'Currency', currency);
   const update = () => {
@@ -243,6 +297,9 @@ function viewNew() {
       h('label', {}, 'Type', typeSelect),
       h('label', {}, unitLabel, h('input', { name: 'amount', type: 'number', min: '0', step: 'any', value: '0', required: true }))),
     hint,
+    allowed.length < Object.keys(TYPES).length
+      ? h('p', { class: 'muted small' }, `You can raise ${allowed.map((k) => TYPES[k].label).join(', ')} requests. Ask an admin if you need another module.`)
+      : null,
     h('label', {}, 'Title', h('input', { name: 'title', minlength: '3', maxlength: '120', required: true, placeholder: 'For example: Laptop for new joiner' })),
     h('label', {}, 'Details', h('textarea', { name: 'description', maxlength: '2000', rows: '4', placeholder: 'Why is this needed? Any links or context for the approver.' })),
     currencyField,
@@ -408,6 +465,360 @@ async function viewInbox() {
     h('div', { class: 'muted small' }, `Risk ${it.riskTier}, group ${it.approverGroup}, raised ${fmtTime(it.createdAt)}`)))));
 }
 
+// ---------- access and user management ----------
+function viewNoAccess() {
+  const disabled = state.me && state.me.status === 'DISABLED';
+  mount(h('section', { class: 'card hero' },
+    h('h1', {}, disabled ? 'Your account is disabled' : 'Your access is not set up yet'),
+    h('p', { class: 'lead' }, disabled
+      ? 'An admin has disabled this account, so requests and approvals are switched off. Contact an admin if you think this is a mistake.'
+      : 'You can sign in, but an admin has not given you a role and modules yet. Ask an admin to set up your access.'),
+    h('button', { class: 'btn', onclick: () => { state.meAt = 0; route(); } }, 'Check again')));
+}
+
+function confirmDialog({ title, body, confirmLabel = 'Confirm', danger = false, typeToConfirm = null }) {
+  const dialog = document.getElementById('confirm');
+  const ok = document.getElementById('confirmOk');
+  const typeWrap = document.getElementById('confirmTypeWrap');
+  const typeInput = document.getElementById('confirmType');
+  document.getElementById('confirmTitle').textContent = title;
+  document.getElementById('confirmBody').textContent = body;
+  ok.textContent = confirmLabel;
+  ok.className = `btn ${danger ? 'danger solid' : 'primary'}`;
+  typeWrap.hidden = !typeToConfirm;
+  typeInput.value = '';
+  if (typeToConfirm) {
+    document.getElementById('confirmTypeLabel').textContent = `Type ${typeToConfirm} to confirm`;
+    ok.disabled = true;
+    typeInput.oninput = () => { ok.disabled = typeInput.value.trim().toLowerCase() !== typeToConfirm.toLowerCase(); };
+  } else {
+    ok.disabled = false;
+  }
+  return new Promise((resolve) => {
+    dialog.addEventListener('close', () => resolve(dialog.returnValue === 'ok'), { once: true });
+    dialog.showModal();
+    (typeToConfirm ? typeInput : ok).focus();
+  });
+}
+
+function initials(user) {
+  const source = (user.name || user.email || '?').trim();
+  const parts = source.split(/[\s@._-]+/).filter(Boolean);
+  return ((parts[0] || '?')[0] + ((parts[1] || '')[0] || '')).toUpperCase();
+}
+
+function avatar(user) {
+  return h('span', { class: 'avatar', 'aria-hidden': 'true' }, initials(user));
+}
+
+function roleBadge(roleId) {
+  if (!roleId) return h('span', { class: 'badge muted' }, 'No role');
+  return h('span', { class: `badge role-${roleId}` }, (ROLES[roleId] || {}).label || roleId);
+}
+
+function accessBadge(status) {
+  return h('span', { class: `badge ${ACCESS_TONE[status] || 'muted'}` }, ACCESS_LABEL[status] || status);
+}
+
+function signInBadge(status) {
+  const [label, tone] = SIGN_IN[status] || [String(status || 'Unknown').replace(/_/g, ' ').toLowerCase(), 'muted'];
+  return h('span', { class: `badge ${tone}` }, label);
+}
+
+function moduleChips(user) {
+  if (user.role === 'admins') return h('span', { class: 'chip strong' }, 'All modules');
+  if (!user.modules || !user.modules.length) return h('span', { class: 'muted small' }, 'None');
+  return h('div', { class: 'chips' }, user.modules.map((m) => h('span', { class: 'chip' }, (MODULES[m] || {}).label || m)));
+}
+
+function stat(label, value, tone = '') {
+  return h('div', { class: `stat ${tone}` }, h('div', { class: 'stat-value' }, String(value)), h('div', { class: 'stat-label' }, label));
+}
+
+async function viewUsers() {
+  if (!isAdmin()) { window.location.hash = '#/mine'; return; }
+  mount(h('p', { class: 'muted' }, 'Loading users...'));
+  const data = await api('/admin/users');
+  const users = data.items || [];
+  const summary = data.summary || {};
+
+  const search = h('input', { type: 'search', placeholder: 'Search by name or email', 'aria-label': 'Search users' });
+  const roleFilter = h('select', { 'aria-label': 'Filter by role' },
+    h('option', { value: '' }, 'All roles'),
+    Object.entries(ROLES).map(([id, r]) => h('option', { value: id }, r.label)));
+  const statusFilter = h('select', { 'aria-label': 'Filter by status' },
+    h('option', { value: '' }, 'Any status'),
+    h('option', { value: 'ACTIVE' }, 'Active'),
+    h('option', { value: 'DISABLED' }, 'Disabled'),
+    h('option', { value: 'NO_PROFILE' }, 'No access set up'),
+    h('option', { value: 'INVITED' }, 'Invite pending'));
+  const tbody = h('tbody');
+  const count = h('span', { class: 'muted small' });
+
+  const paint = () => {
+    const q = search.value.trim().toLowerCase();
+    const shown = users.filter((u) => {
+      if (q && !`${u.name || ''} ${u.email || ''}`.toLowerCase().includes(q)) return false;
+      if (roleFilter.value && u.role !== roleFilter.value) return false;
+      if (statusFilter.value === 'INVITED') return u.cognitoStatus === 'FORCE_CHANGE_PASSWORD';
+      if (statusFilter.value && u.status !== statusFilter.value) return false;
+      return true;
+    });
+    count.textContent = `${shown.length} of ${users.length} users`;
+    tbody.replaceChildren(...(shown.length ? shown.map((u) => h('tr', {
+      class: `clickable${u.status === 'DISABLED' ? ' dim' : ''}`,
+      tabindex: '0',
+      onclick: () => { window.location.hash = `#/users/${u.userId}`; },
+      onkeydown: (ev) => { if (ev.key === 'Enter') window.location.hash = `#/users/${u.userId}`; },
+    },
+    h('td', {}, h('div', { class: 'person' }, avatar(u),
+      h('div', { class: 'person-text' }, h('div', { class: 'title' }, u.name || u.email), u.name ? h('div', { class: 'muted small' }, u.email) : null,
+        h('div', { class: 'row tight' },
+          u.userId === state.me.userId ? h('span', { class: 'chip' }, 'You') : null,
+          h('span', { class: 'mobile-only' }, roleBadge(u.role)))))),
+    h('td', {}, roleBadge(u.role)),
+    h('td', {}, moduleChips(u)),
+    h('td', {}, signInBadge(u.cognitoStatus)),
+    h('td', {}, accessBadge(u.status)),
+    h('td', { class: 'muted small' }, fmtTime(u.updatedAt || u.createdAt))))
+      : [h('tr', {}, h('td', { colspan: '6', class: 'empty' }, 'No users match these filters.'))]));
+  };
+  [search, roleFilter, statusFilter].forEach((el) => el.addEventListener('input', paint));
+
+  mount(
+    h('div', { class: 'section-head' },
+      h('div', {}, h('h2', {}, 'Users'), h('p', { class: 'muted small' }, 'Invite people, choose their role and decide which request modules they can use. Changes apply on their next click, not their next sign-in.')),
+      h('div', { class: 'row' },
+        h('button', { class: 'btn', onclick: () => route() }, 'Refresh'),
+        h('a', { class: 'btn primary', href: '#/users/new' }, 'Invite user'))),
+    h('div', { class: 'stats' },
+      stat('Users', summary.total ?? users.length),
+      stat('Active', summary.active ?? 0, 'ok'),
+      stat('Invites pending', summary.invitesPending ?? 0, 'warn'),
+      stat('Disabled', summary.disabled ?? 0, 'danger'),
+      stat('Admins', summary.admins ?? 0, 'tone-brand')),
+    h('div', { class: 'toolbar' }, search, roleFilter, statusFilter, count),
+    h('div', { class: 'card flush' },
+      h('table', { class: 'table users' },
+        h('thead', {}, h('tr', {}, h('th', {}, 'User'), h('th', {}, 'Role'), h('th', {}, 'Modules'), h('th', {}, 'Sign-in'), h('th', {}, 'Access'), h('th', {}, 'Updated'))),
+        tbody)));
+  paint();
+}
+
+// Role picker and module checkboxes, shared by the invite form and the user page.
+function accessEditor(initial = { role: 'requesters', modules: [] }) {
+  const roleName = `role-${Math.random().toString(36).slice(2, 8)}`;
+  const roleInputs = {};
+  const roleCards = h('div', { class: 'choice-grid roles' }, Object.entries(ROLES).map(([id, r]) => {
+    const input = h('input', { type: 'radio', name: roleName, value: id, checked: initial.role === id });
+    roleInputs[id] = input;
+    return h('label', { class: 'choice' }, input, h('span', { class: 'choice-body' }, h('strong', {}, r.label), h('span', { class: 'muted small' }, r.blurb)));
+  }));
+  const moduleInputs = {};
+  const moduleCards = h('div', { class: 'choice-grid' }, Object.entries(MODULES).map(([id, m]) => {
+    const input = h('input', { type: 'checkbox', value: id, checked: (initial.modules || []).includes(id) });
+    moduleInputs[id] = input;
+    return h('label', { class: 'choice' }, input, h('span', { class: 'choice-body' }, h('strong', {}, m.label), h('span', { class: 'muted small' }, m.blurb)));
+  }));
+  const adminNote = h('p', { class: 'note' }, 'Admins can use every module, so module choices do not apply.');
+  const quick = h('div', { class: 'row small' },
+    h('button', { type: 'button', class: 'linkish', onclick: () => { Object.values(moduleInputs).forEach((i) => { i.checked = true; }); } }, 'Select all'),
+    h('button', { type: 'button', class: 'linkish', onclick: () => { Object.values(moduleInputs).forEach((i) => { i.checked = false; }); } }, 'Clear'));
+
+  const sync = () => {
+    const isAdminRole = roleInputs.admins.checked;
+    moduleCards.classList.toggle('disabled', isAdminRole);
+    Object.values(moduleInputs).forEach((i) => { i.disabled = isAdminRole; });
+    adminNote.hidden = !isAdminRole;
+    quick.hidden = isAdminRole;
+  };
+  Object.values(roleInputs).forEach((i) => i.addEventListener('change', sync));
+  sync();
+
+  return {
+    node: h('div', { class: 'access-editor' },
+      h('h4', {}, 'Role'), roleCards,
+      h('div', { class: 'row spread' }, h('h4', {}, 'Request modules'), quick),
+      moduleCards, adminNote),
+    value() {
+      const roleId = Object.keys(roleInputs).find((id) => roleInputs[id].checked);
+      const modules = Object.keys(moduleInputs).filter((id) => moduleInputs[id].checked);
+      return { role: roleId, modules };
+    },
+    setDisabled(disabled) {
+      Object.values(roleInputs).forEach((i) => { i.disabled = disabled; });
+      if (disabled) Object.values(moduleInputs).forEach((i) => { i.disabled = true; }); else sync();
+    },
+  };
+}
+
+function viewUserNew() {
+  if (!isAdmin()) { window.location.hash = '#/mine'; return; }
+  const editor = accessEditor({ role: 'requesters', modules: ['GENERAL'] });
+  const invite = h('input', { type: 'checkbox', name: 'sendInvite', checked: true });
+  const form = h('form', { class: 'card form' },
+    h('div', { class: 'grid2' },
+      h('label', {}, 'Email', h('input', { name: 'email', type: 'email', required: true, maxlength: '254', placeholder: 'name@company.com', autocomplete: 'off' })),
+      h('label', {}, 'Full name', h('input', { name: 'name', maxlength: '80', placeholder: 'Optional', autocomplete: 'off' }))),
+    editor.node,
+    h('label', { class: 'check' }, invite, h('span', {}, 'Email the invitation now. Cognito sends a temporary password; the person sets a new one and enrols an authenticator app at first sign-in.')),
+    h('div', { class: 'row end' },
+      h('a', { class: 'btn', href: '#/users' }, 'Cancel'),
+      h('button', { class: 'btn primary', type: 'submit' }, 'Invite user')));
+
+  form.addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    const fd = new FormData(form);
+    const access = editor.value();
+    const payload = {
+      email: String(fd.get('email')).trim(),
+      name: String(fd.get('name') || '').trim(),
+      role: access.role,
+      modules: access.role === 'admins' ? [] : access.modules,
+      sendInvite: invite.checked,
+    };
+    if (payload.role !== 'admins' && !payload.modules.length) {
+      const go = await confirmDialog({ title: 'Invite without any module?', body: 'This person will be able to sign in but not raise or approve any request until you grant a module.', confirmLabel: 'Invite anyway' });
+      if (!go) return;
+    }
+    if (payload.role === 'admins') {
+      const go = await confirmDialog({ title: 'Invite a new admin?', body: `${payload.email} will be able to approve anything and manage every user, including you. The ops team is alerted about new admins.`, confirmLabel: 'Invite admin', danger: true });
+      if (!go) return;
+    }
+    const button = form.querySelector('button[type=submit]');
+    button.disabled = true;
+    try {
+      const res = await api('/admin/users', { method: 'POST', body: JSON.stringify(payload) });
+      toast(res.invited ? `Invitation emailed to ${payload.email}` : `${payload.email} created. Send the invitation when they are ready.`, 'ok');
+      window.location.hash = `#/users/${res.user.userId}`;
+    } catch (e) {
+      toast(e.message, 'danger');
+      button.disabled = false;
+    }
+  });
+
+  mount(h('div', { class: 'section-head' },
+    h('div', {}, h('a', { href: '#/users', class: 'muted small' }, 'Back to users'), h('h2', {}, 'Invite a user'))), form);
+}
+
+async function viewUserDetail(userId) {
+  if (!isAdmin()) { window.location.hash = '#/mine'; return; }
+  mount(h('p', { class: 'muted' }, 'Loading user...'));
+  const { user } = await api(`/admin/users/${encodeURIComponent(userId)}`);
+  const isSelf = user.userId === state.me.userId;
+  const invited = user.cognitoStatus === 'FORCE_CHANGE_PASSWORD';
+
+  // Access card
+  const editor = accessEditor({ role: user.role || 'requesters', modules: user.modules || [] });
+  const nameInput = h('input', { value: user.name || '', maxlength: '80', placeholder: 'Full name' });
+  const save = h('button', { class: 'btn primary', type: 'submit' }, user.managed ? 'Save access' : 'Set up access');
+  const accessForm = h('form', { class: 'card form' },
+    h('div', { class: 'row spread' }, h('h3', {}, 'Access'), h('span', { class: 'muted small' }, 'Takes effect on the next click. No sign-out needed.')),
+    !user.managed ? h('p', { class: 'note warn' }, 'This account was created outside Request Hub and has no access profile, so it cannot use the app yet. Choose a role and modules to set it up.') : null,
+    h('label', {}, 'Full name', nameInput),
+    editor.node,
+    isSelf ? h('p', { class: 'note' }, 'You cannot remove your own admin role. Another admin has to do that.') : null,
+    h('div', { class: 'row end' }, save));
+  if (isSelf) editor.setDisabled(true);
+
+  accessForm.addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    const access = editor.value();
+    const payload = { name: nameInput.value.trim() };
+    if (!isSelf) { payload.role = access.role; payload.modules = access.role === 'admins' ? (user.modules || []) : access.modules; }
+    if (user.managed && user.version !== undefined && user.version !== null) payload.version = user.version;
+    if (!isSelf && access.role === 'admins' && user.role !== 'admins') {
+      const go = await confirmDialog({ title: `Make ${user.email} an admin?`, body: 'Admins can approve anything and manage every user. The ops team is alerted about new admins.', confirmLabel: 'Make admin', danger: true });
+      if (!go) return;
+    }
+    save.disabled = true;
+    try {
+      const res = await api(`/admin/users/${encodeURIComponent(user.userId)}`, { method: 'PATCH', body: JSON.stringify(payload) });
+      toast(res.changed ? 'Access saved. It applies immediately.' : 'Nothing changed.', res.changed ? 'ok' : 'info');
+      await viewUserDetail(user.userId);
+    } catch (e) {
+      toast(e.message, 'danger');
+      save.disabled = false;
+    }
+  });
+
+  // Account card with lifecycle actions
+  const act = async (action, opts) => {
+    if (opts.confirm) {
+      const go = await confirmDialog(opts.confirm);
+      if (!go) return;
+    }
+    try {
+      const res = await api(`/admin/users/${encodeURIComponent(user.userId)}/actions`, { method: 'POST', body: JSON.stringify({ action }) });
+      toast(res.message, 'ok');
+      await viewUserDetail(user.userId);
+    } catch (e) {
+      toast(e.message, 'danger');
+    }
+  };
+  const actions = [];
+  if (user.status === 'DISABLED') {
+    actions.push(h('button', { class: 'btn ok', onclick: () => act('ENABLE', {}) }, 'Enable account'));
+  } else if (!isSelf) {
+    actions.push(h('button', { class: 'btn danger', onclick: () => act('DISABLE', { confirm: { title: `Disable ${user.email}?`, body: 'Sign-in is blocked, every session is signed out, and API access stops on their very next click. You can enable the account again later.', confirmLabel: 'Disable', danger: true } }) }, 'Disable account'));
+  }
+  if (invited) {
+    actions.push(h('button', { class: 'btn', onclick: () => act('RESEND_INVITE', { confirm: { title: 'Resend the invitation?', body: `Cognito emails ${user.email} a new temporary password. The old one stops working.`, confirmLabel: 'Resend' } }) }, 'Resend invitation'));
+  } else if (user.cognitoStatus !== 'MISSING') {
+    actions.push(h('button', { class: 'btn', onclick: () => act('RESET_PASSWORD', { confirm: { title: 'Reset the password?', body: `Cognito emails ${user.email} a verification code. They must choose a new password at their next sign-in.`, confirmLabel: 'Reset password' } }) }, 'Reset password'));
+    actions.push(h('button', { class: 'btn', onclick: () => act('RESET_MFA', { confirm: { title: 'Reset the authenticator?', body: 'Use this when someone loses their phone. They are signed out and enrol a new authenticator app at their next sign-in.', confirmLabel: 'Reset authenticator' } }) }, 'Reset authenticator'));
+  }
+  if (user.cognitoStatus !== 'MISSING') {
+    actions.push(h('button', { class: 'btn', onclick: () => act('SIGN_OUT', { confirm: { title: 'Sign out everywhere?', body: 'Revokes every refresh token for this user. They sign in again with their password and authenticator.', confirmLabel: 'Sign out everywhere' } }) }, 'Sign out everywhere'));
+  }
+
+  const account = h('div', { class: 'card' },
+    h('h3', {}, 'Account'),
+    h('dl', { class: 'facts' },
+      field('Sign-in', SIGN_IN[user.cognitoStatus] ? SIGN_IN[user.cognitoStatus][0] : user.cognitoStatus),
+      field('MFA', user.mfa),
+      field('Cognito groups', (user.groups || []).join(', ') || 'None'),
+      field('Created', fmtTime(user.createdAt)),
+      field('Last access change', user.updatedAt ? `${fmtTime(user.updatedAt)}${user.updatedByEmail ? ` by ${user.updatedByEmail}` : ''}` : null),
+      field('User ID', h('span', { class: 'mono small' }, user.userId))),
+    h('div', { class: 'row' }, actions));
+
+  // Danger zone
+  const danger = isSelf ? null : h('div', { class: 'card danger-zone' },
+    h('h3', {}, 'Delete user'),
+    h('p', { class: 'muted small' }, 'Removes the sign-in and the access profile. Their requests and this access history are kept for audit.'),
+    h('button', {
+      class: 'btn danger',
+      onclick: async () => {
+        const go = await confirmDialog({ title: `Delete ${user.email}?`, body: 'This cannot be undone. They lose access immediately, and you would need to invite them again.', confirmLabel: 'Delete user', danger: true, typeToConfirm: user.email });
+        if (!go) return;
+        try {
+          await api(`/admin/users/${encodeURIComponent(user.userId)}`, { method: 'DELETE' });
+          toast(`${user.email} deleted`, 'ok');
+          window.location.hash = '#/users';
+        } catch (e) {
+          toast(e.message, 'danger');
+        }
+      },
+    }, 'Delete user'));
+
+  // History
+  const historyCard = h('div', { class: 'card' }, h('h3', {}, 'Access history'),
+    (user.history || []).length
+      ? h('ol', { class: 'timeline' }, user.history.map((entry) => h('li', {},
+        h('div', { class: 'row spread' }, h('strong', {}, HISTORY_LABEL[entry.action] || entry.action), h('span', { class: 'muted small' }, fmtTime(entry.at))),
+        h('div', {}, entry.summary),
+        h('div', { class: 'muted small' }, `by ${entry.actorEmail || entry.actorId}`))))
+      : h('p', { class: 'muted small' }, 'No changes recorded yet.'));
+
+  mount(
+    h('div', { class: 'section-head' },
+      h('div', {}, h('a', { href: '#/users', class: 'muted small' }, 'Back to users'),
+        h('div', { class: 'person big' }, avatar(user), h('div', {}, h('h2', {}, user.name || user.email), user.name ? h('div', { class: 'muted' }, user.email) : null))),
+      h('div', { class: 'row' }, roleBadge(user.role), accessBadge(user.status), signInBadge(user.cognitoStatus))),
+    h('div', { class: 'split' }, h('div', {}, accessForm), h('div', {}, account, historyCard, danger)));
+}
+
 // ---------- router ----------
 function showError(e) {
   toast(e.message, 'danger');
@@ -422,13 +833,15 @@ function paintChrome() {
     who.replaceChildren();
     return;
   }
-  nav.hidden = false;
+  const active = state.me && state.me.status === 'ACTIVE';
+  nav.hidden = !active;
   document.getElementById('inboxTab').hidden = !isReviewer();
+  document.getElementById('usersTab').hidden = !isAdmin();
   const current = (window.location.hash.split('/')[1] || 'mine');
   nav.querySelectorAll('a').forEach((a) => a.classList.toggle('active', a.dataset.view === current));
   who.replaceChildren(
-    h('span', { class: 'small' }, state.claims.email || ''),
-    ...[...state.groups].map((g) => h('span', { class: 'chip' }, g)),
+    h('span', { class: 'small' }, (state.me && state.me.email) || state.claims.email || ''),
+    role() ? h('span', { class: 'chip' }, (ROLES[role()] || {}).label || role()) : null,
     h('button', { class: 'btn ghost', onclick: signOut }, 'Sign out'));
 }
 
@@ -439,14 +852,20 @@ async function route() {
     viewSignedOut();
     return;
   }
-  paintChrome();
   const parts = window.location.hash.replace(/^#\/?/, '').split('/');
   try {
+    await ensureMe(parts[0] === 'users');
+    paintChrome();
+    if (state.me.status !== 'ACTIVE') { viewNoAccess(); return; }
     if (parts[0] === 'new') viewNew();
     else if (parts[0] === 'inbox') await viewInbox();
     else if (parts[0] === 'requests' && parts[1]) await viewDetail(parts[1]);
+    else if (parts[0] === 'users' && parts[1] === 'new') viewUserNew();
+    else if (parts[0] === 'users' && parts[1]) await viewUserDetail(parts[1]);
+    else if (parts[0] === 'users') await viewUsers();
     else await viewMine();
   } catch (e) {
+    paintChrome();
     showError(e);
   }
 }

@@ -352,6 +352,15 @@ Resources:
           TemporaryPasswordValidityDays: 3
       AdminCreateUserConfig:
         AllowAdminCreateUserOnly: true
+        InviteMessageTemplate:
+          EmailSubject: You are invited to Request Hub
+          EmailMessage: >-
+            Hello,<br><br>An administrator has invited you to Request Hub.<br><br>
+            Sign in with your email address and this temporary password: <b>{####}</b><br><br>
+            At first sign-in you will choose a new password (12+ characters with upper and lower case,
+            a number and a symbol) and scan a QR code with an authenticator app.
+            The temporary password expires in 3 days; ask your admin to resend the invitation if it does.<br><br>
+            Account reference: {username}
       AccountRecoverySetting:
         RecoveryMechanisms:
           - {Name: verified_email, Priority: 1}
@@ -913,6 +922,74 @@ Resources:
         - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
         - arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole
 
+  UserAdminRolePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: Least-privilege permissions for UserAdminRole (user lifecycle in this pool only)
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ManageUsersInThisPool
+            Effect: Allow
+            Action:
+              - cognito-idp:ListUsers
+              - cognito-idp:AdminGetUser
+              - cognito-idp:AdminCreateUser
+              - cognito-idp:AdminDeleteUser
+              - cognito-idp:AdminAddUserToGroup
+              - cognito-idp:AdminRemoveUserFromGroup
+              - cognito-idp:AdminListGroupsForUser
+              - cognito-idp:AdminUpdateUserAttributes
+              - cognito-idp:AdminDisableUser
+              - cognito-idp:AdminEnableUser
+              - cognito-idp:AdminResetUserPassword
+              - cognito-idp:AdminSetUserMFAPreference
+              - cognito-idp:AdminUserGlobalSignOut
+            Resource:
+              - !GetAtt UserPool.Arn
+          - Sid: AccessProfilesAndHistoryOnly
+            Effect: Allow
+            Action:
+              - dynamodb:GetItem
+              - dynamodb:Query
+              - dynamodb:PutItem
+              - dynamodb:DeleteItem
+              - dynamodb:ConditionCheckItem
+            Resource:
+              - !GetAtt RequestsTable.Arn
+            Condition:
+              ForAllValues:StringLike:
+                dynamodb:LeadingKeys: ['USER#*']   # user items only, never request items
+          - Sid: DirectoryIndex
+            Effect: Allow
+            Action:
+              - dynamodb:Query
+            Resource:
+              - !Sub '${RequestsTable.Arn}/index/GSI2'
+          - Sid: PublishAccessEvents
+            Effect: Allow
+            Action:
+              - events:PutEvents
+            Resource:
+              - !Sub arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/default
+
+  UserAdminRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /service-role/
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref UserAdminRolePolicy
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+
   PolicyEngineFunction:
     Type: AWS::Lambda::Function
     Properties:
@@ -1021,6 +1098,29 @@ Resources:
           TABLE_NAME: !Ref RequestsTable
           METRICS_NAMESPACE: RequestHub
           DOWNSTREAM_SECRET_ARN: !Ref DownstreamApiSecret
+
+  UserAdminFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub
+        - '${AWS::StackName}-user-admin-${Suffix}'
+        - Suffix: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]
+      Description: User management for admins - invite, role and module access, disable, reset, delete, history
+      Code: src/user_admin/
+      Handler: app.handler
+      Role: !GetAtt UserAdminRole.Arn
+      Runtime: python3.12
+      Architectures: [x86_64]
+      MemorySize: 256   # playground maximum
+      Timeout: 8        # playground maximum is 10 seconds
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref RequestsTable
+          USER_POOL_ID: !Ref UserPool
+          EVENT_BUS_NAME: default
+          METRICS_NAMESPACE: RequestHub
 
   FulfilmentWorkerMapping:
     Type: AWS::Lambda::EventSourceMapping
@@ -1313,6 +1413,31 @@ Resources:
       ManagedPolicyArns:
         - !Ref EventsToFirehoseRolePolicy
 
+  PrivilegedAccessRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub
+        - '${AWS::StackName}-privileged-access-${Suffix}'
+        - Suffix: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]
+      Description: Alert the ops topic whenever someone is given the admin role
+      EventBusName: default
+      EventPattern:
+        source: [request-hub.identity]
+        detail-type: [User Access Changed]
+        detail:
+          privileged: [true]
+      Targets:
+        - Id: ops-topic
+          Arn: !Ref OpsTopic
+          DeadLetterConfig: {Arn: !GetAtt EventsDlq.Arn}
+          RetryPolicy: {MaximumRetryAttempts: 4, MaximumEventAgeInSeconds: 3600}
+          InputTransformer:
+            InputPathsMap:
+              email: $.detail.email
+              actor: $.detail.actorEmail
+              action: $.detail.action
+            InputTemplate: '"Security notice: <actor> gave <email> the admin role (<action>). Review this in Request Hub > Users if it was not expected."'
+
   AuditRule:
     Type: AWS::Events::Rule
     Properties:
@@ -1400,6 +1525,7 @@ Resources:
             Effect: Allow
             Action:
               - dynamodb:PutItem
+              - dynamodb:ConditionCheckItem   # access check inside the create transaction
             Resource:
               - !GetAtt RequestsTable.Arn
           - Sid: ServeWebApp
@@ -1537,6 +1663,60 @@ Resources:
                 contentType:
                   type: string
                   maxLength: 120
+            CreateUser:
+              type: object
+              required: [email, role]
+              additionalProperties: false
+              properties:
+                email:
+                  type: string
+                  minLength: 5
+                  maxLength: 254
+                  pattern: '^[^@\s]+@[^@\s]+\.[^@\s]+$'
+                name:
+                  type: string
+                  maxLength: 80
+                role:
+                  type: string
+                  enum: [requesters, approvers, admins]
+                modules:
+                  type: array
+                  maxItems: 5
+                  uniqueItems: true
+                  items:
+                    type: string
+                    enum: [PURCHASE, ACCESS, LEAVE, CHANGE, GENERAL]
+                sendInvite:
+                  type: boolean
+            UpdateUser:
+              type: object
+              minProperties: 1
+              additionalProperties: false
+              properties:
+                name:
+                  type: string
+                  maxLength: 80
+                role:
+                  type: string
+                  enum: [requesters, approvers, admins]
+                modules:
+                  type: array
+                  maxItems: 5
+                  uniqueItems: true
+                  items:
+                    type: string
+                    enum: [PURCHASE, ACCESS, LEAVE, CHANGE, GENERAL]
+                version:
+                  type: integer
+                  minimum: 0
+            UserAction:
+              type: object
+              required: [action]
+              additionalProperties: false
+              properties:
+                action:
+                  type: string
+                  enum: [DISABLE, ENABLE, RESET_PASSWORD, RESEND_INVITE, RESET_MFA, SIGN_OUT]
         paths:
           /:
             get:
@@ -1644,7 +1824,9 @@ Resources:
                 uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${QueryApiFunction.Arn}/invocations
                 passthroughBehavior: when_no_match
             post:
-              summary: Create a request (functionless - API Gateway writes straight to DynamoDB)
+              summary: >-
+                Create a request (functionless). API Gateway runs one DynamoDB transaction that checks the
+                caller's live access profile (active, and holds the module or is an admin) and writes the request.
               security:
                 - CognitoAuth: []
               x-amazon-apigateway-request-validator: body
@@ -1657,11 +1839,12 @@ Resources:
               responses:
                 '201': {description: Created}
                 '400': {description: Rejected}
+                '403': {description: No access to this module, or the account is disabled}
                 '500': {description: Error}
               x-amazon-apigateway-integration:
                 type: aws
                 httpMethod: POST
-                uri: !Sub arn:aws:apigateway:${AWS::Region}:dynamodb:action/PutItem
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:dynamodb:action/TransactWriteItems
                 credentials: !GetAtt ApiGatewayServiceRole.Arn
                 passthroughBehavior: never
                 requestTemplates:
@@ -1677,29 +1860,48 @@ Resources:
                     #set($now = $context.requestTimeEpoch)
                     #set($sub = $context.authorizer.claims.sub)
                     {
-                      "TableName": "${RequestsTable}",
-                      "ConditionExpression": "attribute_not_exists(PK)",
-                      "Item": {
-                        "PK": {"S": "REQ#$id"},
-                        "SK": {"S": "META"},
-                        "entity": {"S": "REQUEST"},
-                        "requestId": {"S": "$id"},
-                        "type": {"S": "$b.type"},
-                        "title": {"S": "$util.escapeJavaScript($b.title).replaceAll("\\'", "'")"},
-                        "description": {"S": "$util.escapeJavaScript($description).replaceAll("\\'", "'")"},
-                        "amount": {"N": "$amount"},
-                        "currency": {"S": "$currency"},
-                        "requesterId": {"S": "$sub"},
-                        "requesterEmail": {"S": "$context.authorizer.claims.email"},
-                        "status": {"S": "SUBMITTED"},
-                        "riskTier": {"S": "UNASSESSED"},
-                        "approverGroup": {"S": "none"},
-                        "createdAt": {"N": "$now"},
-                        "GSI1PK": {"S": "USER#$sub"},
-                        "GSI1SK": {"N": "$now"},
-                        "GSI2PK": {"S": "STATUS#SUBMITTED"},
-                        "GSI2SK": {"N": "$now"}
-                      }
+                      "TransactItems": [
+                        {
+                          "ConditionCheck": {
+                            "TableName": "${RequestsTable}",
+                            "Key": {"PK": {"S": "USER#$sub"}, "SK": {"S": "PROFILE"}},
+                            "ConditionExpression": "#st = :active AND (#role = :admins OR contains(#mods, :module))",
+                            "ExpressionAttributeNames": {"#st": "status", "#role": "role", "#mods": "modules"},
+                            "ExpressionAttributeValues": {
+                              ":active": {"S": "ACTIVE"},
+                              ":admins": {"S": "admins"},
+                              ":module": {"S": "$b.type"}
+                            }
+                          }
+                        },
+                        {
+                          "Put": {
+                            "TableName": "${RequestsTable}",
+                            "ConditionExpression": "attribute_not_exists(PK)",
+                            "Item": {
+                              "PK": {"S": "REQ#$id"},
+                              "SK": {"S": "META"},
+                              "entity": {"S": "REQUEST"},
+                              "requestId": {"S": "$id"},
+                              "type": {"S": "$b.type"},
+                              "title": {"S": "$util.escapeJavaScript($b.title).replaceAll("\\'", "'")"},
+                              "description": {"S": "$util.escapeJavaScript($description).replaceAll("\\'", "'")"},
+                              "amount": {"N": "$amount"},
+                              "currency": {"S": "$currency"},
+                              "requesterId": {"S": "$sub"},
+                              "requesterEmail": {"S": "$context.authorizer.claims.email"},
+                              "status": {"S": "SUBMITTED"},
+                              "riskTier": {"S": "UNASSESSED"},
+                              "approverGroup": {"S": "none"},
+                              "createdAt": {"N": "$now"},
+                              "GSI1PK": {"S": "USER#$sub"},
+                              "GSI1SK": {"N": "$now"},
+                              "GSI2PK": {"S": "STATUS#SUBMITTED"},
+                              "GSI2SK": {"N": "$now"}
+                            }
+                          }
+                        }
+                      ]
                     }
                 responses:
                   default:
@@ -1709,7 +1911,16 @@ Resources:
                   '4\d{2}':
                     statusCode: '400'
                     responseTemplates:
-                      application/json: '{"message": "The request could not be stored", "requestId": "$context.requestId"}'
+                      # The first cancellation reason belongs to the access check, so a failure there is a 403.
+                      application/json: |
+                        #set($reason = "$!input.path('$.CancellationReasons[0].Code')")
+                        #set($text = "$!input.path('$.Message')$!input.path('$.message')")
+                        #if($reason == "ConditionalCheckFailed" || $text.contains("[ConditionalCheckFailed"))
+                        #set($context.responseOverride.status = 403)
+                        {"message": "You do not have access to this request module, or your account is disabled. Ask an admin for access.", "requestId": "$context.requestId"}
+                        #else
+                        {"message": "The request could not be stored", "requestId": "$context.requestId"}
+                        #end
                   '5\d{2}':
                     statusCode: '500'
                     responseTemplates:
@@ -1791,6 +2002,128 @@ Resources:
                 httpMethod: POST
                 uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${QueryApiFunction.Arn}/invocations
                 passthroughBehavior: when_no_match
+          /me:
+            get:
+              summary: The caller's live access profile (role, modules, status)
+              security:
+                - CognitoAuth: []
+              responses:
+                '200': {description: OK}
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                httpMethod: POST
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${QueryApiFunction.Arn}/invocations
+                passthroughBehavior: when_no_match
+          /admin/users:
+            get:
+              summary: User directory (admins only)
+              security:
+                - CognitoAuth: []
+              responses:
+                '200': {description: OK}
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                httpMethod: POST
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UserAdminFunction.Arn}/invocations
+                passthroughBehavior: when_no_match
+            post:
+              summary: Invite a user with a role and module access (admins only)
+              security:
+                - CognitoAuth: []
+              x-amazon-apigateway-request-validator: body
+              requestBody:
+                required: true
+                content:
+                  application/json:
+                    schema:
+                      $ref: '#/components/schemas/CreateUser'
+              responses:
+                '201': {description: Created}
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                httpMethod: POST
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UserAdminFunction.Arn}/invocations
+                passthroughBehavior: when_no_match
+          /admin/users/{userId}:
+            get:
+              summary: One user with sign-in details and access history (admins only)
+              security:
+                - CognitoAuth: []
+              parameters:
+                - name: userId
+                  in: path
+                  required: true
+                  schema: {type: string}
+              responses:
+                '200': {description: OK}
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                httpMethod: POST
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UserAdminFunction.Arn}/invocations
+                passthroughBehavior: when_no_match
+            patch:
+              summary: Change a user's name, role or module access (admins only)
+              security:
+                - CognitoAuth: []
+              parameters:
+                - name: userId
+                  in: path
+                  required: true
+                  schema: {type: string}
+              x-amazon-apigateway-request-validator: body
+              requestBody:
+                required: true
+                content:
+                  application/json:
+                    schema:
+                      $ref: '#/components/schemas/UpdateUser'
+              responses:
+                '200': {description: OK}
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                httpMethod: POST
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UserAdminFunction.Arn}/invocations
+                passthroughBehavior: when_no_match
+            delete:
+              summary: Delete a user; their requests and access history are kept (admins only)
+              security:
+                - CognitoAuth: []
+              parameters:
+                - name: userId
+                  in: path
+                  required: true
+                  schema: {type: string}
+              responses:
+                '200': {description: OK}
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                httpMethod: POST
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UserAdminFunction.Arn}/invocations
+                passthroughBehavior: when_no_match
+          /admin/users/{userId}/actions:
+            post:
+              summary: Disable, enable, reset password, resend invitation, reset MFA or sign out everywhere (admins only)
+              security:
+                - CognitoAuth: []
+              parameters:
+                - name: userId
+                  in: path
+                  required: true
+                  schema: {type: string}
+              x-amazon-apigateway-request-validator: body
+              requestBody:
+                required: true
+                content:
+                  application/json:
+                    schema:
+                      $ref: '#/components/schemas/UserAction'
+              responses:
+                '200': {description: OK}
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                httpMethod: POST
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UserAdminFunction.Arn}/invocations
+                passthroughBehavior: when_no_match
 
   ApiDeployment:
     Type: AWS::ApiGateway::Deployment
@@ -1843,6 +2176,14 @@ Resources:
     Properties:
       Action: lambda:InvokeFunction
       FunctionName: !Ref AttachmentPresignerFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*
+
+  UserAdminInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref UserAdminFunction
       Principal: apigateway.amazonaws.com
       SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*
 
@@ -2024,7 +2365,7 @@ Resources:
       Metrics:
         - Id: total
           Label: Errors across functions
-          Expression: SUM([e1, e2, e3, e4, e5])
+          Expression: SUM([e1, e2, e3, e4, e5, e6])
           ReturnData: true
         - Id: e1
           ReturnData: false
@@ -2056,6 +2397,12 @@ Resources:
             Metric: {Namespace: AWS/Lambda, MetricName: Errors, Dimensions: [{Name: FunctionName, Value: !Ref FulfilmentWorkerFunction}]}
             Period: 300
             Stat: Sum
+        - Id: e6
+          ReturnData: false
+          MetricStat:
+            Metric: {Namespace: AWS/Lambda, MetricName: Errors, Dimensions: [{Name: FunctionName, Value: !Ref UserAdminFunction}]}
+            Period: 300
+            Stat: Sum
 
   LambdaInvocationBudgetAlarm:
     Type: AWS::CloudWatch::Alarm
@@ -2073,7 +2420,7 @@ Resources:
       Metrics:
         - Id: busiest
           Label: Busiest function, invocations per hour
-          Expression: MAX([i1, i2, i3, i4, i5])
+          Expression: MAX([i1, i2, i3, i4, i5, i6])
           ReturnData: true
         - Id: i1
           ReturnData: false
@@ -2105,6 +2452,12 @@ Resources:
             Metric: {Namespace: AWS/Lambda, MetricName: Invocations, Dimensions: [{Name: FunctionName, Value: !Ref FulfilmentWorkerFunction}]}
             Period: 3600
             Stat: Sum
+        - Id: i6
+          ReturnData: false
+          MetricStat:
+            Metric: {Namespace: AWS/Lambda, MetricName: Invocations, Dimensions: [{Name: FunctionName, Value: !Ref UserAdminFunction}]}
+            Period: 3600
+            Stat: Sum
 
   Dashboard:
     Type: AWS::CloudWatch::Dashboard
@@ -2134,7 +2487,7 @@ Resources:
             {"type": "metric", "x": 8, "y": 8, "width": 8, "height": 6,
              "properties": {"title": "Lambda invocations per hour vs playground budget", "region": "${AWS::Region}", "stat": "Sum", "period": 3600, "view": "timeSeries",
               "annotations": {"horizontal": [{"label": "Playground deletes function", "value": 300, "color": "#d62728"}, {"label": "Budget alarm", "value": 200, "color": "#ff7f0e"}]},
-              "metrics": [["AWS/Lambda", "Invocations", "FunctionName", "${PolicyEngineFunction}"], ["...", "${QueryApiFunction}"], ["...", "${DecisionHandlerFunction}"], ["...", "${AttachmentPresignerFunction}"], ["...", "${FulfilmentWorkerFunction}"]]}},
+              "metrics": [["AWS/Lambda", "Invocations", "FunctionName", "${PolicyEngineFunction}"], ["...", "${QueryApiFunction}"], ["...", "${DecisionHandlerFunction}"], ["...", "${AttachmentPresignerFunction}"], ["...", "${FulfilmentWorkerFunction}"], ["...", "${UserAdminFunction}"]]}},
             {"type": "metric", "x": 16, "y": 8, "width": 8, "height": 6,
              "properties": {"title": "Queues (fulfilment backlog and dead letters)", "region": "${AWS::Region}", "stat": "Maximum", "period": 60, "view": "timeSeries",
               "metrics": [["AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${FulfilmentQueue.QueueName}"], ["...", "${FulfilmentDlq.QueueName}"], ["...", "${EventsDlq.QueueName}"]]}},

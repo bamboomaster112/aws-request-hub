@@ -1,7 +1,7 @@
 """POST /requests/{requestId}/decision
 
-Checks that the caller may decide (right group, not their own request, still
-pending), then resumes the paused Step Functions execution with the task token
+Checks that the caller may decide (active account, right role, access to the
+request's module, not their own request, still pending), then resumes the paused Step Functions execution with the task token
 stored on the request. Step Functions accepts a token only once, which makes
 double-clicks and races with the SLA timer safe without extra locking.
 """
@@ -40,6 +40,14 @@ def parse_groups(raw):
     return {g.strip() for g in text.replace(",", " ").split() if g.strip()}
 
 
+def load_access(sub):
+    """Live role, modules and status from the PROFILE item that the user admin API maintains."""
+    item = table().get_item(Key={"PK": f"USER#{sub}", "SK": "PROFILE"}, ConsistentRead=True).get("Item")
+    if not item or item.get("status") != "ACTIVE":
+        return None
+    return {"role": item.get("role"), "modules": {str(m) for m in (item.get("modules") or [])}}
+
+
 def response(status, body):
     return {
         "statusCode": status,
@@ -48,10 +56,12 @@ def response(status, body):
     }
 
 
-def authorise(item, sub, groups):
+def authorise(item, sub, groups, modules):
     """Returns an error response, or None when the caller may decide."""
     if item is None:
         return response(404, {"message": "Request not found"})
+    if "admins" not in groups and item.get("type") not in modules:
+        return response(403, {"message": f"You do not have access to the {item.get('type')} module"})
     if item.get("status") not in DECISION_STATUSES:
         return response(409, {"message": f"Request is {item.get('status')}, so it is no longer waiting for a decision"})
     if item.get("requesterId") == sub:
@@ -82,9 +92,12 @@ def _emit_metric(decision):
 def handler(event, _context):
     claims = ((event.get("requestContext") or {}).get("authorizer") or {}).get("claims") or {}
     sub, email = claims.get("sub"), claims.get("email", "")
-    groups = parse_groups(claims.get("cognito:groups"))
     if not sub:
         return response(401, {"message": "Unauthorized"})
+    access = load_access(sub)
+    if access is None:
+        return response(403, {"message": "Your account is disabled or has no access set up yet. Ask an admin for access."})
+    groups, modules = {access["role"]}, access["modules"]
 
     request_id = (event.get("pathParameters") or {}).get("requestId", "")
     try:
@@ -100,7 +113,7 @@ def handler(event, _context):
         return response(400, {"message": "Please add a comment explaining the rejection"})
 
     item = table().get_item(Key={"PK": f"REQ#{request_id}", "SK": "META"}, ConsistentRead=True).get("Item")
-    denied = authorise(item, sub, groups)
+    denied = authorise(item, sub, groups, modules)
     if denied:
         return denied
 

@@ -5,7 +5,7 @@ from unittest import mock
 
 from botocore.exceptions import ClientError
 
-from helpers import load
+from helpers import FakeTable, load, profile
 
 query = load("query_api")
 decision = load("decision_handler")
@@ -43,31 +43,73 @@ class QueryApiTests(unittest.TestCase):
         self.assertEqual(out["policyReasons"], ["a reason"])
 
     def test_can_decide_rules(self):
-        item = {"status": "PENDING_APPROVAL", "requesterId": "alice", "approverGroup": "approvers"}
-        self.assertTrue(query.can_decide(item, "bob", {"approvers"}))
-        self.assertFalse(query.can_decide(item, "alice", {"approvers"}))       # own request
-        self.assertFalse(query.can_decide(item, "bob", {"requesters"}))        # wrong group
-        self.assertTrue(query.can_decide({**item, "approverGroup": "admins"}, "bob", {"admins"}))
-        self.assertFalse(query.can_decide({**item, "status": "APPROVED"}, "bob", {"admins"}))
+        item = {"status": "PENDING_APPROVAL", "requesterId": "alice", "approverGroup": "approvers", "type": "PURCHASE"}
+        mods = {"PURCHASE"}
+        self.assertTrue(query.can_decide(item, "bob", {"approvers"}, mods))
+        self.assertFalse(query.can_decide(item, "alice", {"approvers"}, mods))       # own request
+        self.assertFalse(query.can_decide(item, "bob", {"requesters"}, mods))        # wrong role
+        self.assertFalse(query.can_decide(item, "bob", {"approvers"}, {"LEAVE"}))     # no access to the module
+        self.assertTrue(query.can_decide({**item, "approverGroup": "admins"}, "bob", {"admins"}, set()))  # admins: every module
+        self.assertFalse(query.can_decide({**item, "status": "APPROVED"}, "bob", {"admins"}, mods))
 
     def test_inbox_is_forbidden_for_requesters(self):
-        res = query.handler(api_event(groups="requesters", resource="/approvals"), None)
+        table = FakeTable([profile("user-1")])
+        with mock.patch.object(query, "table", return_value=table):
+            res = query.handler(api_event(groups="requesters", resource="/approvals"), None)
         self.assertEqual(res["statusCode"], 403)
 
     def test_strangers_get_not_found_for_someone_elses_request(self):
-        table = mock.Mock()
-        table.query.return_value = {"Items": [{"PK": "REQ#r1", "SK": "META", "requesterId": "alice", "status": "SUBMITTED"}]}
+        table = FakeTable([profile("mallory")],
+                          query_items=[{"PK": "REQ#r1", "SK": "META", "requesterId": "alice", "status": "SUBMITTED"}])
         with mock.patch.object(query, "table", return_value=table):
             res = query.handler(api_event(sub="mallory", groups="requesters"), None)
         self.assertEqual(res["statusCode"], 404)
 
+    def test_disabled_or_unprovisioned_users_are_refused_immediately(self):
+        for table in (FakeTable([profile("user-1", status="DISABLED")]), FakeTable([])):
+            with mock.patch.object(query, "table", return_value=table):
+                res = query.handler(api_event(resource="/requests"), None)
+            self.assertEqual(res["statusCode"], 403)
+
+    def test_token_groups_are_not_trusted_over_the_live_profile(self):
+        # The token still says approvers, but an admin has since made this user a requester.
+        table = FakeTable([profile("user-1", role="requesters")])
+        with mock.patch.object(query, "table", return_value=table):
+            res = query.handler(api_event(groups="approvers", resource="/approvals"), None)
+        self.assertEqual(res["statusCode"], 403)
+
+    def test_inbox_only_shows_modules_the_approver_holds(self):
+        pending = [
+            {"PK": "REQ#a", "SK": "META", "requestId": "a", "type": "PURCHASE", "status": "PENDING_APPROVAL",
+             "requesterId": "alice", "approverGroup": "approvers"},
+            {"PK": "REQ#b", "SK": "META", "requestId": "b", "type": "ACCESS", "status": "PENDING_APPROVAL",
+             "requesterId": "alice", "approverGroup": "approvers"},
+        ]
+        table = FakeTable([profile("bob", role="approvers", modules=("PURCHASE",))], query_items=pending)
+        with mock.patch.object(query, "table", return_value=table):
+            res = query.handler(api_event(sub="bob", resource="/approvals"), None)
+        self.assertEqual([i["requestId"] for i in json.loads(res["body"])["items"]], ["a"])
+
+    def test_me_reports_live_access(self):
+        with mock.patch.object(query, "table", return_value=FakeTable([profile("user-1", modules=("LEAVE",))])):
+            body = json.loads(query.handler(api_event(resource="/me"), None)["body"])
+        self.assertEqual((body["role"], body["modules"], body["canManageUsers"]), ("requesters", ["LEAVE"], False))
+        with mock.patch.object(query, "table", return_value=FakeTable([profile("user-1", role="admins", modules=())])):
+            body = json.loads(query.handler(api_event(resource="/me"), None)["body"])
+        self.assertEqual(len(body["modules"]), 5)
+        self.assertTrue(body["canManageUsers"])
+        with mock.patch.object(query, "table", return_value=FakeTable([])):
+            body = json.loads(query.handler(api_event(resource="/me"), None)["body"])
+        self.assertEqual(body["status"], "NO_PROFILE")
+
 
 class DecisionHandlerTests(unittest.TestCase):
-    pending = {"status": "PENDING_APPROVAL", "requesterId": "alice", "approverGroup": "approvers", "approvalToken": "tok"}
+    pending = {"PK": "REQ#r1", "SK": "META", "type": "PURCHASE", "status": "PENDING_APPROVAL", "requesterId": "alice",
+               "approverGroup": "approvers", "approvalToken": "tok"}
 
-    def run_handler(self, item, sub="bob", groups="approvers", body=None):
-        table, sfn = mock.Mock(), mock.Mock()
-        table.get_item.return_value = {"Item": item} if item else {}
+    def run_handler(self, item, sub="bob", groups="approvers", body=None, access=None):
+        people = [access or profile(sub, role=groups or "requesters")]
+        table, sfn = FakeTable(people + ([item] if item else [])), mock.Mock()
         with mock.patch.object(decision, "table", return_value=table), mock.patch.object(decision, "sfn", return_value=sfn):
             res = decision.handler(api_event(sub=sub, groups=groups, body=body or {"decision": "APPROVED"},
                                              resource="/requests/{requestId}/decision", method="POST"), None)
@@ -88,13 +130,22 @@ class DecisionHandlerTests(unittest.TestCase):
         res, _ = self.run_handler({**self.pending, "approverGroup": "admins"})
         self.assertEqual(res["statusCode"], 403)
 
+    def test_module_access_is_required(self):
+        res, sfn = self.run_handler(self.pending, access=profile("bob", role="approvers", modules=("LEAVE",)))
+        self.assertEqual(res["statusCode"], 403)
+        sfn.send_task_success.assert_not_called()
+
+    def test_disabled_approver_is_refused(self):
+        res, sfn = self.run_handler(self.pending, access=profile("bob", role="approvers", status="DISABLED"))
+        self.assertEqual(res["statusCode"], 403)
+        sfn.send_task_success.assert_not_called()
+
     def test_rejection_needs_a_comment(self):
         res, _ = self.run_handler(self.pending, body={"decision": "REJECTED", "comment": "  "})
         self.assertEqual(res["statusCode"], 400)
 
     def test_closed_token_becomes_conflict(self):
-        table, sfn = mock.Mock(), mock.Mock()
-        table.get_item.return_value = {"Item": self.pending}
+        table, sfn = FakeTable([self.pending, profile("user-1", role="approvers")]), mock.Mock()
         sfn.send_task_success.side_effect = ClientError({"Error": {"Code": "TaskTimedOut", "Message": "x"}}, "SendTaskSuccess")
         with mock.patch.object(decision, "table", return_value=table), mock.patch.object(decision, "sfn", return_value=sfn):
             res = decision.handler(api_event(groups="approvers", body={"decision": "APPROVED"}, method="POST"), None)
@@ -108,9 +159,16 @@ class PresignerTests(unittest.TestCase):
         self.assertEqual(presigner.safe_file_name(""), "file")
 
     def test_disallowed_type_is_rejected(self):
-        res = presigner.handler(api_event(body={"fileName": "x.exe", "contentType": "application/x-msdownload"},
-                                          method="POST"), None)
+        with mock.patch.object(presigner, "table", return_value=FakeTable([profile("user-1")])):
+            res = presigner.handler(api_event(body={"fileName": "x.exe", "contentType": "application/x-msdownload"},
+                                              method="POST"), None)
         self.assertEqual(res["statusCode"], 400)
+
+    def test_disabled_user_cannot_upload(self):
+        with mock.patch.object(presigner, "table", return_value=FakeTable([profile("user-1", status="DISABLED")])):
+            res = presigner.handler(api_event(body={"fileName": "a.pdf", "contentType": "application/pdf"},
+                                              method="POST"), None)
+        self.assertEqual(res["statusCode"], 403)
 
 
 class WorkerTests(unittest.TestCase):

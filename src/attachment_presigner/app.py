@@ -57,6 +57,14 @@ def parse_groups(raw):
     return {g.strip() for g in text.replace(",", " ").split() if g.strip()}
 
 
+def load_access(sub):
+    """Live role and status from the PROFILE item that the user admin API maintains."""
+    item = table().get_item(Key={"PK": f"USER#{sub}", "SK": "PROFILE"}, ConsistentRead=True).get("Item")
+    if not item or item.get("status") != "ACTIVE":
+        return None
+    return {"role": item.get("role")}
+
+
 def safe_file_name(name):
     base = os.path.basename(str(name or "file"))
     cleaned = re.sub(r"[^A-Za-z0-9._-]", "_", base).strip("._") or "file"
@@ -74,9 +82,12 @@ def response(status, body):
 def handler(event, _context):
     claims = ((event.get("requestContext") or {}).get("authorizer") or {}).get("claims") or {}
     sub, email = claims.get("sub"), claims.get("email", "")
-    groups = parse_groups(claims.get("cognito:groups"))
     if not sub:
         return response(401, {"message": "Unauthorized"})
+    access = load_access(sub)
+    if access is None:
+        return response(403, {"message": "Your account is disabled or has no access set up yet. Ask an admin for access."})
+    groups = {access["role"]}
 
     request_id = (event.get("pathParameters") or {}).get("requestId", "")
     try:

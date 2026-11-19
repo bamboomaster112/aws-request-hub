@@ -40,6 +40,7 @@
 }
 
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 body { margin: 0; background: var(--bg); color: var(--ink); line-height: 1.45; }
 a { color: var(--brand); text-decoration: none; }
 h1, h2, h3 { margin: 0 0 .4rem; line-height: 1.2; }
@@ -69,7 +70,7 @@ main { max-width: 1040px; margin: 1.5rem auto; padding: 0 1.25rem; }
   background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius);
   box-shadow: var(--shadow); padding: 1.25rem; margin-bottom: 1rem;
 }
-.card.flush { padding: 0; overflow: hidden; }
+.card.flush { padding: 0; overflow-x: auto; }
 .card.accent { border-left: 4px solid var(--brand); }
 .card.empty { text-align: center; color: var(--muted); padding: 2.5rem 1rem; }
 .hero { padding: 2.5rem; }
@@ -146,8 +147,95 @@ input:focus, select:focus, textarea:focus { outline: 2px solid var(--brand); out
 .toast.warn { background: var(--warn-bg); color: var(--warn); }
 .toast.danger { background: var(--danger-bg); color: var(--danger); }
 
+/* ---------- user management ---------- */
+h4 { margin: 1rem 0 .5rem; font-size: .8rem; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
+.stats { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: .75rem; margin-bottom: 1rem; }
+.stat { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: .8rem 1rem; box-shadow: var(--shadow); }
+.stat-value { font-size: 1.5rem; font-weight: 700; line-height: 1.1; }
+.stat-label { font-size: .75rem; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; margin-top: .2rem; }
+.stat.ok .stat-value { color: var(--ok); }
+.stat.warn .stat-value { color: var(--warn); }
+.stat.danger .stat-value { color: var(--danger); }
+.stat.tone-brand .stat-value { color: var(--brand); }
+
+.toolbar { display: flex; gap: .6rem; align-items: center; flex-wrap: wrap; margin-bottom: .75rem; }
+.toolbar input[type=search] { flex: 1 1 260px; width: auto; }
+.toolbar select { width: auto; min-width: 150px; }
+.toolbar .muted { margin-left: auto; }
+
+.person { display: flex; align-items: center; gap: .7rem; }
+.person.big h2 { margin: 0; }
+.person-text { min-width: 0; overflow-wrap: break-word; }
+.row.tight { gap: .3rem; margin-top: .2rem; }
+.mobile-only { display: none; }
+.person.big .avatar { width: 46px; height: 46px; font-size: 1rem; }
+.avatar {
+  flex: none; display: grid; place-items: center; width: 34px; height: 34px; border-radius: 50%;
+  background: var(--info-bg); color: var(--info); font-weight: 700; font-size: .8rem; letter-spacing: .5px;
+}
+.chips { display: flex; flex-wrap: wrap; gap: .3rem; }
+.chips .chip, .chip { white-space: nowrap; }
+.chip.strong { background: var(--brand); color: var(--brand-ink); }
+.table.users td { vertical-align: middle; }
+.table td.empty { text-align: center; color: var(--muted); padding: 2rem 1rem; }
+tr.dim td { opacity: .6; }
+.badge.role-admins { background: var(--brand); color: var(--brand-ink); }
+.badge.role-approvers { background: var(--info-bg); color: var(--info); }
+.badge.role-requesters { background: var(--bg); color: var(--ink); border: 1px solid var(--line); }
+
+.choice-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: .6rem; }
+.choice-grid.roles { grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); }
+.form label.choice, label.choice {
+  flex-direction: row; align-items: flex-start; gap: .6rem; margin: 0; padding: .7rem .8rem;
+  border: 1px solid var(--line); border-radius: 10px; cursor: pointer; font-weight: 400; background: var(--surface);
+}
+label.choice:hover { border-color: var(--brand); }
+label.choice:has(input:checked) { border-color: var(--brand); background: color-mix(in srgb, var(--brand) 8%, var(--surface)); }
+label.choice input { width: auto; margin-top: .2rem; accent-color: var(--brand); }
+.choice-body { display: flex; flex-direction: column; gap: .15rem; }
+.choice-grid.disabled label.choice { opacity: .5; cursor: not-allowed; }
+.access-editor { margin-bottom: 1rem; }
+.form label.check { flex-direction: row; align-items: flex-start; gap: .6rem; font-weight: 400; }
+.form label.check input { width: auto; margin-top: .2rem; accent-color: var(--brand); }
+.note { background: var(--info-bg); color: var(--info); border-radius: 9px; padding: .6rem .8rem; font-size: .85rem; margin: .75rem 0; }
+.note.warn { background: var(--warn-bg); color: var(--warn); }
+.linkish { background: none; border: 0; padding: 0; color: var(--brand); font: inherit; font-weight: 600; cursor: pointer; }
+
+.split { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); gap: 1rem; align-items: start; }
+.timeline { list-style: none; margin: 0; padding: 0 0 0 1rem; border-left: 2px solid var(--line); }
+.timeline li { position: relative; padding: 0 0 .9rem .6rem; }
+.timeline li::before {
+  content: ''; position: absolute; left: -1.42rem; top: .35rem; width: 10px; height: 10px; border-radius: 50%;
+  background: var(--surface); border: 2px solid var(--brand);
+}
+.danger-zone { border-color: var(--danger); }
+.btn.danger.solid { background: var(--danger); color: #fff; }
+
+.dialog {
+  border: 1px solid var(--line); border-radius: var(--radius); padding: 1.25rem 1.4rem; max-width: 460px; width: calc(100% - 2rem);
+  background: var(--surface); color: var(--ink); box-shadow: 0 20px 60px rgba(10, 12, 25, .35);
+}
+.dialog::backdrop { background: rgba(10, 12, 25, .45); }
+.dialog p { margin: .25rem 0 1rem; }
+.confirm-type { display: flex; flex-direction: column; gap: .35rem; margin-bottom: .5rem; }
+
+@media (max-width: 900px) {
+  .split { grid-template-columns: 1fr; }
+  .stats { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+
 @media (max-width: 640px) {
   .grid2 { grid-template-columns: 1fr; }
   .who { margin-left: 0; }
   .table th:nth-child(5), .table td:nth-child(5) { display: none; }
+  .mobile-only { display: inline-block; }
+  .person-text { overflow-wrap: anywhere; }
+  .table.users th:nth-child(2), .table.users td:nth-child(2),
+  .table.users th:nth-child(3), .table.users td:nth-child(3),
+  .table.users th:nth-child(4), .table.users td:nth-child(4),
+  .table.users th:nth-child(6), .table.users td:nth-child(6) { display: none; }
+  .tabs { width: 100%; overflow-x: auto; }
+  .tabs a { white-space: nowrap; }
+  .table th, .table td { padding: .65rem .75rem; }
+  .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }

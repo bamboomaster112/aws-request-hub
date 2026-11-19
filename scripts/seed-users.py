@@ -33,21 +33,24 @@ def strong_password(length=20):
 
 def recreate_user(out, email, groups):
     pool = out["UserPoolId"]
-    try:
+    previous = hubkit.user_id_for(out, email)
+    if previous:
+        hubkit.delete_profile(out, previous)
         hubkit.cognito.admin_delete_user(UserPoolId=pool, Username=email)
         print(f"  removed previous {email}")
-    except ClientError as exc:
-        if exc.response["Error"]["Code"] != "UserNotFoundException":
-            raise
-    hubkit.cognito.admin_create_user(
+    created = hubkit.cognito.admin_create_user(
         UserPoolId=pool, Username=email, MessageAction="SUPPRESS",
         UserAttributes=[{"Name": "email", "Value": email}, {"Name": "email_verified", "Value": "true"}],
-    )
+    )["User"]
     for group in groups:
         hubkit.cognito.admin_add_user_to_group(UserPoolId=pool, Username=email, GroupName=group)
     password = strong_password()
     hubkit.cognito.admin_set_user_password(UserPoolId=pool, Username=email, Password=password, Permanent=True)
-    print(f"  created {email} in {', '.join(groups)}")
+    user_id = {a["Name"]: a["Value"] for a in created["Attributes"]}.get("sub", created["Username"])
+    # Test users hold every module so the smoke test can raise any request type.
+    hubkit.put_profile(out, user_id, created["Username"], email, groups[0], hubkit.ALL_MODULES,
+                       name=f"Test {groups[0][:-1]}", actor="seed-users.py")
+    print(f"  created {email} in {', '.join(groups)} with an access profile")
     return password
 
 
@@ -85,8 +88,9 @@ def main():
         print(f"  {role}: MFA enrolled")
     hubkit.save_users(users)
     print(f"Stored credentials (mode 600) in {hubkit.USERS_FILE}")
-    print("For the web app, create your own user (Cognito emails a temporary password and you enrol MFA")
-    print("with your authenticator app):  ./scripts/create-user.sh you@yourdomain.com approvers")
+    print("For the web app, create your own admin (Cognito emails a temporary password and you enrol MFA")
+    print("with your authenticator app):  ./scripts/create-user.sh you@yourdomain.com admins")
+    print("Then invite everyone else from the Users page in the web app.")
 
 
 if __name__ == "__main__":

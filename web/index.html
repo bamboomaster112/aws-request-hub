@@ -19,6 +19,7 @@
       <a href="#/mine" data-view="mine">My requests</a>
       <a href="#/new" data-view="new">New request</a>
       <a href="#/inbox" data-view="inbox" id="inboxTab" hidden>Approvals</a>
+      <a href="#/users" data-view="users" id="usersTab" hidden>Users</a>
     </nav>
     <div class="who" id="who"></div>
   </header>
@@ -29,8 +30,23 @@
 
   <div id="toast" class="toast" role="status" hidden></div>
 
+  <dialog id="confirm" class="dialog" aria-labelledby="confirmTitle">
+    <form method="dialog">
+      <h3 id="confirmTitle"></h3>
+      <p id="confirmBody" class="muted"></p>
+      <label id="confirmTypeWrap" class="confirm-type" hidden>
+        <span id="confirmTypeLabel" class="small"></span>
+        <input id="confirmType" autocomplete="off">
+      </label>
+      <div class="row end">
+        <button class="btn" value="cancel">Cancel</button>
+        <button class="btn primary" id="confirmOk" value="ok">Confirm</button>
+      </div>
+    </form>
+  </dialog>
+
   <footer class="footer">
-    Serverless on AWS: WAF, API Gateway, Cognito, DynamoDB, EventBridge Pipes, Step Functions, SQS, SNS, Firehose, KMS
+    Serverless on AWS: API Gateway, Cognito, DynamoDB, EventBridge, Step Functions, SQS, SNS, Firehose, KMS
   </footer>
 </body>
 </html>

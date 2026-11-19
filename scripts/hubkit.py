@@ -103,6 +103,62 @@ def sign_in(out, user):
     raise RuntimeError(f"Could not sign in {user['username']}")
 
 
+# ---------------- access profiles ----------------
+# Authorisation lives in a PROFILE item per user (role, modules, status). The user admin API
+# maintains it; these helpers exist for bootstrapping the first admin and the test users.
+ALL_MODULES = ["PURCHASE", "ACCESS", "LEAVE", "CHANGE", "GENERAL"]
+ROLES = ("requesters", "approvers", "admins")
+_ddb = session.client("dynamodb")
+
+
+def user_id_for(out, email):
+    """The Cognito sub for an email, or None when the user does not exist."""
+    try:
+        user = cognito.admin_get_user(UserPoolId=out["UserPoolId"], Username=email)
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] == "UserNotFoundException":
+            return None
+        raise
+    attrs = {a["Name"]: a["Value"] for a in user.get("UserAttributes", [])}
+    return attrs.get("sub", user["Username"])
+
+
+def put_profile(out, user_id, username, email, role, modules, name="", actor="cloudshell-script"):
+    """Writes (or overwrites) the access profile plus an access-history entry, atomically."""
+    if role not in ROLES:
+        raise ValueError(f"role must be one of {ROLES}")
+    modules = sorted(set(modules)) if role != "admins" else []
+    unknown = set(modules) - set(ALL_MODULES)
+    if unknown:
+        raise ValueError(f"unknown modules: {', '.join(sorted(unknown))}")
+    now = int(time.time() * 1000)
+    profile = {
+        "PK": {"S": f"USER#{user_id}"}, "SK": {"S": "PROFILE"}, "entity": {"S": "USER_PROFILE"},
+        "userId": {"S": user_id}, "username": {"S": username}, "email": {"S": email}, "name": {"S": name},
+        "role": {"S": role}, "status": {"S": "ACTIVE"}, "version": {"N": "1"},
+        "createdAt": {"N": str(now)}, "createdBy": {"S": actor}, "createdByEmail": {"S": actor},
+        "updatedAt": {"N": str(now)}, "updatedBy": {"S": actor}, "updatedByEmail": {"S": actor},
+        "GSI2PK": {"S": "DIRECTORY#USERS"}, "GSI2SK": {"N": str(now)},
+    }
+    if modules:
+        profile["modules"] = {"SS": modules}
+    what = "every module (admin)" if role == "admins" else (", ".join(modules) or "no modules")
+    audit = {
+        "PK": {"S": f"USER#{user_id}"}, "SK": {"S": f"AUDIT#{now:013d}#{uuid.uuid4().hex[:6]}"},
+        "entity": {"S": "ACCESS_AUDIT"}, "userId": {"S": user_id}, "action": {"S": "ACCESS_SET_UP"},
+        "summary": {"S": f"Provisioned from CloudShell as {role} with {what}"},
+        "actorId": {"S": actor}, "actorEmail": {"S": actor}, "at": {"N": str(now)},
+    }
+    _ddb.transact_write_items(TransactItems=[
+        {"Put": {"TableName": out["TableName"], "Item": profile}},
+        {"Put": {"TableName": out["TableName"], "Item": audit}},
+    ])
+
+
+def delete_profile(out, user_id):
+    _ddb.delete_item(TableName=out["TableName"], Key={"PK": {"S": f"USER#{user_id}"}, "SK": {"S": "PROFILE"}})
+
+
 # ---------------- HTTP ----------------
 def http(method, url, token=None, body=None, headers=None, raw=None):
     data = raw if raw is not None else (json.dumps(body).encode() if body is not None else None)

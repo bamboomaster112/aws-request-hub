@@ -12,8 +12,12 @@ flowchart LR
   waf --> apigw[API Gateway REST<br/>Cognito authorizer, X-Ray]
   cognito[Cognito user pool<br/>TOTP MFA, Plus tier] -. JWT .- user
   apigw -->|GET /, /assets| web[(S3 web bucket)]
-  apigw -->|POST /requests<br/>direct PutItem, no Lambda| ddb[(DynamoDB<br/>single table, PITR, KMS)]
+  apigw -->|POST /requests<br/>access check + write in one<br/>DynamoDB transaction, no Lambda| ddb[(DynamoDB<br/>single table, PITR, KMS)]
   apigw --> q[Lambda query-api]
+  apigw -->|/admin/users| ua[Lambda user-admin]
+  ua -->|invite, groups, disable,<br/>reset, sign out| cognito
+  ua -->|access profiles + history| ddb
+  ua -->|User Access Changed| bus
   apigw --> d[Lambda decision-handler]
   apigw --> p[Lambda attachment-presigner]
   p -. presigned POST .-> att[(S3 attachments)]
@@ -27,21 +31,48 @@ flowchart LR
   bus -->|approved| sqs[[SQS fulfilment + DLQ]]
   sqs --> w[Lambda fulfilment-worker]
   w --> sm[(Secrets Manager)]
-  bus -->|status changes| sns[SNS topics<br/>approvals, updates, ops]
+  bus -->|status changes,<br/>new admins| sns[SNS topics<br/>approvals, updates, ops]
   bus -->|all events| fh[Kinesis Data Firehose] --> audit[(S3 audit lake<br/>gzip, date partitions)]
   cw[CloudWatch dashboard, alarms,<br/>EMF metrics, X-Ray] -.-> sns
 ```
 
 ### The flow, in one paragraph
 
-A signed-in user submits a request. API Gateway validates the JSON against a schema and writes it **straight into DynamoDB** (no Lambda). DynamoDB Streams feeds **EventBridge Pipes** (or, where Pipes is blocked, a small batched Lambda), which turns the change into a clean `Request Submitted` domain event on EventBridge and starts a **Step Functions** workflow (through a rule in Pipes mode, or directly from the Lambda, with the request ID as an idempotent execution name): a small policy engine reads the rules from Parameter Store and decides the risk tier. Low risk is auto-approved. Otherwise the workflow uses the **AWS SDK integration with `.waitForTaskToken`** to store a task token on the request and pause. Approvers get an SNS email; when one decides in the web app, a Lambda checks they are allowed (right group, not their own request) and calls `SendTaskSuccess`. If nobody decides before the SLA, the workflow escalates to admins, then expires the request. Every status change is itself a DynamoDB write, so Pipes turns it into a `Request Status Changed` event that EventBridge routes to SNS (notifications), SQS (fulfilment) and Firehose (audit lake).
+A signed-in user submits a request. API Gateway validates the JSON against a schema and runs one **DynamoDB transaction** (no Lambda): a condition check on the caller's access profile (account active, and the request's module granted) plus the write of the request. DynamoDB Streams feeds **EventBridge Pipes** (or, where Pipes is blocked, a small batched Lambda), which turns the change into a clean `Request Submitted` domain event on EventBridge and starts a **Step Functions** workflow (through a rule in Pipes mode, or directly from the Lambda, with the request ID as an idempotent execution name): a small policy engine reads the rules from Parameter Store and decides the risk tier. Low risk is auto-approved. Otherwise the workflow uses the **AWS SDK integration with `.waitForTaskToken`** to store a task token on the request and pause. Approvers get an SNS email; when one decides in the web app, a Lambda checks they are allowed (active account, right role, access to the module, not their own request) and calls `SendTaskSuccess`. If nobody decides before the SLA, the workflow escalates to admins, then expires the request. Every status change is itself a DynamoDB write, so Pipes turns it into a `Request Status Changed` event that EventBridge routes to SNS (notifications), SQS (fulfilment) and Firehose (audit lake).
+
+## User management and module access
+
+Admins manage people from the **Users** page of the web app: invite someone, choose their role, tick the request modules they may use, and later change, disable, reset or delete them. Everything an admin does is recorded in the user's access history.
+
+**Roles** (one per user, mirrored into the Cognito group of the same name):
+
+| Role | Can do |
+| --- | --- |
+| Requester | Raise and track requests in the modules they hold |
+| Approver | Everything a requester can, plus approve requests in the modules they hold |
+| Admin | Approve anything, resolve escalations, manage users; every module is included |
+
+**Modules** are the request types: Purchasing, Access management, Leave, Change management and General requests. A module grants the right to raise that kind of request and, for approvers, to see and decide it.
+
+**Where it is enforced.** Identity (password, MFA, sign-in) stays in Cognito. Authorisation lives in a `PROFILE` item per user in DynamoDB (role, modules, status), and every path checks that live item on every call, so a grant, a revocation or a disabled account takes effect on the user's next click instead of when their one-hour token expires:
+
+| Path | Check |
+| --- | --- |
+| `POST /requests` (no Lambda) | `TransactWriteItems`: a `ConditionCheck` on the profile (`status = ACTIVE AND (role = admins OR contains(modules, type))`) and the `Put` of the request succeed or fail together; a failed check is mapped to 403 in the response template |
+| Inbox, request detail, decisions | The query and decision Lambdas read the profile: approvers only see and decide requests in their modules |
+| Attachments, my requests | Refused for a disabled or unprovisioned account |
+| `/admin/users*` | Only an active admin, read from the profile rather than the token, so a demoted admin loses access at once |
+
+**Admin actions:** invite (with or without the email), change name, role and modules (optimistic locking, so two admins cannot overwrite each other), disable and enable (Cognito sign-in blocked, sessions revoked, API refused), reset password, resend the invitation, reset a lost authenticator, sign out everywhere, and delete (the user's requests and history are kept).
+
+**Guardrails:** admins cannot disable, delete or demote themselves, and the last active admin cannot be removed. Each change writes the profile and a history item in one transaction and publishes a `User Access Changed` event; the audit lake keeps a copy, and an EventBridge rule emails the ops topic whenever someone is made an admin. The user-admin Lambda's IAM policy is scoped to `USER#` items with `dynamodb:LeadingKeys`, so it cannot touch requests.
 
 ## AWS services used
 
 | Area | Services |
 | --- | --- |
 | Edge and identity | Amazon API Gateway (REST), Amazon Cognito (Plus tier, TOTP MFA), AWS WAF (when the account allows it) |
-| Compute and orchestration | AWS Lambda (5 or 6 small functions), AWS Step Functions (Standard, SDK integration with task tokens) |
+| Compute and orchestration | AWS Lambda (6 or 7 small functions), AWS Step Functions (Standard, SDK integration with task tokens) |
 | Events and messaging | Amazon EventBridge (rules on the default bus), EventBridge Pipes (when allowed), Amazon SQS (queue + 2 DLQs), Amazon SNS (3 topics, email) |
 | Data | Amazon DynamoDB (single table, Streams, PITR, 2 GSIs), Amazon S3 (web, attachments, audit lake), Amazon Data Firehose |
 | Security and config | AWS KMS (customer managed key), AWS Secrets Manager, AWS Systems Manager Parameter Store, AWS IAM |
@@ -95,10 +126,11 @@ Options for `deploy.sh`:
 | `WITH_PIPELINE` | `true` | Deploys the CodePipeline/CodeBuild stack |
 | `WITH_GOVERNANCE` | `false` | Deploys CloudTrail and AWS Config rules |
 
-To use the web app yourself, create a real user and follow the emailed temporary password:
+To use the web app yourself, bootstrap the first admin from CloudShell and follow the emailed temporary password. After that, invite and manage everyone else from the **Users** page:
 
 ```bash
-./scripts/create-user.sh you@yourdomain.com approvers
+./scripts/create-user.sh you@yourdomain.com admins
+./scripts/create-user.sh ana@yourdomain.com approvers PURCHASE,ACCESS   # optional: more users from the CLI
 ```
 
 ## Demo script
@@ -111,7 +143,8 @@ To use the web app yourself, create a real user and follow the emailed temporary
 6. **Failure handling.** Raise a GENERAL request for 50 with `[fail]` in the title. Fulfilment fails three times, the message lands in the DLQ, and the DLQ alarm fires.
 7. **Security at the edge.** Call the API without a token (401) or with an invalid body (400). Where WAF is allowed, `' UNION SELECT` in a title or `<script>` in a description gets a 403.
 8. **Audit lake.** A minute later, browse `s3://request-hub-audit-.../events/year=/month=/day=/` (gzip files of raw EventBridge events).
-9. **Operations.** Open the `request-hub-operations-...` CloudWatch dashboard, including the Lambda budget widget against the 300 per hour line.
+9. **User management.** As an admin, open **Users**, invite someone, and untick a module for an existing requester. Their next attempt to raise that kind of request is refused with 403, without signing out. Disable them and their open session stops working; enable them and it works again. The user page shows every change in the access history, and making someone an admin emails the ops topic.
+10. **Operations.** Open the `request-hub-operations-...` CloudWatch dashboard, including the Lambda budget widget against the 300 per hour line.
 
 `python3 scripts/smoke-test.py --escalation --dlq --audit` runs all of these automatically.
 
@@ -123,6 +156,8 @@ Live KodeKloud AWS Playground session, 18 Nov 2026 (us-east-1, WAF and Pipes blo
 * CI/CD: a release through S3, EventBridge, CodePipeline V2 and CodeBuild ran Source, Test (unit tests, cfn-lint, Bandit, JavaScript check) and Deploy successfully.
 * Full deploy from an empty account: about 8 minutes (core, web app and CI/CD stacks).
 
+**User management (added 19 Nov 2026, after that session ended):** covered by 26 new unit tests (57 in total), cfn-lint, the create and error mapping templates rendered with Apache Velocity 1.7 (the access check, the 403 mapping and the escaping), and the admin screens driven in headless Chrome against a mock API. The smoke test has 13 new live checks for it (revoke a module and see the same token refused, disable and enable, history, self-protection, create and delete); they have not run in a playground yet.
+
 ## CI/CD
 
 `./scripts/release.sh` zips the current commit into the pipeline's source bucket. S3 emits an `Object Created` event, an EventBridge rule starts **CodePipeline V2**, the **Test** stage runs unit tests, `cfn-lint`, Bandit SAST and a JavaScript syntax check, and the **Deploy** stage publishes the web app. Infrastructure changes stay with `deploy.sh`, which keeps every pipeline run well inside the 15-minute limit.
@@ -132,8 +167,8 @@ Live KodeKloud AWS Playground session, 18 Nov 2026 (us-east-1, WAF and Pipes blo
 ```
 template.yaml                      core stack, plain CloudFormation packaged by the SAM CLI (about 90 resources)
 statemachine/approval-workflow.asl.json
-src/<function>/app.py              policy_engine, query_api, decision_handler,
-                                   attachment_presigner, fulfilment_worker, stream_publisher
+src/<function>/app.py              policy_engine, query_api, decision_handler, attachment_presigner,
+                                   fulfilment_worker, stream_publisher, user_admin
 web/                               single-page app (no framework, no build step)
 pipeline/                          cicd.yaml + buildspecs
 governance/governance.yaml         CloudTrail + AWS Config rules
@@ -148,8 +183,10 @@ tests/                             unit tests for handlers, policy and workflow 
 | --- | --- | --- | --- | --- |
 | Request | `REQ#<id>` | `META` | `USER#<sub>` / createdAt | `STATUS#<status>` / createdAt |
 | Attachment | `REQ#<id>` | `ATT#<attachmentId>` | | |
+| Access profile | `USER#<sub>` | `PROFILE` | | `DIRECTORY#USERS` / createdAt |
+| Access history | `USER#<sub>` | `AUDIT#<epoch ms>#<rand>` | | |
 
-Rule that keeps the event stream clean: **every write to a META item is a status transition**. Attachments are child items, so uploading a file never re-sends an approval email.
+Rule that keeps the event stream clean: **every write to a META item is a status transition**. Attachments are child items, so uploading a file never re-sends an approval email. Profile and history items never reach the workflow either, because the stream consumer only accepts `SK = META`.
 
 ## Teardown
 

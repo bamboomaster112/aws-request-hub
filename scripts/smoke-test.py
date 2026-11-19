@@ -174,6 +174,47 @@ def main():
                                    {"fileName": "x.txt", "contentType": "text/plain"})
         check("Someone else cannot attach files to the request (404)", status == 404, status)
 
+    section("User management and module access")
+    admin_api = f"{hub.api}/admin/users"
+    status, _ = hubkit.http("GET", admin_api, tok["requester"])
+    check("A requester cannot open user management (403)", status == 403, status)
+    status, body = hubkit.http("GET", admin_api, tok["admin"])
+    emails = {u.get("email") for u in (body or {}).get("items", [])} if status == 200 else set()
+    check("Admin lists the directory (Cognito + access profiles)", users["requester"]["username"] in emails, f"{status}")
+    status, me = hubkit.http("GET", f"{hub.api}/me", tok["requester"])
+    rid = (me or {}).get("userId") if status == 200 else None
+    check("GET /me returns the live role and modules", status == 200 and "LEAVE" in (me or {}).get("modules", []), f"{status} {me}")
+    if rid:
+        user_api = f"{admin_api}/{rid}"
+        keep = [m for m in hubkit.ALL_MODULES if m != "LEAVE"]
+        status, body = hubkit.http("PATCH", user_api, tok["admin"], {"modules": keep})
+        check("Admin revokes the Leave module (200)", status == 200, f"{status} {body}")
+        status, body = hub.create(tok["requester"], type="LEAVE", title="Smoke test: blocked leave", amount=1)
+        check("Revocation applies at once: same token, Leave request refused (403)", status == 403, f"{status} {body}")
+        status, body = hubkit.http("PATCH", user_api, tok["admin"], {"modules": hubkit.ALL_MODULES})
+        check("Admin grants it back (200)", status == 200, f"{status} {body}")
+        status, body = hubkit.http("POST", f"{user_api}/actions", tok["admin"], {"action": "DISABLE"})
+        check("Admin disables the requester (200)", status == 200, f"{status} {body}")
+        status, _ = hubkit.http("GET", f"{hub.api}/requests", tok["requester"])
+        check("A disabled user's still-valid token is refused (403)", status == 403, status)
+        status, body = hubkit.http("POST", f"{user_api}/actions", tok["admin"], {"action": "ENABLE"})
+        status2, _ = hubkit.http("GET", f"{hub.api}/requests", tok["requester"])
+        check("Enabling restores access (200)", status == 200 and status2 == 200, f"{status} {status2}")
+        status, detail = hubkit.http("GET", user_api, tok["admin"])
+        actions = [h.get("action") for h in (detail or {}).get("user", {}).get("history", [])] if status == 200 else []
+        check("Every change is in the user's access history", {"ACCESS_CHANGED", "DISABLE", "ENABLE"} <= set(actions), actions[:6])
+    status, me_admin = hubkit.http("GET", f"{hub.api}/me", tok["admin"])
+    status, body = hubkit.http("POST", f"{admin_api}/{(me_admin or {}).get('userId')}/actions", tok["admin"], {"action": "DISABLE"})
+    check("Admins cannot disable themselves (400)", status == 400, f"{status} {body}")
+    temp = f"smoke-{int(time.time())}@example.com"
+    status, body = hubkit.http("POST", admin_api, tok["admin"],
+                               {"email": temp, "role": "requesters", "modules": ["GENERAL"], "sendInvite": False})
+    new_id = ((body or {}).get("user") or {}).get("userId") if status == 201 else None
+    check("Admin creates a user without sending email (201)", bool(new_id), f"{status} {body}")
+    if new_id:
+        status, _ = hubkit.http("DELETE", f"{admin_api}/{new_id}", tok["admin"])
+        check("Admin deletes that user (200)", status == 200, status)
+
     if args.escalation:
         section("SLA escalation (waits for the approval timer)")
         status, body = hub.create(tok["requester"], type="ACCESS", title="Smoke test: escalation drill", amount=1)
