@@ -175,12 +175,11 @@ Live KodeKloud AWS Playground session, 18 Nov 2026 (us-east-1, WAF and Pipes blo
 * CI/CD: a release through S3, EventBridge, CodePipeline V2 and CodeBuild ran Source, Test (unit tests, cfn-lint, Bandit, JavaScript check) and Deploy successfully.
 * Full deploy from an empty account: about 8 minutes (core, web app and CI/CD stacks).
 
-**User management, forms, workflows and hierarchy (added 19 Nov 2026, after that session ended)** have not run in a playground yet. They are covered by:
+**User management, forms, workflows and hierarchy** were verified in a fresh playground session on 19 Nov 2026 (us-east-1, WAF and Pipes blocked again):
 
-* 87 unit tests (policy plans, intake validation, decisions, inbox, admin API rules) and cfn-lint, which also validates the state machine definition.
-* `python3 tests/local_e2e.py`: **32 of 32** end-to-end checks with the real handlers, moto standing in for DynamoDB (which evaluates every update and condition expression) and a small interpreter running the state machine level by level, including escalation, expiry, rejection and the "nobody eligible" case.
-* The screens driven in headless Chrome against a mock API.
-* `scripts/smoke-test.py`, rewritten for the new model (47 live checks), ready for the next playground session.
+* Clean deploy of the core and CI/CD stacks, with `seed-config.py` writing 4 approver groups, 5 versioned forms and 5 workflows.
+* `python3 scripts/smoke-test.py --escalation --dlq --audit`: **45 of 45 checks passed in 534 seconds** (the WAF check is skipped when WAF is blocked). Covered: setup through the admin API, schema and per-field form validation, no auto-approval without a grant, an admin-granted limit (within it auto-approved and fulfilled, above it back to the chain), the two-level chain (line manager, then Finance) with the requester, an admin jumping the chain and the manager approving twice all refused (403), the approver's own request going to their manager, hierarchy guardrails (loops, a Requester as manager, demoting someone with reports), immediate module revocation and disablement on a still-valid token, access history, presigned S3 attachments, SLA escalation, the fulfilment DLQ and the audit lake.
+* Before that session the same code was covered by 88 unit tests, cfn-lint, `python3 tests/local_e2e.py` (**32 of 32** checks with moto and a small state machine interpreter) and the screens driven in headless Chrome against a mock API.
 
 ## CI/CD
 
