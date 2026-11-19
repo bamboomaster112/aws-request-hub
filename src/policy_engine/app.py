@@ -28,6 +28,8 @@ MANAGER_ROLES = ("approvers", "admins")
 DEFAULT_WORKFLOW = {"levels": [{"kind": "MANAGER", "minAmount": 0}]}
 CACHE_SECONDS = 60
 MIN_TIMER_SECONDS = 60
+MODULE_LABELS = {"PURCHASE": "Purchasing", "ACCESS": "Access management", "LEAVE": "Leave",
+                 "CHANGE": "Change management", "GENERAL": "General"}
 
 _clients = {}
 _cache = {"defaults": None, "loaded_at": 0.0}
@@ -83,7 +85,7 @@ def auto_approval(rule, requester, amount, now_ms):
         return None
     if amount > _num(rule.get("maxAmount"), -1):
         return None
-    return (f"Auto-approved: an admin allowed {requester.get('email')} to self-approve {rule.get('module')} requests "
+    return (f"Auto-approved: an admin allowed {requester.get('email')} to self-approve {MODULE_LABELS.get(rule.get('module'), rule.get('module'))} requests "
             f"up to {_fmt(rule.get('maxAmount'))} until {rule.get('expiresOn')}; this one is {_fmt(amount)}")
 
 

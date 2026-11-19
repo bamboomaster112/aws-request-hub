@@ -181,10 +181,10 @@ async function viewNew() {
     if (!current) { formHost.replaceChildren(h('p', { class: 'muted' }, 'Choose a module to see its form.')); return; }
     const form = current;
     const key = newKey();
-    const title = h('input', { name: 'title', minlength: '3', maxlength: '120', required: true, placeholder: 'A short summary approvers will see first' });
+    const title = h('input', { id: 'request-title', name: 'title', minlength: '3', maxlength: '120', required: true, placeholder: 'A short summary approvers will see first' });
     const titleError = h('span', { class: 'field-error', role: 'alert' });
     const hasAmount = form.fields.some((f) => f.type === 'amount');
-    const currency = h('select', { 'aria-label': 'Currency' }, CURRENCIES.map((c) => h('option', { value: c }, c)));
+    const currency = h('select', { id: 'request-currency' }, CURRENCIES.map((c) => h('option', { value: c }, c)));
     const inputs = form.fields.map((f) => renderField(f));
     const approvalInput = inputs.find((i) => i.key === form.approvalField);
     const approvalLabel = (form.fields.find((f) => f.key === form.approvalField) || {}).label;
@@ -212,8 +212,8 @@ async function viewNew() {
     const submit = h('button', { class: 'btn primary', type: 'submit' }, 'Submit request');
     const el = h('form', { class: 'card form', novalidate: true },
       h('div', { class: 'row spread' }, h('h3', {}, form.label), h('span', { class: 'muted small' }, `Form version ${form.version}`)),
-      h('div', { class: 'dyn-field' }, h('label', {}, 'Title', h('span', { class: 'req' }, ' *')), title, titleError),
-      hasAmount ? h('div', { class: 'dyn-field narrow' }, h('label', {}, 'Currency'), currency) : null,
+      h('div', { class: 'dyn-field' }, h('label', { for: 'request-title' }, 'Title', h('span', { class: 'req' }, ' *')), title, titleError),
+      hasAmount ? h('div', { class: 'dyn-field narrow' }, h('label', { for: 'request-currency' }, 'Currency'), currency) : null,
       h('div', { class: 'dyn-grid' }, inputs.map((i) => i.node)),
       h('div', { class: 'route-box' },
         h('h4', {}, approvalLabel ? `Approval route (depends on ${approvalLabel})` : 'Approval route'),
@@ -259,7 +259,8 @@ function chainPanel(it) {
   const plan = it.approvalPlan || {};
   const levels = plan.levels || [];
   const decisions = Object.fromEntries((it.approvals || []).map((a) => [Number(a.level), a]));
-  if (it.status === 'AUTO_APPROVED') {
+  // Auto-approved requests have no levels; after fulfilment the status moves on but the decision stays.
+  if (it.status === 'AUTO_APPROVED' || it.decidedBy === 'policy-engine') {
     return h('div', { class: 'card' }, h('h3', {}, 'Approval'),
       h('p', { class: 'note ok' }, 'Approved automatically under an auto-approval rule an admin granted to the requester.'));
   }
@@ -268,7 +269,8 @@ function chainPanel(it) {
       h('p', { class: 'note warn' }, 'Nobody was eligible to approve this request, so it stopped. An admin needs to fix the reporting line or approver groups; then raise it again.'));
   }
   if (!levels.length) {
-    return h('div', { class: 'card' }, h('h3', {}, 'Approval'), h('p', { class: 'muted' }, 'Working out the approval route...'));
+    return h('div', { class: 'card' }, h('h3', {}, 'Approval'), h('p', { class: 'muted' }, it.status === 'SUBMITTED'
+      ? 'Working out the approval route...' : 'No approval route was recorded for this request.'));
   }
   const current = Number(it.currentLevel || 0);
   const open = ['PENDING_APPROVAL', 'ESCALATED'].includes(it.status);
@@ -340,7 +342,7 @@ async function viewDetail(requestId, attempt = 0) {
 }
 
 function decisionPanel(it) {
-  const comment = h('textarea', { rows: '3', maxlength: '500', placeholder: 'Add a note (required when rejecting)' });
+  const comment = h('textarea', { rows: '3', maxlength: '500', 'aria-label': 'Decision note', placeholder: 'Add a note (required when rejecting)' });
   const decide = async (decision, buttons) => {
     buttons.forEach((b) => { b.disabled = true; });
     try {
