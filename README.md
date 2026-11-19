@@ -1,6 +1,6 @@
 # Request Hub: a cloud-native request and approval platform on AWS
 
-An industry-agnostic, event-driven platform for anything that needs a "yes" before it happens: purchases, access, leave, production changes, or a general request. Policy rules auto-approve low-risk requests, route the rest to the right approvers, escalate when an SLA is missed, and fulfil approved work automatically, with a full audit trail.
+An industry-agnostic, event-driven platform for anything that needs a "yes" before it happens: purchases, access, leave, production changes, or a general request. Admins design each module's form, its approval levels and the org hierarchy in the web app. Every request follows the requester's reporting line and the approver groups its value calls for, escalates when an SLA is missed, and is fulfilled automatically once approved, with a full audit trail. Nothing is auto-approved unless an admin grants a person auto-approval, up to a limit and until a date.
 
 It is built to run inside the **KodeKloud AWS Playground** (3-hour sessions, us-east-1), so every design choice respects its limits. One command deploys it from AWS CloudShell.
 
@@ -12,12 +12,13 @@ flowchart LR
   waf --> apigw[API Gateway REST<br/>Cognito authorizer, X-Ray]
   cognito[Cognito user pool<br/>TOTP MFA, Plus tier] -. JWT .- user
   apigw -->|GET /, /assets| web[(S3 web bucket)]
-  apigw -->|POST /requests<br/>access check + write in one<br/>DynamoDB transaction, no Lambda| ddb[(DynamoDB<br/>single table, PITR, KMS)]
-  apigw --> q[Lambda query-api]
-  apigw -->|/admin/users| ua[Lambda user-admin]
+  apigw -->|POST /requests| ri[Lambda request-intake<br/>access check, form validation]
+  ri --> ddb[(DynamoDB<br/>single table, PITR, KMS)]
+  apigw -->|/me, /forms, inbox, detail| q[Lambda query-api]
+  apigw -->|/admin/*| ua[Lambda admin API<br/>users, hierarchy, forms,<br/>workflows, groups, auto-approval]
   ua -->|invite, groups, disable,<br/>reset, sign out| cognito
-  ua -->|access profiles + history| ddb
-  ua -->|User Access Changed| bus
+  ua -->|profiles, config, history| ddb
+  ua -->|access and config events| bus
   apigw --> d[Lambda decision-handler]
   apigw --> p[Lambda attachment-presigner]
   p -. presigned POST .-> att[(S3 attachments)]
@@ -25,8 +26,9 @@ flowchart LR
   pipes --> bus{{EventBridge<br/>default bus}}
   bus -->|Request Submitted| sfn[Step Functions<br/>approval workflow]
   sfn --> pe[Lambda policy-engine]
-  pe --> ssm[(SSM Parameter Store<br/>policy rules)]
-  sfn -->|waitForTaskToken<br/>SDK integration| ddb
+  pe -->|rules, workflow,<br/>hierarchy, groups| ddb
+  pe --> ssm[(SSM Parameter Store<br/>global timers)]
+  sfn -->|Map over levels:<br/>waitForTaskToken per level| ddb
   d -->|SendTaskSuccess| sfn
   bus -->|approved| sqs[[SQS fulfilment + DLQ]]
   sqs --> w[Lambda fulfilment-worker]
@@ -38,41 +40,49 @@ flowchart LR
 
 ### The flow, in one paragraph
 
-A signed-in user submits a request. API Gateway validates the JSON against a schema and runs one **DynamoDB transaction** (no Lambda): a condition check on the caller's access profile (account active, and the request's module granted) plus the write of the request. DynamoDB Streams feeds **EventBridge Pipes** (or, where Pipes is blocked, a small batched Lambda), which turns the change into a clean `Request Submitted` domain event on EventBridge and starts a **Step Functions** workflow (through a rule in Pipes mode, or directly from the Lambda, with the request ID as an idempotent execution name): a small policy engine reads the rules from Parameter Store and decides the risk tier. Low risk is auto-approved. Otherwise the workflow uses the **AWS SDK integration with `.waitForTaskToken`** to store a task token on the request and pause. Approvers get an SNS email; when one decides in the web app, a Lambda checks they are allowed (active account, right role, access to the module, not their own request) and calls `SendTaskSuccess`. If nobody decides before the SLA, the workflow escalates to admins, then expires the request. Every status change is itself a DynamoDB write, so Pipes turns it into a `Request Status Changed` event that EventBridge routes to SNS (notifications), SQS (fulfilment) and Firehose (audit lake).
+A signed-in user picks a module and fills in that module's form. The **request-intake** Lambda checks their live access profile (account active, module granted) and validates every field against the module's current form version, then stores the request with a snapshot of the fields. DynamoDB Streams feeds **EventBridge Pipes** (or, where Pipes is blocked, a small batched Lambda), which turns the change into a `Request Submitted` event and starts a **Step Functions** workflow with the request ID as an idempotent execution name. The **policy engine** auto-approves only under an admin-granted rule; otherwise it builds an **approval plan**: level 1 is the requester's line manager, then any approver groups (Finance, a change board) whose threshold the request's value reaches, with admins standing in wherever nobody is eligible. A sequential **Map state** walks the levels: each one names its approvers on the request and pauses on a task token (**AWS SDK integration with `.waitForTaskToken`**). When a named approver decides, a Lambda checks they are on that level, are not the requester and did not approve an earlier level, then calls `SendTaskSuccess`. A missed SLA escalates the level to admins, and a second miss expires the request. Each decision is a child item; each status or level change is an event that EventBridge routes to SNS (notifications), SQS (fulfilment) and Firehose (audit lake).
+
+## Forms, approval workflows and the org hierarchy
+
+Admins configure everything below from the **Admin** area of the web app; nothing needs a redeploy.
+
+**Forms (per module, versioned).** A form builder adds, reorders and removes fields (short text, long text, number, money amount, date, dropdown, checkbox), marks them required, adds help text and limits, and picks the **approval value** field that drives thresholds. A requester only sees the fields of the module they choose, along with a live preview of the approval route for the value they type. Saving creates a new version; each request keeps the version and field labels it was submitted with, and the server validates every submission against that version.
+
+**Org hierarchy.** Each user has a manager, a department and a job title, set on their user page or in bulk with a CSV import that is checked first (unknown people, managers who are not approvers, loops across rows). Only active Approvers and Admins can manage people, loops are refused, and an org chart shows the tree.
+
+**Approval workflows (per module).** Level 1 is always the requester's **line manager**, so an approver's own request goes to their manager like everyone else's. Later levels are **approver groups** or **admins**, each switched on by a threshold on the approval value (for example Finance from 1,000 and admins from 10,000), up to five levels, with an SLA per level and an escalation timer. The rules every chain follows:
+
+* Nobody approves their own request, and the same person cannot approve two levels of one request.
+* If a level has nobody eligible (no manager, an empty group, disabled people), admins stand in; if not even an admin is eligible, the request stops as UNROUTABLE instead of waiting forever.
+* Admins cannot jump the chain: they decide only levels that name them (admin levels, stand-ins and escalations).
+* A plan is fixed when the request is submitted, so configuration changes never alter requests already in flight.
+
+**Auto-approval (off by default).** An admin can grant one person auto-approval for one module, up to a limit and until an expiry date (at most a year). Nobody can grant it to themselves; every grant and revocation is in the person's history and published as an event. Without a matching, unexpired rule, every request goes through its chain.
 
 ## User management and module access
 
-Admins manage people from the **Users** page of the web app: invite someone, choose their role, tick the request modules they may use, and later change, disable, reset or delete them. Everything an admin does is recorded in the user's access history.
-
-**Roles** (one per user, mirrored into the Cognito group of the same name):
+Admins manage people from **Admin > Users**: invite someone, choose their role, tick the modules they may use, set their manager, and later change, disable, reset or delete them. Everything an admin does is recorded in the user's access history.
 
 | Role | Can do |
 | --- | --- |
 | Requester | Raise and track requests in the modules they hold |
-| Approver | Everything a requester can, plus approve requests in the modules they hold |
-| Admin | Approve anything, resolve escalations, manage users; every module is included |
+| Approver | The same, and can manage people (be a line manager) and sit in approver groups |
+| Admin | Manage users and configuration, stand in where nobody else can approve, handle escalations; every module is included |
 
-**Modules** are the request types: Purchasing, Access management, Leave, Change management and General requests. A module grants the right to raise that kind of request and, for approvers, to see and decide it.
+**Modules** (Purchasing, Access management, Leave, Change management, General requests) decide what a person can raise. Who approves comes from the chain: a manager approves their reports' requests in any module.
 
-**Where it is enforced.** Identity (password, MFA, sign-in) stays in Cognito. Authorisation lives in a `PROFILE` item per user in DynamoDB (role, modules, status), and every path checks that live item on every call, so a grant, a revocation or a disabled account takes effect on the user's next click instead of when their one-hour token expires:
+**Where it is enforced.** Identity (password, MFA, sign-in) stays in Cognito. Authorisation lives in a `PROFILE` item per user in DynamoDB (role, modules, manager, status), and every path reads that live item, so a grant, a revocation or a disabled account applies on the user's next click instead of when their one-hour token expires: intake (module and status), the inbox and decisions (named on the current level), attachments, and the admin API (an active admin, read from the profile rather than the token).
 
-| Path | Check |
-| --- | --- |
-| `POST /requests` (no Lambda) | `TransactWriteItems`: a `ConditionCheck` on the profile (`status = ACTIVE AND (role = admins OR contains(modules, type))`) and the `Put` of the request succeed or fail together; a failed check is mapped to 403 in the response template |
-| Inbox, request detail, decisions | The query and decision Lambdas read the profile: approvers only see and decide requests in their modules |
-| Attachments, my requests | Refused for a disabled or unprovisioned account |
-| `/admin/users*` | Only an active admin, read from the profile rather than the token, so a demoted admin loses access at once |
+**Admin actions:** invite (with or without the email), change name, role, modules and reporting line (optimistic locking, so two admins cannot overwrite each other), disable and enable, reset password, resend the invitation, reset a lost authenticator, sign out everywhere, and delete (requests and history are kept).
 
-**Admin actions:** invite (with or without the email), change name, role and modules (optimistic locking, so two admins cannot overwrite each other), disable and enable (Cognito sign-in blocked, sessions revoked, API refused), reset password, resend the invitation, reset a lost authenticator, sign out everywhere, and delete (the user's requests and history are kept).
-
-**Guardrails:** admins cannot disable, delete or demote themselves, and the last active admin cannot be removed. Each change writes the profile and a history item in one transaction and publishes a `User Access Changed` event; the audit lake keeps a copy, and an EventBridge rule emails the ops topic whenever someone is made an admin. The user-admin Lambda's IAM policy is scoped to `USER#` items with `dynamodb:LeadingKeys`, so it cannot touch requests.
+**Guardrails:** admins cannot disable, delete or demote themselves; the last active admin cannot be removed; someone with direct reports or approver group seats cannot be demoted or deleted until those are reassigned; and every change is one transaction with its history item. An EventBridge rule emails the ops topic whenever someone is made an admin. The admin Lambda's IAM policy is scoped to `USER#` and `CONFIG` items with `dynamodb:LeadingKeys`, so it cannot touch requests.
 
 ## AWS services used
 
 | Area | Services |
 | --- | --- |
 | Edge and identity | Amazon API Gateway (REST), Amazon Cognito (Plus tier, TOTP MFA), AWS WAF (when the account allows it) |
-| Compute and orchestration | AWS Lambda (6 or 7 small functions), AWS Step Functions (Standard, SDK integration with task tokens) |
+| Compute and orchestration | AWS Lambda (7 or 8 small functions), AWS Step Functions (Standard, SDK integration with task tokens) |
 | Events and messaging | Amazon EventBridge (rules on the default bus), EventBridge Pipes (when allowed), Amazon SQS (queue + 2 DLQs), Amazon SNS (3 topics, email) |
 | Data | Amazon DynamoDB (single table, Streams, PITR, 2 GSIs), Amazon S3 (web, attachments, audit lake), Amazon Data Firehose |
 | Security and config | AWS KMS (customer managed key), AWS Secrets Manager, AWS Systems Manager Parameter Store, AWS IAM |
@@ -110,8 +120,8 @@ git clone https://github.com/bamboomaster112/aws-request-hub.git
 cd aws-request-hub
 ./scripts/preflight.sh                 # read-only permission probe, about 20 seconds
 python3 scripts/permissions-check.py   # IAM policy simulator over every action the stacks need
-./scripts/deploy.sh                    # core stack + web app + CI/CD stack
-python3 scripts/seed-users.py          # requester, approver and admin test users with MFA enrolled
+./scripts/deploy.sh                    # core stack + default forms, workflows, groups + web app + CI/CD
+python3 scripts/seed-users.py          # requester -> approver -> admin test users with MFA enrolled
 python3 scripts/smoke-test.py          # end-to-end checks
 ```
 
@@ -126,7 +136,7 @@ Options for `deploy.sh`:
 | `WITH_PIPELINE` | `true` | Deploys the CodePipeline/CodeBuild stack |
 | `WITH_GOVERNANCE` | `false` | Deploys CloudTrail and AWS Config rules |
 
-To use the web app yourself, bootstrap the first admin from CloudShell and follow the emailed temporary password. After that, invite and manage everyone else from the **Users** page:
+`deploy.sh` runs `scripts/seed-config.py`, which writes starting forms, workflows and approver groups only where none exist, so it never overwrites an admin's changes. To use the web app yourself, bootstrap the first admin from CloudShell and follow the emailed temporary password. After that, invite everyone else, set their managers and add approver group members from the **Admin** area:
 
 ```bash
 ./scripts/create-user.sh you@yourdomain.com admins
@@ -135,18 +145,21 @@ To use the web app yourself, bootstrap the first admin from CloudShell and follo
 
 ## Demo script
 
-1. **Auto-approval.** Raise a PURCHASE for 250. It moves from SUBMITTED to AUTO_APPROVED to FULFILLED (with a PO reference) in a few seconds, with no human involved.
-2. **Human approval.** Raise a PURCHASE for 1,200. Open the Step Functions console: the execution is paused on `RequestApproval`. Approve it as an approver and watch the execution resume.
-3. **Segregation of duties.** Try to approve your own request. The API refuses with 403.
-4. **High risk.** Raise a CHANGE request. It routes to admins only.
-5. **SLA escalation.** Leave an ACCESS request alone for 3 minutes. It escalates to admins, and an email goes out.
-6. **Failure handling.** Raise a GENERAL request for 50 with `[fail]` in the title. Fulfilment fails three times, the message lands in the DLQ, and the DLQ alarm fires.
-7. **Security at the edge.** Call the API without a token (401) or with an invalid body (400). Where WAF is allowed, `' UNION SELECT` in a title or `<script>` in a description gets a 403.
-8. **Audit lake.** A minute later, browse `s3://request-hub-audit-.../events/year=/month=/day=/` (gzip files of raw EventBridge events).
-9. **User management.** As an admin, open **Users**, invite someone, and untick a module for an existing requester. Their next attempt to raise that kind of request is refused with 403, without signing out. Disable them and their open session stops working; enable them and it works again. The user page shows every change in the access history, and making someone an admin emails the ops topic.
-10. **Operations.** Open the `request-hub-operations-...` CloudWatch dashboard, including the Lambda budget widget against the 300 per hour line.
+Set up first, as an admin: give a requester a manager (an Approver), put someone in the Finance group, and look at **Admin > Workflows > Purchasing** (line manager, Finance from 1,000, admins from 10,000).
 
-`python3 scripts/smoke-test.py --escalation --dlq --audit` runs all of these automatically.
+1. **Dynamic forms.** Open **New request** and switch modules: each shows only its own fields, and the approval route updates as you type the value.
+2. **No default auto-approval.** Raise a Purchasing request for 250. It waits for the line manager, even though it is small.
+3. **Granted auto-approval.** In **Admin > Auto-approval**, give the requester Purchasing up to 500 for a week. Raise 300: it is auto-approved and fulfilled in seconds. Raise 600: back to the chain.
+4. **Multi-level chain.** Raise 1,500. The manager approves level 1, then Finance gets level 2. Open the Step Functions console to see the Map state paused on the second level.
+5. **Approver's approver.** As the approver, raise a request: it goes to their manager, and they cannot approve it themselves.
+6. **Segregation of duties.** Try to approve your own request, or a level that does not name you: 403.
+7. **SLA escalation.** Leave a request alone for 3 minutes. The level escalates to admins, and an email goes out.
+8. **Form builder.** Add a dropdown to the Leave form and save. New Leave requests show it; older ones keep their version.
+9. **Org hierarchy.** Import reporting lines from CSV on **Admin > Org chart**; try a loop and see it rejected before anything is saved.
+10. **Failure handling.** With auto-approval for General requests, raise one with `[fail]` in the title. Fulfilment fails three times, the message lands in the DLQ, and the DLQ alarm fires.
+11. **Audit lake and operations.** Browse `s3://request-hub-audit-.../events/` and the `request-hub-operations-...` dashboard.
+
+`python3 scripts/smoke-test.py --escalation --dlq --audit` runs most of these automatically.
 
 ## Verified in the playground
 
@@ -156,7 +169,12 @@ Live KodeKloud AWS Playground session, 18 Nov 2026 (us-east-1, WAF and Pipes blo
 * CI/CD: a release through S3, EventBridge, CodePipeline V2 and CodeBuild ran Source, Test (unit tests, cfn-lint, Bandit, JavaScript check) and Deploy successfully.
 * Full deploy from an empty account: about 8 minutes (core, web app and CI/CD stacks).
 
-**User management (added 19 Nov 2026, after that session ended):** covered by 26 new unit tests (57 in total), cfn-lint, the create and error mapping templates rendered with Apache Velocity 1.7 (the access check, the 403 mapping and the escaping), and the admin screens driven in headless Chrome against a mock API. The smoke test has 13 new live checks for it (revoke a module and see the same token refused, disable and enable, history, self-protection, create and delete); they have not run in a playground yet.
+**User management, forms, workflows and hierarchy (added 19 Nov 2026, after that session ended)** have not run in a playground yet. They are covered by:
+
+* 87 unit tests (policy plans, intake validation, decisions, inbox, admin API rules) and cfn-lint, which also validates the state machine definition.
+* `python3 tests/local_e2e.py`: **32 of 32** end-to-end checks with the real handlers, moto standing in for DynamoDB (which evaluates every update and condition expression) and a small interpreter running the state machine level by level, including escalation, expiry, rejection and the "nobody eligible" case.
+* The screens driven in headless Chrome against a mock API.
+* `scripts/smoke-test.py`, rewritten for the new model (47 live checks), ready for the next playground session.
 
 ## CI/CD
 
@@ -167,14 +185,15 @@ Live KodeKloud AWS Playground session, 18 Nov 2026 (us-east-1, WAF and Pipes blo
 ```
 template.yaml                      core stack, plain CloudFormation packaged by the SAM CLI (about 90 resources)
 statemachine/approval-workflow.asl.json
-src/<function>/app.py              policy_engine, query_api, decision_handler, attachment_presigner,
-                                   fulfilment_worker, stream_publisher, user_admin
-web/                               single-page app (no framework, no build step)
+src/<function>/app.py              request_intake, policy_engine, query_api, decision_handler,
+                                   attachment_presigner, fulfilment_worker, stream_publisher
+src/user_admin/                    admin API: app (routes), users, config_admin, common, defaults
+web/assets/                        app.js (requester screens), admin.js (admin area), core.js (shared)
 pipeline/                          cicd.yaml + buildspecs
 governance/governance.yaml         CloudTrail + AWS Config rules
-scripts/                           preflight, deploy, publish-web, seed-users, smoke-test,
+scripts/                           preflight, deploy, seed-config, publish-web, seed-users, smoke-test,
                                    create-user, release, teardown
-tests/                             unit tests for handlers, policy and workflow definition
+tests/                             unit tests, plus local_e2e.py (moto + state machine interpreter)
 ```
 
 ## Data model (single table)
@@ -183,10 +202,15 @@ tests/                             unit tests for handlers, policy and workflow 
 | --- | --- | --- | --- | --- |
 | Request | `REQ#<id>` | `META` | `USER#<sub>` / createdAt | `STATUS#<status>` / createdAt |
 | Attachment | `REQ#<id>` | `ATT#<attachmentId>` | | |
-| Access profile | `USER#<sub>` | `PROFILE` | | `DIRECTORY#USERS` / createdAt |
+| Approval decision | `REQ#<id>` | `APPROVAL#<level>` | | |
+| Access profile (role, modules, manager) | `USER#<sub>` | `PROFILE` | | `DIRECTORY#USERS` / createdAt |
+| Auto-approval rule | `USER#<sub>` | `AUTORULE#<module>` | | `DIRECTORY#AUTORULES` / createdAt |
 | Access history | `USER#<sub>` | `AUDIT#<epoch ms>#<rand>` | | |
+| Form (current, and immutable versions) | `CONFIG` | `FORM#<module>`, `FORMVER#<module>#<v>` | | |
+| Workflow, approver group | `CONFIG` | `WORKFLOW#<module>`, `GROUP#<id>` | | |
+| Configuration history | `CONFIG` | `AUDIT#<epoch ms>#<rand>` | | |
 
-Rule that keeps the event stream clean: **every write to a META item is a status transition**. Attachments are child items, so uploading a file never re-sends an approval email. Profile and history items never reach the workflow either, because the stream consumer only accepts `SK = META`.
+Rule that keeps the event stream clean: **every write to a META item is a status or approval-level transition**. Decisions are child items. Attachments are child items, so uploading a file never re-sends an approval email. Profile and history items never reach the workflow either, because the stream consumer only accepts `SK = META`.
 
 ## Teardown
 
@@ -201,5 +225,6 @@ The playground wipes the account when the session ends, but this is the habit to
 * Container front end on Amazon ECS Express Mode (the App Runner successor).
 * Query the audit lake with Athena and a Glue table (not available in the playground).
 * Amazon Bedrock to summarise long requests for approvers (not available in the playground).
-* Multi-step approvals (manager, then finance) as a Map state over an approver chain.
+* Delegation while an approver is away, and per-approver email through Amazon SES instead of one SNS topic.
+* Admin-created modules beyond the five built-in ones.
 * Replace email links with Slack approvals through Amazon Q Developer in chat applications.

@@ -1,8 +1,9 @@
 """POST /requests/{requestId}/decision
 
-Checks that the caller may decide (active account, right role, access to the
-request's module, not their own request, still pending), then resumes the paused Step Functions execution with the task token
-stored on the request. Step Functions accepts a token only once, which makes
+Checks that the caller may decide (active account, named as an approver of the
+current level, not their own request, and not someone who already decided an
+earlier level of it), then resumes the paused Step Functions execution with the
+task token stored on the request. Step Functions accepts a token only once, which makes
 double-clicks and races with the SLA timer safe without extra locking.
 """
 import json
@@ -10,6 +11,7 @@ import os
 import time
 
 import boto3
+from boto3.dynamodb.conditions import Key
 from botocore.exceptions import ClientError
 
 DECISION_STATUSES = ("PENDING_APPROVAL", "ESCALATED")
@@ -33,19 +35,12 @@ def sfn():
     return _sfn
 
 
-def parse_groups(raw):
-    if isinstance(raw, (list, tuple, set)):
-        return {str(g).strip() for g in raw if str(g).strip()}
-    text = str(raw or "").strip().strip("[]")
-    return {g.strip() for g in text.replace(",", " ").split() if g.strip()}
-
-
 def load_access(sub):
-    """Live role, modules and status from the PROFILE item that the user admin API maintains."""
+    """Live role and status from the PROFILE item that the user admin API maintains."""
     item = table().get_item(Key={"PK": f"USER#{sub}", "SK": "PROFILE"}, ConsistentRead=True).get("Item")
     if not item or item.get("status") != "ACTIVE":
         return None
-    return {"role": item.get("role"), "modules": {str(m) for m in (item.get("modules") or [])}}
+    return {"role": item.get("role")}
 
 
 def response(status, body):
@@ -56,19 +51,26 @@ def response(status, body):
     }
 
 
-def authorise(item, sub, groups, modules):
+def prior_deciders(request_id):
+    result = table().query(
+        KeyConditionExpression=Key("PK").eq(f"REQ#{request_id}") & Key("SK").begins_with("APPROVAL#"),
+        ConsistentRead=True,
+    )
+    return {str(i.get("decidedBy")) for i in result.get("Items", [])}
+
+
+def authorise(item, sub, deciders):
     """Returns an error response, or None when the caller may decide."""
     if item is None:
         return response(404, {"message": "Request not found"})
-    if "admins" not in groups and item.get("type") not in modules:
-        return response(403, {"message": f"You do not have access to the {item.get('type')} module"})
     if item.get("status") not in DECISION_STATUSES:
         return response(409, {"message": f"Request is {item.get('status')}, so it is no longer waiting for a decision"})
     if item.get("requesterId") == sub:
         return response(403, {"message": "You cannot decide on your own request (segregation of duties)"})
-    required = item.get("approverGroup", "approvers")
-    if "admins" not in groups and required not in groups:
-        return response(403, {"message": f"This request needs someone in the '{required}' group"})
+    if sub not in {str(i) for i in (item.get("approverIds") or [])}:
+        return response(403, {"message": f"This step is waiting for {item.get('approverGroup', 'another approver')}, not you"})
+    if sub in deciders:
+        return response(403, {"message": "You already decided an earlier level of this request, so someone else must decide this one"})
     if not item.get("approvalToken"):
         return response(409, {"message": "The approval window is not open yet, refresh in a moment"})
     return None
@@ -97,7 +99,6 @@ def handler(event, _context):
     access = load_access(sub)
     if access is None:
         return response(403, {"message": "Your account is disabled or has no access set up yet. Ask an admin for access."})
-    groups, modules = {access["role"]}, access["modules"]
 
     request_id = (event.get("pathParameters") or {}).get("requestId", "")
     try:
@@ -113,7 +114,7 @@ def handler(event, _context):
         return response(400, {"message": "Please add a comment explaining the rejection"})
 
     item = table().get_item(Key={"PK": f"REQ#{request_id}", "SK": "META"}, ConsistentRead=True).get("Item")
-    denied = authorise(item, sub, groups, modules)
+    denied = authorise(item, sub, prior_deciders(request_id) if item else set())
     if denied:
         return denied
 

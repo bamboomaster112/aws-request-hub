@@ -46,9 +46,11 @@ def to_entry(record):
     if _s(new, "SK") != "META":
         return None
     status, previous = _s(new, "status"), (_s(old, "status") if old else "NONE")
+    level, previous_level = _s(new, "currentLevel", "0"), (_s(old, "currentLevel", "0") if old else "0")
     if record.get("eventName") == "INSERT":
         detail_type = "Request Submitted"
-    elif record.get("eventName") == "MODIFY" and status != previous:
+    elif record.get("eventName") == "MODIFY" and (status != previous or level != previous_level):
+        # A new approval level is a change too: the next approvers need to hear about it.
         detail_type = "Request Status Changed"
     else:
         return None
@@ -64,6 +66,8 @@ def to_entry(record):
         "previousStatus": previous,
         "riskTier": _s(new, "riskTier"),
         "approverGroup": _s(new, "approverGroup"),
+        "level": int(level or 0),
+        "levelCount": int(_s(new, "levelCount", "0") or 0),
     }
     return {"Source": SOURCE, "DetailType": detail_type, "Detail": json.dumps(detail),
             "EventBusName": os.environ["EVENT_BUS_NAME"]}

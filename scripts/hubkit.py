@@ -123,7 +123,8 @@ def user_id_for(out, email):
     return attrs.get("sub", user["Username"])
 
 
-def put_profile(out, user_id, username, email, role, modules, name="", actor="cloudshell-script"):
+def put_profile(out, user_id, username, email, role, modules, name="", actor="cloudshell-script",
+                manager_id=None, department=None):
     """Writes (or overwrites) the access profile plus an access-history entry, atomically."""
     if role not in ROLES:
         raise ValueError(f"role must be one of {ROLES}")
@@ -142,6 +143,10 @@ def put_profile(out, user_id, username, email, role, modules, name="", actor="cl
     }
     if modules:
         profile["modules"] = {"SS": modules}
+    if manager_id:
+        profile["managerId"] = {"S": manager_id}
+    if department:
+        profile["department"] = {"S": department}
     what = "every module (admin)" if role == "admins" else (", ".join(modules) or "no modules")
     audit = {
         "PK": {"S": f"USER#{user_id}"}, "SK": {"S": f"AUDIT#{now:013d}#{uuid.uuid4().hex[:6]}"},
@@ -156,6 +161,11 @@ def put_profile(out, user_id, username, email, role, modules, name="", actor="cl
 
 
 def delete_profile(out, user_id):
+    """Removes a test user's profile and any auto-approval rules (history items are kept)."""
+    rules = _ddb.query(TableName=out["TableName"], KeyConditionExpression="PK = :pk AND begins_with(SK, :sk)",
+                       ExpressionAttributeValues={":pk": {"S": f"USER#{user_id}"}, ":sk": {"S": "AUTORULE#"}})
+    for rule in rules.get("Items", []):
+        _ddb.delete_item(TableName=out["TableName"], Key={"PK": rule["PK"], "SK": rule["SK"]})
     _ddb.delete_item(TableName=out["TableName"], Key={"PK": {"S": f"USER#{user_id}"}, "SK": {"S": "PROFILE"}})
 
 

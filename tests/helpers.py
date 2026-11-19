@@ -6,11 +6,19 @@ import pathlib
 os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
 os.environ.setdefault("TABLE_NAME", "test-table")
 os.environ.setdefault("ATTACHMENTS_BUCKET", "test-bucket")
+os.environ.setdefault("USER_POOL_ID", "us-east-1_test")
+os.environ.setdefault("POLICY_PARAMETER", "/test/policy")
+os.environ.setdefault("EVENT_BUS_NAME", "default")
 
 SRC = pathlib.Path(__file__).resolve().parent.parent / "src"
 
 
 def load(function_dir):
+    """Imports src/<function_dir>/app.py. The function's folder goes on sys.path, as it is in Lambda."""
+    import sys
+    folder = str(SRC / function_dir)
+    if folder not in sys.path:
+        sys.path.insert(0, folder)
     path = SRC / function_dir / "app.py"
     spec = importlib.util.spec_from_file_location(f"{function_dir}_app", path)
     module = importlib.util.module_from_spec(spec)
@@ -34,7 +42,23 @@ class FakeTable:
     def query(self, **kwargs):
         if self.query_items is not None:
             return {"Items": list(self.query_items)}
-        return {"Items": list(self.items.values())}
+        return {"Items": [dict(i) for i in self.items.values() if _matches(i, kwargs)]}
+
+
+def _matches(item, kwargs):
+    """Evaluates the boto3 Key condition objects used by the handlers (eq and begins_with, ANDed)."""
+    from boto3.dynamodb.conditions import And, BeginsWith, Equals
+
+    def check(cond):
+        if isinstance(cond, And):
+            return all(check(c) for c in cond._values)
+        name, value = cond._values[0].name, cond._values[1]
+        if isinstance(cond, Equals):
+            return item.get(name) == value
+        if isinstance(cond, BeginsWith):
+            return str(item.get(name, "")).startswith(value)
+        raise NotImplementedError(type(cond))
+    return check(kwargs["KeyConditionExpression"])
 
 
 def profile(sub, role="requesters", modules=("PURCHASE", "ACCESS", "LEAVE", "CHANGE", "GENERAL"), status="ACTIVE",

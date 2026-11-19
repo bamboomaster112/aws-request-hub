@@ -1,80 +1,139 @@
 import json
-import pathlib
-import re
 import unittest
+from unittest import mock
 
 from helpers import load
 
 engine = load("policy_engine")
 
-TEMPLATE = pathlib.Path(__file__).resolve().parent.parent / "template.yaml"
+NOW = 1_800_000_000_000
+DAY = 86_400_000
+TIMERS = {"slaSeconds": 180, "escalationSeconds": 180}
 
 
-def rules_from_template():
-    """Reads the policy JSON straight out of template.yaml so tests and deployment never drift."""
-    text = TEMPLATE.read_text()
-    block = text.split("Value: !Sub |", 1)[1]
-    lines = []
-    for line in block.splitlines()[1:]:
-        if line.strip() and not line.startswith("        "):
-            break
-        lines.append(line)
-    doc = "\n".join(lines).replace("${ApprovalSlaSeconds}", "180").replace("${EscalationSlaSeconds}", "180")
-    return json.loads(doc)
+def person(uid, role="requesters", manager=None, status="ACTIVE"):
+    return {"userId": uid, "email": f"{uid}@example.com", "name": uid.title(), "role": role,
+            "status": status, "managerId": manager}
 
 
-RULES = rules_from_template()
+def org():
+    """rahul -> ana -> priya -> (nobody). Two admins: priya and vikram. Finance: li."""
+    return {
+        "rahul": person("rahul", manager="ana"),
+        "ana": person("ana", "approvers", manager="priya"),
+        "priya": person("priya", "admins"),
+        "vikram": person("vikram", "admins"),
+        "li": person("li", "approvers", manager="priya"),
+    }
 
 
-class PolicyEngineTests(unittest.TestCase):
-    def decide(self, rtype, amount):
-        return engine.evaluate({"type": rtype, "amount": amount}, RULES)
+PURCHASE = {"version": 3, "levels": [
+    {"kind": "MANAGER", "minAmount": 0},
+    {"kind": "GROUP", "groupId": "finance", "minAmount": 1000},
+    {"kind": "ADMINS", "minAmount": 10000},
+]}
+GROUPS = {"finance": {"groupId": "finance", "name": "Finance", "members": ["li"]}}
 
-    def test_small_purchase_is_auto_approved(self):
-        result = self.decide("PURCHASE", 250)
+
+def plan(amount, requester="rahul", workflow=PURCHASE, profiles=None, groups=GROUPS, rule=None):
+    profiles = profiles or org()
+    request = {"requestId": "r1", "type": "PURCHASE", "amount": amount, "requesterId": requester}
+    return engine.build_plan(request, profiles.get(requester), workflow, profiles, groups, rule, NOW, TIMERS)
+
+
+def chain(result):
+    return [(l["label"], l["approverIds"]) for l in result["levels"]]
+
+
+class AutoApprovalTests(unittest.TestCase):
+    rule = {"module": "PURCHASE", "maxAmount": 500, "expiresAt": NOW + DAY, "expiresOn": "2027-01-16"}
+
+    def test_nothing_is_auto_approved_without_a_rule(self):
+        result = plan(1)
+        self.assertFalse(result["autoApprove"])
+        self.assertEqual(chain(result), [("Line manager: Ana", ["ana"])])
+
+    def test_rule_within_limit_auto_approves(self):
+        result = plan(500, rule=self.rule)
         self.assertTrue(result["autoApprove"])
-        self.assertEqual(result["riskTier"], "LOW")
+        self.assertIn("up to 500", result["reasons"][0])
 
-    def test_mid_purchase_needs_an_approver(self):
-        result = self.decide("PURCHASE", 1200)
+    def test_over_the_limit_goes_to_approval(self):
+        result = plan(501, rule=self.rule)
         self.assertFalse(result["autoApprove"])
-        self.assertEqual((result["riskTier"], result["approverGroup"]), ("MEDIUM", "approvers"))
+        self.assertIn("above the requester's auto-approval limit", result["reasons"][0])
 
-    def test_large_purchase_needs_an_admin(self):
-        result = self.decide("PURCHASE", 5000)
-        self.assertEqual((result["riskTier"], result["approverGroup"]), ("HIGH", "admins"))
-
-    def test_access_always_needs_a_human(self):
-        result = self.decide("ACCESS", 0)
+    def test_expired_rule_goes_to_approval(self):
+        result = plan(10, rule={**self.rule, "expiresAt": NOW - 1})
         self.assertFalse(result["autoApprove"])
-        self.assertEqual(result["riskTier"], "MEDIUM")
+        self.assertIn("expired", result["reasons"][0])
 
-    def test_change_is_always_high_risk(self):
-        result = self.decide("CHANGE", 0)
-        self.assertEqual((result["riskTier"], result["approverGroup"]), ("HIGH", "admins"))
+    def test_disabled_requester_never_auto_approves(self):
+        profiles = org()
+        profiles["rahul"]["status"] = "DISABLED"
+        self.assertFalse(plan(10, profiles=profiles, rule=self.rule)["autoApprove"])
 
-    def test_short_leave_is_auto_approved_long_leave_is_high_risk(self):
-        self.assertTrue(self.decide("LEAVE", 2)["autoApprove"])
-        self.assertEqual(self.decide("LEAVE", 5)["riskTier"], "MEDIUM")
-        self.assertEqual(self.decide("LEAVE", 15)["riskTier"], "HIGH")
 
-    def test_unknown_type_and_bad_amount_fall_back_safely(self):
-        result = engine.evaluate({"type": "SOMETHING", "amount": "not-a-number"}, RULES)
-        self.assertEqual(result["riskTier"], "LOW")  # GENERAL with 0
-        self.assertIn("GENERAL", result["reasons"][0])
+class ChainTests(unittest.TestCase):
+    def test_thresholds_add_levels_in_order(self):
+        self.assertEqual(len(plan(999)["levels"]), 1)
+        self.assertEqual(chain(plan(1000)), [("Line manager: Ana", ["ana"]), ("Finance", ["li"])])
+        three = plan(25000)
+        self.assertEqual([l["label"] for l in three["levels"]], ["Line manager: Ana", "Finance", "Admins"])
+        self.assertEqual(three["levels"][2]["approverIds"], ["priya", "vikram"])
+        self.assertEqual(three["lastIndex"], 2)
 
-    def test_timers_have_a_floor_and_are_integers(self):
-        rules = {"default": {"slaSeconds": 5, "escalationSeconds": 10}, "types": {}}
-        result = engine.evaluate({"type": "ACCESS", "amount": 1}, rules)
-        self.assertEqual((result["slaSeconds"], result["escalationSeconds"]), (60, 60))
-        self.assertIsInstance(result["slaSeconds"], int)
+    def test_the_approvers_own_request_goes_to_their_manager(self):
+        self.assertEqual(chain(plan(50, requester="ana")), [("Line manager: Priya", ["priya"])])
 
-    def test_every_decision_explains_itself(self):
-        for rtype in engine.VALID_TYPES:
-            for amount in (0, 1, 499, 500, 5000, 20000):
-                result = self.decide(rtype, amount)
-                self.assertTrue(result["reasons"], f"{rtype} {amount}")
-                self.assertTrue(re.match(r"^[A-Z]", result["reasons"][0]))
+    def test_requester_is_never_an_approver(self):
+        # Li is the only Finance member and raises the request: admins stand in for Finance.
+        result = plan(2000, requester="li")
+        self.assertEqual(chain(result), [("Line manager: Priya", ["priya"]), ("Finance (admins standing in)", ["vikram"])])
+
+    def test_same_person_cannot_approve_two_levels(self):
+        groups = {"finance": {"groupId": "finance", "name": "Finance", "members": ["ana", "li"]}}
+        result = plan(2000, groups=groups)
+        self.assertEqual(result["levels"][1]["approverIds"], ["li"])  # Ana already approves level 1
+
+    def test_top_of_the_tree_falls_back_to_other_admins(self):
+        result = plan(50, requester="priya")
+        self.assertEqual(chain(result), [("Line manager (admins standing in)", ["vikram"])])
+        self.assertIn("no manager set", " ".join(result["reasons"]))
+
+    def test_disabled_manager_falls_back_to_admins(self):
+        profiles = org()
+        profiles["ana"]["status"] = "DISABLED"
+        result = plan(50, profiles=profiles)
+        self.assertEqual(result["levels"][0]["approverIds"], ["priya", "vikram"])
+        self.assertTrue(result["levels"][0]["fallback"])
+
+    def test_nobody_eligible_is_unroutable(self):
+        profiles = {"solo": person("solo", "admins")}
+        result = plan(50, requester="solo", profiles=profiles, workflow={"levels": [{"kind": "MANAGER", "minAmount": 0}]})
+        self.assertFalse(result["routable"])
+        self.assertIn("Nobody is eligible", result["reasons"][-1])
+
+    def test_plan_json_and_dynamodb_shapes(self):
+        result = plan(1000)
+        self.assertEqual(result["levels"][0]["approverIdsDdb"], [{"S": "ana"}])
+        stored = json.loads(result["planJson"])
+        self.assertEqual([l["label"] for l in stored["levels"]], ["Line manager: Ana", "Finance"])
+        self.assertEqual(result["escalateToDdb"], [{"S": "priya"}, {"S": "vikram"}])
+
+    def test_workflow_timers_win_over_defaults_with_a_floor(self):
+        result = plan(10, workflow={**PURCHASE, "slaSeconds": 30, "escalationSeconds": 600})
+        self.assertEqual((result["slaSeconds"], result["escalationSeconds"]), (60, 600))
+
+
+class HandlerTests(unittest.TestCase):
+    def test_handler_loads_context_and_returns_the_plan(self):
+        with mock.patch.object(engine, "load_context", return_value=(org()["rahul"], PURCHASE, org(), GROUPS, None)), \
+                mock.patch.object(engine, "load_defaults", return_value=TIMERS):
+            out = engine.handler({"request": {"requestId": "r1", "type": "PURCHASE", "amount": "1500",
+                                              "requesterId": "rahul"}}, None)
+        self.assertEqual(out["levelCount"], 2)
+        self.assertTrue(out["routable"])
 
 
 if __name__ == "__main__":

@@ -37,8 +37,15 @@ put() { # file key content-type cache-control
 }
 
 put "$ROOT/web/index.html" index.html "text/html; charset=utf-8" "no-cache"
-put "$ROOT/web/assets/app.js" assets/app.js "text/javascript; charset=utf-8" "no-cache"
-put "$ROOT/web/assets/styles.css" assets/styles.css "text/css; charset=utf-8" "no-cache"
+for file in "$ROOT"/web/assets/*; do
+  name=$(basename "$file")
+  case "$name" in
+    *.js)  type="text/javascript; charset=utf-8" ;;
+    *.css) type="text/css; charset=utf-8" ;;
+    *)     continue ;;
+  esac
+  put "$file" "assets/$name" "$type" "no-cache"
+done
 put "$TMP/config.json" config.json "application/json" "no-store"
 
 echo "Web app published to s3://$WEB_BUCKET"

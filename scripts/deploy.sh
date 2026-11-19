@@ -96,6 +96,9 @@ aws apigateway create-deployment --rest-api-id "$API_ID" --stage-name v1 --descr
 step "Verifying EventBridge rules"
 "$ROOT/scripts/verify-rules.sh" || true
 
+step "Seeding forms, workflows and approver groups (never overwrites admin changes)"
+SLA_SECONDS="$SLA_SECONDS" python3 "$ROOT/scripts/seed-config.py"
+
 step "Publishing the web app"
 "$ROOT/scripts/publish-web.sh"
 
@@ -133,6 +136,7 @@ aws cloudformation describe-stacks --stack-name "$STACK" \
 cat <<'EOF'
 
 Next:
-  python3 scripts/seed-users.py      # creates requester, approver and admin test users (MFA enrolled)
-  python3 scripts/smoke-test.py      # end-to-end checks through WAF, API Gateway, workflow and fulfilment
+  ./scripts/create-user.sh you@yourdomain.com admins   # your own admin login for the web app
+  python3 scripts/seed-users.py      # requester -> approver -> admin test users with MFA, for the smoke test
+  python3 scripts/smoke-test.py      # end-to-end checks through API Gateway, workflow and fulfilment
 EOF

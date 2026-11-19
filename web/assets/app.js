@@ -1,110 +1,10 @@
-// Request Hub single-page app. No framework and no build step: plain ES modules.
+// Request Hub single-page app: sign-in, routing and the requester and approver screens.
 // Auth: Cognito hosted UI with the authorization code flow + PKCE.
-// Every value from the API is rendered with textContent (never innerHTML).
-
-const state = { cfg: null, idToken: null, claims: null, groups: new Set(), me: null, meAt: 0 };
-
-const TYPES = {
-  PURCHASE: { label: 'Purchase', unit: 'Amount', money: true, hint: 'Up to 499 is auto-approved. 5,000 and above needs an admin.' },
-  ACCESS: { label: 'Access', unit: 'Duration (days)', money: false, hint: 'Always needs an approver.' },
-  LEAVE: { label: 'Leave', unit: 'Days', money: false, hint: 'Up to 2 days is auto-approved. 15 days or more needs an admin.' },
-  CHANGE: { label: 'Change', unit: 'Impact score', money: false, hint: 'Production changes always need an admin.' },
-  GENERAL: { label: 'General', unit: 'Amount', money: true, hint: 'Up to 100 is auto-approved. 10,000 and above needs an admin.' },
-};
-
-// Modules are the request types a user may raise and (for approvers) review.
-// The server is the authority; these labels only drive the screens.
-const MODULES = {
-  PURCHASE: { label: 'Purchasing', blurb: 'Purchase requests for goods and services.' },
-  ACCESS: { label: 'Access management', blurb: 'Requests for system and data access.' },
-  LEAVE: { label: 'Leave', blurb: 'Time off and leave requests.' },
-  CHANGE: { label: 'Change management', blurb: 'Production and infrastructure changes.' },
-  GENERAL: { label: 'General requests', blurb: 'Anything that needs a yes but has no module of its own.' },
-};
-
-const ROLES = {
-  requesters: { label: 'Requester', blurb: 'Raises and tracks requests in the modules they hold.' },
-  approvers: { label: 'Approver', blurb: 'A requester who can also approve requests in the modules they hold.' },
-  admins: { label: 'Admin', blurb: 'Approves anything, handles escalations and manages users. Every module is included.' },
-};
-
-const SIGN_IN = {
-  FORCE_CHANGE_PASSWORD: ['Invite pending', 'warn'],
-  CONFIRMED: ['Signed in before', 'ok'],
-  RESET_REQUIRED: ['Password reset pending', 'warn'],
-  UNCONFIRMED: ['Unconfirmed', 'warn'],
-  MISSING: ['Missing in Cognito', 'danger'],
-};
-
-const ACCESS_TONE = { ACTIVE: 'ok', DISABLED: 'danger', NO_PROFILE: 'warn' };
-const ACCESS_LABEL = { ACTIVE: 'Active', DISABLED: 'Disabled', NO_PROFILE: 'No access set up' };
-
-const HISTORY_LABEL = {
-  CREATED: 'Invited', ACCESS_CHANGED: 'Access changed', ACCESS_SET_UP: 'Access set up', DISABLE: 'Disabled',
-  ENABLE: 'Enabled', RESET_PASSWORD: 'Password reset', RESEND_INVITE: 'Invitation re-sent',
-  RESET_MFA: 'Authenticator reset', SIGN_OUT: 'Signed out everywhere', DELETED: 'Deleted',
-};
-
-const STATUS_TONE = {
-  SUBMITTED: 'info', PENDING_APPROVAL: 'warn', ESCALATED: 'danger', APPROVED: 'ok', AUTO_APPROVED: 'ok',
-  FULFILLED: 'ok', REJECTED: 'muted', EXPIRED: 'muted', FAILED: 'danger',
-};
-
-// ---------- tiny DOM helper ----------
-function h(tag, attrs = {}, ...children) {
-  const el = document.createElement(tag);
-  for (const [key, value] of Object.entries(attrs || {})) {
-    if (value === null || value === undefined || value === false) continue;
-    if (key === 'class') el.className = value;
-    else if (key.startsWith('on') && typeof value === 'function') el.addEventListener(key.slice(2), value);
-    else el.setAttribute(key, value === true ? '' : String(value));
-  }
-  for (const child of children.flat()) {
-    if (child === null || child === undefined || child === false) continue;
-    el.append(child instanceof Node ? child : document.createTextNode(String(child)));
-  }
-  return el;
-}
-
-const store = {
-  get(k) { try { return sessionStorage.getItem(k); } catch { return null; } },
-  set(k, v) { try { sessionStorage.setItem(k, v); } catch { /* storage unavailable */ } },
-  del(k) { try { sessionStorage.removeItem(k); } catch { /* storage unavailable */ } },
-};
-
-function toast(message, tone = 'info') {
-  const el = document.getElementById('toast');
-  el.textContent = message;
-  el.className = `toast ${tone}`;
-  el.hidden = false;
-  clearTimeout(toast.timer);
-  toast.timer = setTimeout(() => { el.hidden = true; }, 4500);
-}
-
-function mount(...nodes) {
-  const app = document.getElementById('app');
-  app.replaceChildren(...nodes);
-}
-
-function fmtTime(value) {
-  if (value === undefined || value === null || value === '') return '';
-  const d = typeof value === 'number' ? new Date(value) : new Date(String(value));
-  return Number.isNaN(d.getTime()) ? String(value) : d.toLocaleString();
-}
-
-function fmtAmount(item) {
-  const t = TYPES[item.type] || TYPES.GENERAL;
-  const n = Number(item.amount || 0);
-  if (t.money) {
-    try { return new Intl.NumberFormat(undefined, { style: 'currency', currency: item.currency || 'USD' }).format(n); }
-    catch { return `${n} ${item.currency || ''}`.trim(); }
-  }
-  return `${n} (${t.unit.toLowerCase()})`;
-}
-
-function badge(status) {
-  return h('span', { class: `badge ${STATUS_TONE[status] || 'info'}` }, String(status || '').replace(/_/g, ' '));
-}
+import {
+  state, MODULES, ROLES, CURRENCIES, h, store, toast, mount, setRouter, fmtTime, fmtNumber, fmtMoney, fmtField,
+  badge, field, api, ApiError, ensureMe, role, isAdmin, isReviewer, renderField, newKey, displayName,
+} from './core.js';
+import { adminRoute } from './admin.js';
 
 // ---------- auth (PKCE) ----------
 function b64url(bytes) {
@@ -185,7 +85,6 @@ function loadSession() {
     }
     state.idToken = token;
     state.claims = claims;
-    state.groups = new Set(claims['cognito:groups'] || []);
     return true;
   } catch {
     store.del('id_token');
@@ -193,41 +92,15 @@ function loadSession() {
   }
 }
 
-const role = () => (state.me && state.me.role) || null;
-const isReviewer = () => role() === 'approvers' || role() === 'admins';
-const isAdmin = () => Boolean(state.me && state.me.canManageUsers);
-const myModules = () => (state.me && state.me.modules) || [];
+const moduleLabel = (id) => (MODULES[id] || {}).label || id;
 
-// The live access profile decides what the screens offer (the token can be up to an hour old).
-async function ensureMe(force = false) {
-  if (!force && state.me && Date.now() - state.meAt < 60000) return state.me;
-  state.me = await api('/me');
-  state.meAt = Date.now();
-  return state.me;
-}
-
-// ---------- API ----------
-async function api(path, options = {}) {
-  const res = await fetch(`${state.cfg.apiBase}${path}`, {
-    ...options,
-    headers: { 'Content-Type': 'application/json', Authorization: state.idToken, ...(options.headers || {}) },
-  });
-  let data = null;
-  try { data = await res.json(); } catch { /* empty or non-JSON body */ }
-  if (res.status === 401) {
-    store.del('id_token');
-    state.idToken = null;
-    state.me = null;
-    throw new Error('Your session has expired. Please sign in again.');
+function valueText(it) {
+  if (it.approvalField && it.amount !== undefined) {
+    const f = (it.fields || []).find((x) => x.label === it.approvalField);
+    if (f) return `${it.approvalField}: ${fmtField(f, it.currency)}`;
+    return `${it.approvalField}: ${fmtNumber(it.amount)}`;
   }
-  if (res.status === 403 && data && data.message === 'Forbidden') {
-    throw new Error('Blocked by the web application firewall (WAF). Remove anything that looks like SQL or script.');
-  }
-  if (!res.ok) {
-    const detail = data && data.details ? ` (${data.details})` : '';
-    throw new Error(((data && data.message) || `Request failed with status ${res.status}`) + detail);
-  }
-  return data;
+  return it.amount ? fmtMoney(it.amount, it.currency) : '';
 }
 
 // ---------- views ----------
@@ -236,12 +109,21 @@ function viewSignedOut() {
     h('section', { class: 'hero card' },
       h('h1', {}, 'One place for every request that needs a yes'),
       h('p', { class: 'lead' },
-        'Raise purchase, access, leave, change or general requests. Policy rules auto-approve the low-risk ones, ',
-        'route the rest to the right approvers, escalate when an SLA is missed, and fulfil approved work automatically.'),
+        'Raise purchase, access, leave, change or general requests on forms your admins design. ',
+        'Each request follows your reporting line and the approver groups it needs, escalates when an SLA is missed, ',
+        'and is fulfilled automatically once approved.'),
       h('button', { class: 'btn primary', onclick: () => signIn().catch((e) => toast(e.message, 'danger')) }, 'Sign in'),
-      h('p', { class: 'muted small' }, 'Sign-in uses Amazon Cognito with mandatory authenticator-app MFA.'),
-    ),
-  );
+      h('p', { class: 'muted small' }, 'Sign-in uses Amazon Cognito with mandatory authenticator-app MFA.')));
+}
+
+function viewNoAccess() {
+  const disabled = state.me && state.me.status === 'DISABLED';
+  mount(h('section', { class: 'card hero' },
+    h('h1', {}, disabled ? 'Your account is disabled' : 'Your access is not set up yet'),
+    h('p', { class: 'lead' }, disabled
+      ? 'An admin has disabled this account, so requests and approvals are switched off. Contact an admin if you think this is a mistake.'
+      : 'You can sign in, but an admin has not given you a role and modules yet. Ask an admin to set up your access.'),
+    h('button', { class: 'btn', onclick: () => { state.meAt = 0; route(); } }, 'Check again')));
 }
 
 async function viewMine() {
@@ -259,107 +141,184 @@ async function viewMine() {
   }
   const rows = items.map((it) => h('tr', { class: 'clickable', onclick: () => { window.location.hash = `#/requests/${it.requestId}`; } },
     h('td', {}, h('div', { class: 'title' }, it.title), h('div', { class: 'muted small mono' }, it.requestId)),
-    h('td', {}, (TYPES[it.type] || {}).label || it.type),
-    h('td', { class: 'num' }, fmtAmount(it)),
-    h('td', {}, badge(it.status)),
+    h('td', {}, moduleLabel(it.type)),
+    h('td', { class: 'small' }, valueText(it)),
+    h('td', {}, badge(it.status),
+      it.levelCount && ['PENDING_APPROVAL', 'ESCALATED'].includes(it.status)
+        ? h('div', { class: 'muted small' }, `Level ${it.currentLevel} of ${it.levelCount}`) : null),
     h('td', { class: 'muted small' }, fmtTime(it.createdAt))));
   mount(header, h('div', { class: 'card flush' },
     h('table', { class: 'table' },
-      h('thead', {}, h('tr', {}, h('th', {}, 'Request'), h('th', {}, 'Type'), h('th', { class: 'num' }, 'Value'), h('th', {}, 'Status'), h('th', {}, 'Created'))),
+      h('thead', {}, h('tr', {}, h('th', {}, 'Request'), h('th', {}, 'Module'), h('th', {}, 'Value'), h('th', {}, 'Status'), h('th', {}, 'Created'))),
       h('tbody', {}, rows))));
 }
 
-function viewNew() {
-  const allowed = Object.keys(TYPES).filter((key) => myModules().includes(key));
-  if (!allowed.length) {
-    mount(h('div', { class: 'section-head' }, h('h2', {}, 'New request')),
-      h('div', { class: 'card empty' },
-        h('h3', {}, 'No request modules yet'),
-        h('p', {}, 'Your account does not have access to any request module. Ask an admin to grant the modules you need.')));
+// ---------- new request: the module decides which fields appear ----------
+async function viewNew() {
+  mount(h('p', { class: 'muted' }, 'Loading forms...'));
+  const { forms } = await api('/forms');
+  const head = h('div', { class: 'section-head' }, h('h2', {}, 'New request'));
+  if (!forms.length) {
+    mount(head, h('div', { class: 'card empty' }, h('h3', {}, 'No request modules yet'),
+      h('p', {}, 'Your account does not have access to any request module, or no form has been set up. Ask an admin.')));
     return;
   }
-  const typeSelect = h('select', { name: 'type', required: true },
-    allowed.map((key) => h('option', { value: key }, TYPES[key].label)));
-  const unitLabel = h('span', {}, TYPES[allowed[0]].unit);
-  const hint = h('p', { class: 'hint' }, TYPES[allowed[0]].hint);
-  const currency = h('select', { name: 'currency' }, ['USD', 'EUR', 'GBP', 'INR', 'SGD', 'AED'].map((c) => h('option', { value: c }, c)));
-  const currencyField = h('label', {}, 'Currency', currency);
-  const update = () => {
-    const t = TYPES[typeSelect.value];
-    unitLabel.textContent = t.unit;
-    hint.textContent = t.hint;
-    currencyField.hidden = !t.money;
+  const preselect = new URLSearchParams(window.location.hash.split('?')[1] || '').get('module');
+  let current = forms.find((f) => f.module === preselect) || (forms.length === 1 ? forms[0] : null);
+  const picker = h('div', { class: 'choice-grid modules', role: 'radiogroup', 'aria-label': 'Module' });
+  const formHost = h('div');
+
+  const paintPicker = () => {
+    picker.replaceChildren(...forms.map((f) => {
+      const input = h('input', { type: 'radio', name: 'module', value: f.module, checked: current && current.module === f.module });
+      input.addEventListener('change', () => { current = f; paintPicker(); paintForm(); });
+      return h('label', { class: 'choice' }, input, h('span', { class: 'choice-body' },
+        h('strong', {}, f.label), h('span', { class: 'muted small' }, (MODULES[f.module] || {}).blurb || '')));
+    }));
   };
-  typeSelect.addEventListener('change', update);
 
-  const form = h('form', { class: 'card form' },
-    h('div', { class: 'grid2' },
-      h('label', {}, 'Type', typeSelect),
-      h('label', {}, unitLabel, h('input', { name: 'amount', type: 'number', min: '0', step: 'any', value: '0', required: true }))),
-    hint,
-    allowed.length < Object.keys(TYPES).length
-      ? h('p', { class: 'muted small' }, `You can raise ${allowed.map((k) => TYPES[k].label).join(', ')} requests. Ask an admin if you need another module.`)
-      : null,
-    h('label', {}, 'Title', h('input', { name: 'title', minlength: '3', maxlength: '120', required: true, placeholder: 'For example: Laptop for new joiner' })),
-    h('label', {}, 'Details', h('textarea', { name: 'description', maxlength: '2000', rows: '4', placeholder: 'Why is this needed? Any links or context for the approver.' })),
-    currencyField,
-    h('div', { class: 'row end' },
-      h('a', { class: 'btn', href: '#/mine' }, 'Cancel'),
-      h('button', { class: 'btn primary', type: 'submit' }, 'Submit request')));
+  const paintForm = () => {
+    if (!current) { formHost.replaceChildren(h('p', { class: 'muted' }, 'Choose a module to see its form.')); return; }
+    const form = current;
+    const key = newKey();
+    const title = h('input', { name: 'title', minlength: '3', maxlength: '120', required: true, placeholder: 'A short summary approvers will see first' });
+    const titleError = h('span', { class: 'field-error', role: 'alert' });
+    const hasAmount = form.fields.some((f) => f.type === 'amount');
+    const currency = h('select', { 'aria-label': 'Currency' }, CURRENCIES.map((c) => h('option', { value: c }, c)));
+    const inputs = form.fields.map((f) => renderField(f));
+    const approvalInput = inputs.find((i) => i.key === form.approvalField);
+    const approvalLabel = (form.fields.find((f) => f.key === form.approvalField) || {}).label;
 
-  form.addEventListener('submit', async (ev) => {
-    ev.preventDefault();
-    const fd = new FormData(form);
-    const t = TYPES[fd.get('type')];
-    const payload = {
-      type: fd.get('type'),
-      title: String(fd.get('title')).trim(),
-      description: String(fd.get('description') || '').trim(),
-      amount: Number(fd.get('amount') || 0),
+    const routeList = h('ol', { class: 'route' });
+    const autoNote = h('p', { class: 'note ok' });
+    const paintRoute = () => {
+      const value = approvalInput ? Number(approvalInput.input.value || 0) : 0;
+      const auto = form.autoApproval && (!approvalInput || value <= Number(form.autoApproval.maxAmount));
+      autoNote.hidden = !form.autoApproval;
+      if (form.autoApproval) {
+        autoNote.textContent = auto
+          ? `An admin lets you self-approve ${form.label} up to ${fmtNumber(form.autoApproval.maxAmount)} until ${form.autoApproval.expiresOn}, so this request will be approved automatically.`
+          : `Your auto-approval covers up to ${fmtNumber(form.autoApproval.maxAmount)}. This value is higher, so it follows the route below.`;
+        autoNote.className = auto ? 'note ok' : 'note';
+      }
+      routeList.classList.toggle('dimmed', Boolean(auto));
+      routeList.replaceChildren(...form.route.map((step) => {
+        const applies = !step.minAmount || value >= step.minAmount;
+        return h('li', { class: applies ? 'applies' : 'skipped' }, step.text, applies ? null : h('span', { class: 'muted small' }, ' (not needed for this value)'));
+      }));
     };
-    if (t.money) payload.currency = fd.get('currency');
-    const button = form.querySelector('button[type=submit]');
-    button.disabled = true;
-    try {
-      const created = await api('/requests', { method: 'POST', body: JSON.stringify(payload) });
-      toast('Submitted. The workflow is evaluating it now.', 'ok');
-      window.location.hash = `#/requests/${created.requestId}`;
-    } catch (e) {
-      toast(e.message, 'danger');
-      button.disabled = false;
-    }
-  });
-  mount(h('div', { class: 'section-head' }, h('h2', {}, 'New request')), form);
-  update();
+    if (approvalInput) approvalInput.input.addEventListener('input', paintRoute);
+
+    const submit = h('button', { class: 'btn primary', type: 'submit' }, 'Submit request');
+    const el = h('form', { class: 'card form', novalidate: true },
+      h('div', { class: 'row spread' }, h('h3', {}, form.label), h('span', { class: 'muted small' }, `Form version ${form.version}`)),
+      h('div', { class: 'dyn-field' }, h('label', {}, 'Title', h('span', { class: 'req' }, ' *')), title, titleError),
+      hasAmount ? h('div', { class: 'dyn-field narrow' }, h('label', {}, 'Currency'), currency) : null,
+      h('div', { class: 'dyn-grid' }, inputs.map((i) => i.node)),
+      h('div', { class: 'route-box' },
+        h('h4', {}, approvalLabel ? `Approval route (depends on ${approvalLabel})` : 'Approval route'),
+        autoNote, routeList),
+      h('div', { class: 'row end' }, h('a', { class: 'btn', href: '#/mine' }, 'Cancel'), submit));
+    paintRoute();
+
+    el.addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      inputs.forEach((i) => i.setError(''));
+      titleError.textContent = '';
+      const fields = {};
+      inputs.forEach((i) => { const v = i.read(); if (v !== undefined) fields[i.key] = v; });
+      const payload = { type: form.module, title: title.value.trim(), fields };
+      if (hasAmount) payload.currency = currency.value;
+      submit.disabled = true;
+      try {
+        const created = await api('/requests', { method: 'POST', body: JSON.stringify(payload), headers: { 'Idempotency-Key': key } });
+        toast('Submitted. The workflow is routing it now.', 'ok');
+        window.location.hash = `#/requests/${created.requestId}`;
+      } catch (e) {
+        const errors = (e instanceof ApiError && e.data && e.data.fieldErrors) || {};
+        Object.entries(errors).forEach(([k, msg]) => {
+          if (k === 'title') titleError.textContent = msg;
+          const target = inputs.find((i) => i.key === k);
+          if (target) target.setError(msg);
+        });
+        toast(e.message, 'danger');
+        submit.disabled = false;
+      }
+    });
+    formHost.replaceChildren(el);
+    title.focus();
+  };
+
+  mount(head, forms.length > 1 ? h('div', { class: 'card' }, h('h4', {}, 'Module'), picker) : null, formHost);
+  paintPicker();
+  paintForm();
 }
 
-function field(label, value) {
-  if (value === undefined || value === null || value === '') return null;
-  return h('div', { class: 'field' }, h('dt', {}, label), h('dd', {}, value));
+// ---------- request detail ----------
+function chainPanel(it) {
+  const plan = it.approvalPlan || {};
+  const levels = plan.levels || [];
+  const decisions = Object.fromEntries((it.approvals || []).map((a) => [Number(a.level), a]));
+  if (it.status === 'AUTO_APPROVED') {
+    return h('div', { class: 'card' }, h('h3', {}, 'Approval'),
+      h('p', { class: 'note ok' }, 'Approved automatically under an auto-approval rule an admin granted to the requester.'));
+  }
+  if (it.status === 'UNROUTABLE') {
+    return h('div', { class: 'card' }, h('h3', {}, 'Approval'),
+      h('p', { class: 'note warn' }, 'Nobody was eligible to approve this request, so it stopped. An admin needs to fix the reporting line or approver groups; then raise it again.'));
+  }
+  if (!levels.length) {
+    return h('div', { class: 'card' }, h('h3', {}, 'Approval'), h('p', { class: 'muted' }, 'Working out the approval route...'));
+  }
+  const current = Number(it.currentLevel || 0);
+  const open = ['PENDING_APPROVAL', 'ESCALATED'].includes(it.status);
+  const steps = levels.map((level) => {
+    const d = decisions[level.index];
+    let tone = 'upcoming';
+    let line = `Next, after the level above: ${(level.approverNames || []).join(' or ')}`;
+    if (d) {
+      tone = d.decision === 'APPROVED' ? 'done' : 'rejected';
+      line = `${d.decision === 'APPROVED' ? 'Approved' : 'Rejected'} by ${d.decidedByEmail || d.decidedBy} on ${fmtTime(d.at)}`;
+    } else if (open && level.index === current) {
+      tone = it.status === 'ESCALATED' ? 'escalated' : 'active';
+      line = it.status === 'ESCALATED'
+        ? `SLA missed, escalated to admins: ${(plan.escalateToNames || []).join(', ')}`
+        : `Waiting for ${(level.approverNames || []).join(' or ')} since ${fmtTime(it.levelStartedAt)}`;
+    } else if (!open) {
+      tone = 'skipped';
+      line = 'Not reached';
+    }
+    return h('li', { class: `step ${tone}` },
+      h('div', { class: 'step-head' }, h('strong', {}, `Level ${level.index}: ${level.label}`),
+        level.fallback ? h('span', { class: 'chip' }, 'admins standing in') : null),
+      h('div', { class: 'small' }, line),
+      d && d.comment ? h('div', { class: 'muted small quote' }, d.comment) : null);
+  });
+  return h('div', { class: 'card' },
+    h('div', { class: 'row spread' }, h('h3', {}, 'Approval chain'),
+      h('span', { class: 'muted small' }, `${plan.version || ''}${plan.slaSeconds ? `, ${Math.round(plan.slaSeconds / 60)} min per level before escalation` : ''}`)),
+    h('ol', { class: 'chain' }, steps));
 }
 
 async function viewDetail(requestId, attempt = 0) {
   if (attempt === 0) mount(h('p', { class: 'muted' }, 'Loading request...'));
   const it = await api(`/requests/${encodeURIComponent(requestId)}`);
 
-  // The workflow usually moves a new request on within a second or two.
+  // The workflow usually routes a new request within a second or two.
   // Re-check a few times, then stop (each check is a Lambda call, and the playground caps them).
   if (it.status === 'SUBMITTED' && attempt < 3) {
     setTimeout(() => { if (window.location.hash === `#/requests/${requestId}`) viewDetail(requestId, attempt + 1).catch(showError); }, 2500);
   }
 
   const reasons = Array.isArray(it.policyReasons) ? it.policyReasons : [];
+  const fields = h('dl', { class: 'facts' },
+    (it.fields || []).map((f) => field(f.label, f.type === 'textarea' ? h('span', { class: 'desc' }, fmtField(f, it.currency)) : fmtField(f, it.currency))));
   const facts = h('dl', { class: 'facts' },
-    field('Type', (TYPES[it.type] || {}).label || it.type),
-    field('Value', fmtAmount(it)),
-    field('Requested by', it.requesterEmail),
+    field('Module', moduleLabel(it.type)),
+    field('Requested by', it.requesterName ? `${it.requesterName} (${it.requesterEmail})` : it.requesterEmail),
     field('Created', fmtTime(it.createdAt)),
     field('Last update', fmtTime(it.lastUpdated)),
-    field('Risk tier', it.riskTier && it.riskTier !== 'UNASSESSED' ? it.riskTier : null),
-    field('Approver group', it.approverGroup && it.approverGroup !== 'none' ? it.approverGroup : null),
-    field('Approval SLA', it.slaSeconds ? `${it.slaSeconds} seconds, then escalates to admins` : null),
-    field('Escalated', fmtTime(it.escalatedAt)),
-    field('Decided by', it.decidedByEmail || (it.decidedBy === 'policy-engine' ? 'Policy engine (auto-approved)' : null)),
+    field('Decided by', it.decidedByEmail || (it.decidedBy === 'policy-engine' ? 'Auto-approval rule' : null)),
     field('Decision note', it.decisionComment),
     field('Fulfilment reference', it.fulfilmentRef),
     field('Fulfilled', fmtTime(it.fulfilledAt)));
@@ -369,13 +328,13 @@ async function viewDetail(requestId, attempt = 0) {
       h('div', {}, h('a', { href: '#/mine', class: 'muted small' }, 'Back to my requests'), h('h2', {}, it.title)),
       h('div', { class: 'row' }, badge(it.status), h('button', { class: 'btn', onclick: () => viewDetail(requestId).catch(showError) }, 'Refresh'))),
     h('div', { class: 'card' },
-      it.description ? h('p', { class: 'desc' }, it.description) : null,
-      facts,
-      reasons.length ? h('div', { class: 'reasons' }, h('h3', {}, 'Why the policy engine decided this'), h('ul', {}, reasons.map((r) => h('li', {}, r)))) : null,
+      h('div', { class: 'row spread' }, h('h3', {}, 'Details'), it.formVersion ? h('span', { class: 'muted small' }, `Form version ${it.formVersion}`) : null),
+      fields, facts,
+      reasons.length ? h('div', { class: 'reasons' }, h('h3', {}, 'How the route was decided'), h('ul', {}, reasons.map((r) => h('li', {}, r)))) : null,
       h('p', { class: 'muted small mono' }, `Request ID ${it.requestId}`)),
+    chainPanel(it),
   ];
-
-  if (it.canDecide) blocks.push(decisionPanel(it));
+  if (it.canDecide) blocks.splice(2, 0, decisionPanel(it));
   blocks.push(attachmentsPanel(it));
   mount(...blocks);
 }
@@ -388,7 +347,7 @@ function decisionPanel(it) {
       await api(`/requests/${encodeURIComponent(it.requestId)}/decision`, {
         method: 'POST', body: JSON.stringify({ decision, comment: comment.value.trim() }),
       });
-      toast(`Recorded: ${decision.toLowerCase()}. The workflow is updating the request.`, 'ok');
+      toast(`Recorded: ${decision.toLowerCase()}. The workflow is moving the request on.`, 'ok');
       setTimeout(() => viewDetail(it.requestId).catch(showError), 1500);
     } catch (e) {
       toast(e.message, 'danger');
@@ -399,9 +358,12 @@ function decisionPanel(it) {
   const reject = h('button', { class: 'btn danger' }, 'Reject');
   approve.addEventListener('click', () => decide('APPROVED', [approve, reject]));
   reject.addEventListener('click', () => decide('REJECTED', [approve, reject]));
+  const more = Number(it.levelCount || 1) > Number(it.currentLevel || 1);
   return h('div', { class: 'card accent' },
-    h('h3', {}, it.status === 'ESCALATED' ? 'Escalated: admin decision needed' : 'Your decision'),
-    h('p', { class: 'muted small' }, 'Your decision resumes the paused Step Functions workflow through its task token.'),
+    h('h3', {}, it.status === 'ESCALATED' ? 'Escalated to you: decision needed' : `Your decision (level ${it.currentLevel} of ${it.levelCount})`),
+    h('p', { class: 'muted small' }, more
+      ? 'Approving passes the request to the next level. Rejecting ends it.'
+      : 'This is the last level: approving completes the approval and starts fulfilment.'),
     comment,
     h('div', { class: 'row end' }, reject, approve));
 }
@@ -453,7 +415,9 @@ async function viewInbox() {
   mount(h('p', { class: 'muted' }, 'Loading approvals...'));
   const data = await api('/approvals');
   const items = data.items || [];
-  const header = h('div', { class: 'section-head' }, h('h2', {}, 'Approvals waiting for you'),
+  const header = h('div', { class: 'section-head' },
+    h('div', {}, h('h2', {}, 'Approvals waiting for you'),
+      h('p', { class: 'muted small' }, 'Requests where you are named on the current level: as a line manager, a member of an approver group, or an admin standing in.')),
     h('button', { class: 'btn', onclick: () => route() }, 'Refresh'));
   if (!items.length) {
     mount(header, h('div', { class: 'card empty' }, 'Nothing is waiting for you right now.'));
@@ -461,365 +425,12 @@ async function viewInbox() {
   }
   mount(header, h('div', { class: 'cards' }, items.map((it) => h('a', { class: 'card tile', href: `#/requests/${it.requestId}` },
     h('div', { class: 'row spread' }, h('strong', {}, it.title), badge(it.status)),
-    h('div', { class: 'muted small' }, `${(TYPES[it.type] || {}).label || it.type} for ${fmtAmount(it)}, from ${it.requesterEmail}`),
-    h('div', { class: 'muted small' }, `Risk ${it.riskTier}, group ${it.approverGroup}, raised ${fmtTime(it.createdAt)}`)))));
+    h('div', { class: 'muted small' }, `${moduleLabel(it.type)} from ${it.requesterName || it.requesterEmail}. ${valueText(it)}`),
+    h('div', { class: 'small' }, `Level ${it.currentLevel} of ${it.levelCount}: ${it.approverGroup}`),
+    h('div', { class: 'muted small' }, `Raised ${fmtTime(it.createdAt)}`)))));
 }
 
-// ---------- access and user management ----------
-function viewNoAccess() {
-  const disabled = state.me && state.me.status === 'DISABLED';
-  mount(h('section', { class: 'card hero' },
-    h('h1', {}, disabled ? 'Your account is disabled' : 'Your access is not set up yet'),
-    h('p', { class: 'lead' }, disabled
-      ? 'An admin has disabled this account, so requests and approvals are switched off. Contact an admin if you think this is a mistake.'
-      : 'You can sign in, but an admin has not given you a role and modules yet. Ask an admin to set up your access.'),
-    h('button', { class: 'btn', onclick: () => { state.meAt = 0; route(); } }, 'Check again')));
-}
-
-function confirmDialog({ title, body, confirmLabel = 'Confirm', danger = false, typeToConfirm = null }) {
-  const dialog = document.getElementById('confirm');
-  const ok = document.getElementById('confirmOk');
-  const typeWrap = document.getElementById('confirmTypeWrap');
-  const typeInput = document.getElementById('confirmType');
-  document.getElementById('confirmTitle').textContent = title;
-  document.getElementById('confirmBody').textContent = body;
-  ok.textContent = confirmLabel;
-  ok.className = `btn ${danger ? 'danger solid' : 'primary'}`;
-  typeWrap.hidden = !typeToConfirm;
-  typeInput.value = '';
-  if (typeToConfirm) {
-    document.getElementById('confirmTypeLabel').textContent = `Type ${typeToConfirm} to confirm`;
-    ok.disabled = true;
-    typeInput.oninput = () => { ok.disabled = typeInput.value.trim().toLowerCase() !== typeToConfirm.toLowerCase(); };
-  } else {
-    ok.disabled = false;
-  }
-  return new Promise((resolve) => {
-    dialog.addEventListener('close', () => resolve(dialog.returnValue === 'ok'), { once: true });
-    dialog.showModal();
-    (typeToConfirm ? typeInput : ok).focus();
-  });
-}
-
-function initials(user) {
-  const source = (user.name || user.email || '?').trim();
-  const parts = source.split(/[\s@._-]+/).filter(Boolean);
-  return ((parts[0] || '?')[0] + ((parts[1] || '')[0] || '')).toUpperCase();
-}
-
-function avatar(user) {
-  return h('span', { class: 'avatar', 'aria-hidden': 'true' }, initials(user));
-}
-
-function roleBadge(roleId) {
-  if (!roleId) return h('span', { class: 'badge muted' }, 'No role');
-  return h('span', { class: `badge role-${roleId}` }, (ROLES[roleId] || {}).label || roleId);
-}
-
-function accessBadge(status) {
-  return h('span', { class: `badge ${ACCESS_TONE[status] || 'muted'}` }, ACCESS_LABEL[status] || status);
-}
-
-function signInBadge(status) {
-  const [label, tone] = SIGN_IN[status] || [String(status || 'Unknown').replace(/_/g, ' ').toLowerCase(), 'muted'];
-  return h('span', { class: `badge ${tone}` }, label);
-}
-
-function moduleChips(user) {
-  if (user.role === 'admins') return h('span', { class: 'chip strong' }, 'All modules');
-  if (!user.modules || !user.modules.length) return h('span', { class: 'muted small' }, 'None');
-  return h('div', { class: 'chips' }, user.modules.map((m) => h('span', { class: 'chip' }, (MODULES[m] || {}).label || m)));
-}
-
-function stat(label, value, tone = '') {
-  return h('div', { class: `stat ${tone}` }, h('div', { class: 'stat-value' }, String(value)), h('div', { class: 'stat-label' }, label));
-}
-
-async function viewUsers() {
-  if (!isAdmin()) { window.location.hash = '#/mine'; return; }
-  mount(h('p', { class: 'muted' }, 'Loading users...'));
-  const data = await api('/admin/users');
-  const users = data.items || [];
-  const summary = data.summary || {};
-
-  const search = h('input', { type: 'search', placeholder: 'Search by name or email', 'aria-label': 'Search users' });
-  const roleFilter = h('select', { 'aria-label': 'Filter by role' },
-    h('option', { value: '' }, 'All roles'),
-    Object.entries(ROLES).map(([id, r]) => h('option', { value: id }, r.label)));
-  const statusFilter = h('select', { 'aria-label': 'Filter by status' },
-    h('option', { value: '' }, 'Any status'),
-    h('option', { value: 'ACTIVE' }, 'Active'),
-    h('option', { value: 'DISABLED' }, 'Disabled'),
-    h('option', { value: 'NO_PROFILE' }, 'No access set up'),
-    h('option', { value: 'INVITED' }, 'Invite pending'));
-  const tbody = h('tbody');
-  const count = h('span', { class: 'muted small' });
-
-  const paint = () => {
-    const q = search.value.trim().toLowerCase();
-    const shown = users.filter((u) => {
-      if (q && !`${u.name || ''} ${u.email || ''}`.toLowerCase().includes(q)) return false;
-      if (roleFilter.value && u.role !== roleFilter.value) return false;
-      if (statusFilter.value === 'INVITED') return u.cognitoStatus === 'FORCE_CHANGE_PASSWORD';
-      if (statusFilter.value && u.status !== statusFilter.value) return false;
-      return true;
-    });
-    count.textContent = `${shown.length} of ${users.length} users`;
-    tbody.replaceChildren(...(shown.length ? shown.map((u) => h('tr', {
-      class: `clickable${u.status === 'DISABLED' ? ' dim' : ''}`,
-      tabindex: '0',
-      onclick: () => { window.location.hash = `#/users/${u.userId}`; },
-      onkeydown: (ev) => { if (ev.key === 'Enter') window.location.hash = `#/users/${u.userId}`; },
-    },
-    h('td', {}, h('div', { class: 'person' }, avatar(u),
-      h('div', { class: 'person-text' }, h('div', { class: 'title' }, u.name || u.email), u.name ? h('div', { class: 'muted small' }, u.email) : null,
-        h('div', { class: 'row tight' },
-          u.userId === state.me.userId ? h('span', { class: 'chip' }, 'You') : null,
-          h('span', { class: 'mobile-only' }, roleBadge(u.role)))))),
-    h('td', {}, roleBadge(u.role)),
-    h('td', {}, moduleChips(u)),
-    h('td', {}, signInBadge(u.cognitoStatus)),
-    h('td', {}, accessBadge(u.status)),
-    h('td', { class: 'muted small' }, fmtTime(u.updatedAt || u.createdAt))))
-      : [h('tr', {}, h('td', { colspan: '6', class: 'empty' }, 'No users match these filters.'))]));
-  };
-  [search, roleFilter, statusFilter].forEach((el) => el.addEventListener('input', paint));
-
-  mount(
-    h('div', { class: 'section-head' },
-      h('div', {}, h('h2', {}, 'Users'), h('p', { class: 'muted small' }, 'Invite people, choose their role and decide which request modules they can use. Changes apply on their next click, not their next sign-in.')),
-      h('div', { class: 'row' },
-        h('button', { class: 'btn', onclick: () => route() }, 'Refresh'),
-        h('a', { class: 'btn primary', href: '#/users/new' }, 'Invite user'))),
-    h('div', { class: 'stats' },
-      stat('Users', summary.total ?? users.length),
-      stat('Active', summary.active ?? 0, 'ok'),
-      stat('Invites pending', summary.invitesPending ?? 0, 'warn'),
-      stat('Disabled', summary.disabled ?? 0, 'danger'),
-      stat('Admins', summary.admins ?? 0, 'tone-brand')),
-    h('div', { class: 'toolbar' }, search, roleFilter, statusFilter, count),
-    h('div', { class: 'card flush' },
-      h('table', { class: 'table users' },
-        h('thead', {}, h('tr', {}, h('th', {}, 'User'), h('th', {}, 'Role'), h('th', {}, 'Modules'), h('th', {}, 'Sign-in'), h('th', {}, 'Access'), h('th', {}, 'Updated'))),
-        tbody)));
-  paint();
-}
-
-// Role picker and module checkboxes, shared by the invite form and the user page.
-function accessEditor(initial = { role: 'requesters', modules: [] }) {
-  const roleName = `role-${Math.random().toString(36).slice(2, 8)}`;
-  const roleInputs = {};
-  const roleCards = h('div', { class: 'choice-grid roles' }, Object.entries(ROLES).map(([id, r]) => {
-    const input = h('input', { type: 'radio', name: roleName, value: id, checked: initial.role === id });
-    roleInputs[id] = input;
-    return h('label', { class: 'choice' }, input, h('span', { class: 'choice-body' }, h('strong', {}, r.label), h('span', { class: 'muted small' }, r.blurb)));
-  }));
-  const moduleInputs = {};
-  const moduleCards = h('div', { class: 'choice-grid' }, Object.entries(MODULES).map(([id, m]) => {
-    const input = h('input', { type: 'checkbox', value: id, checked: (initial.modules || []).includes(id) });
-    moduleInputs[id] = input;
-    return h('label', { class: 'choice' }, input, h('span', { class: 'choice-body' }, h('strong', {}, m.label), h('span', { class: 'muted small' }, m.blurb)));
-  }));
-  const adminNote = h('p', { class: 'note' }, 'Admins can use every module, so module choices do not apply.');
-  const quick = h('div', { class: 'row small' },
-    h('button', { type: 'button', class: 'linkish', onclick: () => { Object.values(moduleInputs).forEach((i) => { i.checked = true; }); } }, 'Select all'),
-    h('button', { type: 'button', class: 'linkish', onclick: () => { Object.values(moduleInputs).forEach((i) => { i.checked = false; }); } }, 'Clear'));
-
-  const sync = () => {
-    const isAdminRole = roleInputs.admins.checked;
-    moduleCards.classList.toggle('disabled', isAdminRole);
-    Object.values(moduleInputs).forEach((i) => { i.disabled = isAdminRole; });
-    adminNote.hidden = !isAdminRole;
-    quick.hidden = isAdminRole;
-  };
-  Object.values(roleInputs).forEach((i) => i.addEventListener('change', sync));
-  sync();
-
-  return {
-    node: h('div', { class: 'access-editor' },
-      h('h4', {}, 'Role'), roleCards,
-      h('div', { class: 'row spread' }, h('h4', {}, 'Request modules'), quick),
-      moduleCards, adminNote),
-    value() {
-      const roleId = Object.keys(roleInputs).find((id) => roleInputs[id].checked);
-      const modules = Object.keys(moduleInputs).filter((id) => moduleInputs[id].checked);
-      return { role: roleId, modules };
-    },
-    setDisabled(disabled) {
-      Object.values(roleInputs).forEach((i) => { i.disabled = disabled; });
-      if (disabled) Object.values(moduleInputs).forEach((i) => { i.disabled = true; }); else sync();
-    },
-  };
-}
-
-function viewUserNew() {
-  if (!isAdmin()) { window.location.hash = '#/mine'; return; }
-  const editor = accessEditor({ role: 'requesters', modules: ['GENERAL'] });
-  const invite = h('input', { type: 'checkbox', name: 'sendInvite', checked: true });
-  const form = h('form', { class: 'card form' },
-    h('div', { class: 'grid2' },
-      h('label', {}, 'Email', h('input', { name: 'email', type: 'email', required: true, maxlength: '254', placeholder: 'name@company.com', autocomplete: 'off' })),
-      h('label', {}, 'Full name', h('input', { name: 'name', maxlength: '80', placeholder: 'Optional', autocomplete: 'off' }))),
-    editor.node,
-    h('label', { class: 'check' }, invite, h('span', {}, 'Email the invitation now. Cognito sends a temporary password; the person sets a new one and enrols an authenticator app at first sign-in.')),
-    h('div', { class: 'row end' },
-      h('a', { class: 'btn', href: '#/users' }, 'Cancel'),
-      h('button', { class: 'btn primary', type: 'submit' }, 'Invite user')));
-
-  form.addEventListener('submit', async (ev) => {
-    ev.preventDefault();
-    const fd = new FormData(form);
-    const access = editor.value();
-    const payload = {
-      email: String(fd.get('email')).trim(),
-      name: String(fd.get('name') || '').trim(),
-      role: access.role,
-      modules: access.role === 'admins' ? [] : access.modules,
-      sendInvite: invite.checked,
-    };
-    if (payload.role !== 'admins' && !payload.modules.length) {
-      const go = await confirmDialog({ title: 'Invite without any module?', body: 'This person will be able to sign in but not raise or approve any request until you grant a module.', confirmLabel: 'Invite anyway' });
-      if (!go) return;
-    }
-    if (payload.role === 'admins') {
-      const go = await confirmDialog({ title: 'Invite a new admin?', body: `${payload.email} will be able to approve anything and manage every user, including you. The ops team is alerted about new admins.`, confirmLabel: 'Invite admin', danger: true });
-      if (!go) return;
-    }
-    const button = form.querySelector('button[type=submit]');
-    button.disabled = true;
-    try {
-      const res = await api('/admin/users', { method: 'POST', body: JSON.stringify(payload) });
-      toast(res.invited ? `Invitation emailed to ${payload.email}` : `${payload.email} created. Send the invitation when they are ready.`, 'ok');
-      window.location.hash = `#/users/${res.user.userId}`;
-    } catch (e) {
-      toast(e.message, 'danger');
-      button.disabled = false;
-    }
-  });
-
-  mount(h('div', { class: 'section-head' },
-    h('div', {}, h('a', { href: '#/users', class: 'muted small' }, 'Back to users'), h('h2', {}, 'Invite a user'))), form);
-}
-
-async function viewUserDetail(userId) {
-  if (!isAdmin()) { window.location.hash = '#/mine'; return; }
-  mount(h('p', { class: 'muted' }, 'Loading user...'));
-  const { user } = await api(`/admin/users/${encodeURIComponent(userId)}`);
-  const isSelf = user.userId === state.me.userId;
-  const invited = user.cognitoStatus === 'FORCE_CHANGE_PASSWORD';
-
-  // Access card
-  const editor = accessEditor({ role: user.role || 'requesters', modules: user.modules || [] });
-  const nameInput = h('input', { value: user.name || '', maxlength: '80', placeholder: 'Full name' });
-  const save = h('button', { class: 'btn primary', type: 'submit' }, user.managed ? 'Save access' : 'Set up access');
-  const accessForm = h('form', { class: 'card form' },
-    h('div', { class: 'row spread' }, h('h3', {}, 'Access'), h('span', { class: 'muted small' }, 'Takes effect on the next click. No sign-out needed.')),
-    !user.managed ? h('p', { class: 'note warn' }, 'This account was created outside Request Hub and has no access profile, so it cannot use the app yet. Choose a role and modules to set it up.') : null,
-    h('label', {}, 'Full name', nameInput),
-    editor.node,
-    isSelf ? h('p', { class: 'note' }, 'You cannot remove your own admin role. Another admin has to do that.') : null,
-    h('div', { class: 'row end' }, save));
-  if (isSelf) editor.setDisabled(true);
-
-  accessForm.addEventListener('submit', async (ev) => {
-    ev.preventDefault();
-    const access = editor.value();
-    const payload = { name: nameInput.value.trim() };
-    if (!isSelf) { payload.role = access.role; payload.modules = access.role === 'admins' ? (user.modules || []) : access.modules; }
-    if (user.managed && user.version !== undefined && user.version !== null) payload.version = user.version;
-    if (!isSelf && access.role === 'admins' && user.role !== 'admins') {
-      const go = await confirmDialog({ title: `Make ${user.email} an admin?`, body: 'Admins can approve anything and manage every user. The ops team is alerted about new admins.', confirmLabel: 'Make admin', danger: true });
-      if (!go) return;
-    }
-    save.disabled = true;
-    try {
-      const res = await api(`/admin/users/${encodeURIComponent(user.userId)}`, { method: 'PATCH', body: JSON.stringify(payload) });
-      toast(res.changed ? 'Access saved. It applies immediately.' : 'Nothing changed.', res.changed ? 'ok' : 'info');
-      await viewUserDetail(user.userId);
-    } catch (e) {
-      toast(e.message, 'danger');
-      save.disabled = false;
-    }
-  });
-
-  // Account card with lifecycle actions
-  const act = async (action, opts) => {
-    if (opts.confirm) {
-      const go = await confirmDialog(opts.confirm);
-      if (!go) return;
-    }
-    try {
-      const res = await api(`/admin/users/${encodeURIComponent(user.userId)}/actions`, { method: 'POST', body: JSON.stringify({ action }) });
-      toast(res.message, 'ok');
-      await viewUserDetail(user.userId);
-    } catch (e) {
-      toast(e.message, 'danger');
-    }
-  };
-  const actions = [];
-  if (user.status === 'DISABLED') {
-    actions.push(h('button', { class: 'btn ok', onclick: () => act('ENABLE', {}) }, 'Enable account'));
-  } else if (!isSelf) {
-    actions.push(h('button', { class: 'btn danger', onclick: () => act('DISABLE', { confirm: { title: `Disable ${user.email}?`, body: 'Sign-in is blocked, every session is signed out, and API access stops on their very next click. You can enable the account again later.', confirmLabel: 'Disable', danger: true } }) }, 'Disable account'));
-  }
-  if (invited) {
-    actions.push(h('button', { class: 'btn', onclick: () => act('RESEND_INVITE', { confirm: { title: 'Resend the invitation?', body: `Cognito emails ${user.email} a new temporary password. The old one stops working.`, confirmLabel: 'Resend' } }) }, 'Resend invitation'));
-  } else if (user.cognitoStatus !== 'MISSING') {
-    actions.push(h('button', { class: 'btn', onclick: () => act('RESET_PASSWORD', { confirm: { title: 'Reset the password?', body: `Cognito emails ${user.email} a verification code. They must choose a new password at their next sign-in.`, confirmLabel: 'Reset password' } }) }, 'Reset password'));
-    actions.push(h('button', { class: 'btn', onclick: () => act('RESET_MFA', { confirm: { title: 'Reset the authenticator?', body: 'Use this when someone loses their phone. They are signed out and enrol a new authenticator app at their next sign-in.', confirmLabel: 'Reset authenticator' } }) }, 'Reset authenticator'));
-  }
-  if (user.cognitoStatus !== 'MISSING') {
-    actions.push(h('button', { class: 'btn', onclick: () => act('SIGN_OUT', { confirm: { title: 'Sign out everywhere?', body: 'Revokes every refresh token for this user. They sign in again with their password and authenticator.', confirmLabel: 'Sign out everywhere' } }) }, 'Sign out everywhere'));
-  }
-
-  const account = h('div', { class: 'card' },
-    h('h3', {}, 'Account'),
-    h('dl', { class: 'facts' },
-      field('Sign-in', SIGN_IN[user.cognitoStatus] ? SIGN_IN[user.cognitoStatus][0] : user.cognitoStatus),
-      field('MFA', user.mfa),
-      field('Cognito groups', (user.groups || []).join(', ') || 'None'),
-      field('Created', fmtTime(user.createdAt)),
-      field('Last access change', user.updatedAt ? `${fmtTime(user.updatedAt)}${user.updatedByEmail ? ` by ${user.updatedByEmail}` : ''}` : null),
-      field('User ID', h('span', { class: 'mono small' }, user.userId))),
-    h('div', { class: 'row' }, actions));
-
-  // Danger zone
-  const danger = isSelf ? null : h('div', { class: 'card danger-zone' },
-    h('h3', {}, 'Delete user'),
-    h('p', { class: 'muted small' }, 'Removes the sign-in and the access profile. Their requests and this access history are kept for audit.'),
-    h('button', {
-      class: 'btn danger',
-      onclick: async () => {
-        const go = await confirmDialog({ title: `Delete ${user.email}?`, body: 'This cannot be undone. They lose access immediately, and you would need to invite them again.', confirmLabel: 'Delete user', danger: true, typeToConfirm: user.email });
-        if (!go) return;
-        try {
-          await api(`/admin/users/${encodeURIComponent(user.userId)}`, { method: 'DELETE' });
-          toast(`${user.email} deleted`, 'ok');
-          window.location.hash = '#/users';
-        } catch (e) {
-          toast(e.message, 'danger');
-        }
-      },
-    }, 'Delete user'));
-
-  // History
-  const historyCard = h('div', { class: 'card' }, h('h3', {}, 'Access history'),
-    (user.history || []).length
-      ? h('ol', { class: 'timeline' }, user.history.map((entry) => h('li', {},
-        h('div', { class: 'row spread' }, h('strong', {}, HISTORY_LABEL[entry.action] || entry.action), h('span', { class: 'muted small' }, fmtTime(entry.at))),
-        h('div', {}, entry.summary),
-        h('div', { class: 'muted small' }, `by ${entry.actorEmail || entry.actorId}`))))
-      : h('p', { class: 'muted small' }, 'No changes recorded yet.'));
-
-  mount(
-    h('div', { class: 'section-head' },
-      h('div', {}, h('a', { href: '#/users', class: 'muted small' }, 'Back to users'),
-        h('div', { class: 'person big' }, avatar(user), h('div', {}, h('h2', {}, user.name || user.email), user.name ? h('div', { class: 'muted' }, user.email) : null))),
-      h('div', { class: 'row' }, roleBadge(user.role), accessBadge(user.status), signInBadge(user.cognitoStatus))),
-    h('div', { class: 'split' }, h('div', {}, accessForm), h('div', {}, account, historyCard, danger)));
-}
-
-// ---------- router ----------
+// ---------- chrome and router ----------
 function showError(e) {
   toast(e.message, 'danger');
   if (!state.idToken) viewSignedOut();
@@ -836,13 +447,13 @@ function paintChrome() {
   const active = state.me && state.me.status === 'ACTIVE';
   nav.hidden = !active;
   document.getElementById('inboxTab').hidden = !isReviewer();
-  document.getElementById('usersTab').hidden = !isAdmin();
-  const current = (window.location.hash.split('/')[1] || 'mine');
+  document.getElementById('adminTab').hidden = !isAdmin();
+  const current = (window.location.hash.split('/')[1] || 'mine').split('?')[0];
   nav.querySelectorAll('a').forEach((a) => a.classList.toggle('active', a.dataset.view === current));
-  who.replaceChildren(
-    h('span', { class: 'small' }, (state.me && state.me.email) || state.claims.email || ''),
+  who.replaceChildren(...[
+    h('span', { class: 'small' }, displayName(state.me || state.claims || {})),
     role() ? h('span', { class: 'chip' }, (ROLES[role()] || {}).label || role()) : null,
-    h('button', { class: 'btn ghost', onclick: signOut }, 'Sign out'));
+    h('button', { class: 'btn ghost', onclick: signOut }, 'Sign out')].filter(Boolean));
 }
 
 async function route() {
@@ -852,17 +463,16 @@ async function route() {
     viewSignedOut();
     return;
   }
-  const parts = window.location.hash.replace(/^#\/?/, '').split('/');
+  const parts = window.location.hash.replace(/^#\/?/, '').split('?')[0].split('/');
+  if (parts[0] === 'users') { window.location.hash = `#/admin/${parts.join('/')}`; return; }
   try {
-    await ensureMe(parts[0] === 'users');
+    await ensureMe(parts[0] === 'admin');
     paintChrome();
     if (state.me.status !== 'ACTIVE') { viewNoAccess(); return; }
-    if (parts[0] === 'new') viewNew();
+    if (parts[0] === 'new') await viewNew();
     else if (parts[0] === 'inbox') await viewInbox();
     else if (parts[0] === 'requests' && parts[1]) await viewDetail(parts[1]);
-    else if (parts[0] === 'users' && parts[1] === 'new') viewUserNew();
-    else if (parts[0] === 'users' && parts[1]) await viewUserDetail(parts[1]);
-    else if (parts[0] === 'users') await viewUsers();
+    else if (parts[0] === 'admin') await adminRoute(parts.slice(1));
     else await viewMine();
   } catch (e) {
     paintChrome();
@@ -879,6 +489,7 @@ async function start() {
     mount(h('div', { class: 'card' }, h('h2', {}, 'Not configured yet'), h('p', {}, e.message)));
     return;
   }
+  setRouter(route);
   const params = new URLSearchParams(window.location.search);
   if (params.get('code')) {
     try {

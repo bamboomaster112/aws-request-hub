@@ -15,10 +15,11 @@ from botocore.exceptions import ClientError
 import hubkit
 
 SYMBOLS = "!@#%^*-_=+"
+# A small reporting line for the smoke test: requester -> approver -> admin.
 TEST_USERS = [
-    ("requester", "requester@example.com", ["requesters"]),
-    ("approver", "approver@example.com", ["approvers"]),
-    ("admin", "admin@example.com", ["admins"]),
+    ("admin", "admin@example.com", ["admins"], None),
+    ("approver", "approver@example.com", ["approvers"], "admin"),
+    ("requester", "requester@example.com", ["requesters"], "approver"),
 ]
 
 
@@ -31,7 +32,7 @@ def strong_password(length=20):
             return pw
 
 
-def recreate_user(out, email, groups):
+def recreate_user(out, email, groups, manager_id=None):
     pool = out["UserPoolId"]
     previous = hubkit.user_id_for(out, email)
     if previous:
@@ -49,9 +50,9 @@ def recreate_user(out, email, groups):
     user_id = {a["Name"]: a["Value"] for a in created["Attributes"]}.get("sub", created["Username"])
     # Test users hold every module so the smoke test can raise any request type.
     hubkit.put_profile(out, user_id, created["Username"], email, groups[0], hubkit.ALL_MODULES,
-                       name=f"Test {groups[0][:-1]}", actor="seed-users.py")
+                       name=f"Test {groups[0][:-1]}", actor="seed-users.py", manager_id=manager_id, department="Smoke test")
     print(f"  created {email} in {', '.join(groups)} with an access profile")
-    return password
+    return password, user_id
 
 
 def enrol_mfa(out, email, password):
@@ -81,11 +82,12 @@ def main():
     out = hubkit.outputs()
     users = {}
     print(f"Seeding test users in {out['UserPoolId']}")
-    for role, email, groups in TEST_USERS:
-        password = recreate_user(out, email, groups)
-        users[role] = {"username": email, "password": password, "groups": groups,
+    for role, email, groups, manager in TEST_USERS:
+        manager_id = users[manager]["userId"] if manager else None
+        password, user_id = recreate_user(out, email, groups, manager_id)
+        users[role] = {"username": email, "password": password, "groups": groups, "userId": user_id,
                        "totpSecret": enrol_mfa(out, email, password)}
-        print(f"  {role}: MFA enrolled")
+        print(f"  {role}: MFA enrolled" + (f", reports to {manager}" if manager else ""))
     hubkit.save_users(users)
     print(f"Stored credentials (mode 600) in {hubkit.USERS_FILE}")
     print("For the web app, create your own admin (Cognito emails a temporary password and you enrol MFA")
