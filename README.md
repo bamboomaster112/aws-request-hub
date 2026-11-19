@@ -189,6 +189,8 @@ python3 scripts/seed-users.py && python3 tests/ui/run_ui_tests.py --live   # the
 
 `scripts/auth-check.py` covers sign-in from the other side, against Cognito and API Gateway: MFA required with an authenticator app, the password policy, no self sign-up, threat protection, a public code-flow-only client that can only return to the app; the hosted UI accepting the app's request and refusing a foreign return URL; a throwaway user's whole first sign-in (temporary password, weak new password refused, authenticator enrolment before any token, a TOTP code at every later sign-in, wrong codes and passwords refused, unknown emails answered like wrong passwords, global sign-out revoking the refresh token, a disabled account refused); and the authorizer refusing no token, garbage, a tampered token and an access token before the app sees them. No email is sent and no password is printed. Other options: `--headed`, `--slow-mo 300`, `--only two_level_chain`, `--list`.
 
+A UX review of the live instance (screens at desktop and phone width, light and dark, an axe-core audit and live timings), with what was fixed and what is recommended next, is in [docs/UX-REVIEW.md](docs/UX-REVIEW.md).
+
 ## Verified in the playground
 
 Live KodeKloud AWS Playground session, 18 Nov 2026 (us-east-1, WAF and Pipes blocked, so the Lambda CDC publisher was used):
